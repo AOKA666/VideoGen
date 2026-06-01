@@ -1,0 +1,40 @@
+# Environment
+.env
+.env.*
+!.env.local.example
+
+# Dependencies
+node_modules/
+apps/web/node_modules/
+
+# Build outputs
+dist/
+apps/web/dist/
+.vite/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+services/api/.venv/
+
+# Local generated data
+storage/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
