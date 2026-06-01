@@ -74,6 +74,8 @@ def rewrite(project_id: str):
         raise HTTPException(404, "Project not found")
     result = rewrite_script(project["raw_script"], project.get("rewrite_level", "medium"), project.get("script_style", "纪实故事型"))
     project["rewritten_script"] = result["rewritten_script"]
+    project["rewrite_provider"] = result.get("rewrite_provider", "")
+    project["rewrite_error"] = result.get("rewrite_error", "")
     project["status"] = "script_ready"
     project["updated_at"] = datetime.now().isoformat(timespec="seconds")
     save_db(db)

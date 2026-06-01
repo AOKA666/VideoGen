@@ -5,7 +5,7 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException
 
 from services.asset_service import new_id
-from services.generation_service import generate_srt, generate_svg_placeholder, write_silent_wav, write_timeline
+from services.generation_service import generate_doubao_image, generate_srt, write_silent_wav, write_timeline
 from services.store import load_db, project_dir, public_url, save_db
 
 router = APIRouter(prefix="/api/projects", tags=["generation"])
@@ -17,8 +17,13 @@ def generate_image(project_id: str, shot_id: str):
     shot = next((s for s in db["shots"] if s["project_id"] == project_id and s["id"] == shot_id), None)
     if not shot:
         raise HTTPException(404, "Shot not found")
-    out = project_dir(project_id) / "images" / f"shot_{shot['shot_index']:03d}.svg"
-    prompt = generate_svg_placeholder(out, shot)
+    project = next((p for p in db["projects"] if p["id"] == project_id), {})
+    out = project_dir(project_id) / "images" / f"shot_{shot['shot_index']:03d}.png"
+    try:
+        result = generate_doubao_image(out, shot, project.get("video_ratio", "9:16"))
+    except Exception as exc:
+        raise HTTPException(502, str(exc)) from exc
+    prompt = result["prompt"]
     generated_id = new_id()
     db["generated_assets"].append({
         "id": generated_id,
@@ -26,6 +31,11 @@ def generate_image(project_id: str, shot_id: str):
         "shot_id": shot_id,
         "type": "image",
         "prompt": prompt,
+        "provider": result.get("provider"),
+        "model": result.get("model"),
+        "image_size": result.get("image_size"),
+        "remote_url": result.get("remote_url"),
+        "seed": result.get("seed"),
         "file_url": public_url(out),
         "local_path": str(out),
         "status": "success",
@@ -35,7 +45,15 @@ def generate_image(project_id: str, shot_id: str):
     shot["asset_source"] = "ai_generated"
     shot["status"] = "ai_generated"
     save_db(db)
-    return {"shot_id": shot_id, "image_url": public_url(out), "prompt": prompt, "status": "success"}
+    return {
+        "shot_id": shot_id,
+        "image_url": public_url(out),
+        "prompt": prompt,
+        "provider": result.get("provider"),
+        "model": result.get("model"),
+        "image_size": result.get("image_size"),
+        "status": "success",
+    }
 
 
 @router.post("/{project_id}/generate-voice")

@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Archive, Download, Film, FolderOpen, ImagePlus, Library, Mic, RefreshCw, Save, Scissors, Search, Tags, Wand2 } from 'lucide-react';
+import { Archive, Download, Film, FolderOpen, ImagePlus, Library, Mic, RefreshCw, Save, Scissors, Search, Tags, Trash2, Wand2 } from 'lucide-react';
 import './styles.css';
 
 const API = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
@@ -29,11 +29,8 @@ function textToList(value) {
 
 function emptyTagForm() {
   return {
-    people: '',
+    object: '',
     scene: '',
-    era: '',
-    emotion: '',
-    visual_style: '',
     keywords: '',
     source_note: '用户上传',
     copyright_note: '自用素材',
@@ -96,6 +93,14 @@ function App() {
   useEffect(() => {
     refreshAll();
   }, []);
+
+  useEffect(() => {
+    if (!assets.some((asset) => asset.analysis_status === 'analyzing')) return undefined;
+    const timer = window.setInterval(() => {
+      refreshAll(projectId);
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [assets, projectId]);
 
   async function chooseLibraryFolder() {
     if ('showDirectoryPicker' in window) {
@@ -179,15 +184,15 @@ function App() {
     data.append('source_note', form.source_note || '用户上传');
     data.append('copyright_note', form.copyright_note || '自用素材');
     data.append('manual_tags', JSON.stringify({
-      people: textToList(form.people),
+      object: textToList(form.object),
       scene: textToList(form.scene),
-      era: textToList(form.era),
-      emotion: textToList(form.emotion),
-      visual_style: textToList(form.visual_style),
       keywords: textToList(form.keywords),
     }));
-    await run('上传并打标签', () => request('/api/assets/upload', { method: 'POST', body: data }));
+    const result = await run('上传素材', () => request('/api/assets/upload', { method: 'POST', body: data }));
+    if (!result) return;
     closePendingUpload();
+    setTab('assets');
+    setMessage('素材已上传，正在识别标签');
     await refreshAll(projectId);
   }
 
@@ -198,6 +203,13 @@ function App() {
       body: JSON.stringify(payload),
     }));
     setEditingAsset(null);
+    await refreshAll(projectId);
+  }
+
+  async function deleteAsset(asset) {
+    if (!window.confirm(`确认删除素材「${asset.file_name}」吗？`)) return;
+    await run('删除素材', () => request(`/api/assets/${asset.id}`, { method: 'DELETE' }));
+    if (editingAsset?.id === asset.id) setEditingAsset(null);
     await refreshAll(projectId);
   }
 
@@ -307,7 +319,14 @@ function App() {
                   <button className="primary" type="button" onClick={() => uploadInputRef.current?.click()}><ImagePlus size={18} /> 选择素材</button>
                 </div>
                 <div className="asset-grid">
-                  {assets.map((asset) => <AssetCard key={asset.id} asset={asset} onEdit={() => setEditingAsset(asset)} />)}
+                  {assets.map((asset) => (
+                    <AssetCard
+                      key={asset.id}
+                      asset={asset}
+                      onEdit={() => setEditingAsset(asset)}
+                      onDelete={() => deleteAsset(asset)}
+                    />
+                  ))}
                 </div>
               </>
             )}
@@ -374,19 +393,28 @@ function App() {
           onUpload={confirmUpload}
         />
       )}
-      {editingAsset && <AssetEditor asset={editingAsset} onClose={() => setEditingAsset(null)} onSave={saveAssetTags} />}
+      {editingAsset && <AssetEditor asset={editingAsset} onClose={() => setEditingAsset(null)} onSave={saveAssetTags} onDelete={deleteAsset} />}
     </div>
   );
 }
 
-function AssetCard({ asset, onEdit }) {
+function AssetCard({ asset, onEdit, onDelete }) {
   return (
-    <article className="asset-card">
+    <article className={asset.analysis_status === 'analyzing' ? 'asset-card analyzing' : 'asset-card'}>
       <div className="preview">{asset.file_type === 'image' ? <img src={`${API}${asset.file_url}`} /> : <video src={`${API}${asset.file_url}`} controls />}</div>
       <h3>{asset.file_name}</h3>
-      <p>{[...asset.people, ...asset.scene, ...asset.keywords].slice(0, 6).join(' / ') || '待补充标签'}</p>
-      <small>{asset.analysis_provider || 'local_fallback'} · {asset.copyright_note}</small>
-      {onEdit && <button className="asset-edit" onClick={onEdit}><Tags size={16} /> 编辑标签</button>}
+      <p>{asset.analysis_status === 'analyzing' ? '识别中' : [...(asset.object || asset.people || []), ...(asset.scene || []), ...(asset.keywords || [])].slice(0, 6).join(' / ') || '待补充标签'}</p>
+      <div className="asset-meta">
+        <span>方向：{asset.orientation || 'unknown'}</span>
+        <span>质量：{asset.quality_score ?? 75}</span>
+      </div>
+      <small>{asset.analysis_status === 'analyzing' ? '识别标签中，请稍候' : `${asset.analysis_provider || 'local_fallback'} · ${asset.copyright_note}`}</small>
+      {(onEdit || onDelete) && (
+        <div className="asset-actions">
+          {onEdit && <button disabled={asset.analysis_status === 'analyzing'} onClick={onEdit}><Tags size={16} /> 编辑标签</button>}
+          {onDelete && <button className="danger" onClick={onDelete}><Trash2 size={16} /> 删除</button>}
+        </div>
+      )}
     </article>
   );
 }
@@ -395,11 +423,8 @@ function TagFields({ form, update }) {
   return (
     <>
       <div className="grid">
-        <label>人物标签<input value={form.people} onChange={(e) => update('people', e.target.value)} placeholder="钱学森，邓稼先" /></label>
+        <label>主体标签<input value={form.object} onChange={(e) => update('object', e.target.value)} placeholder="钱学森，火车，纪念碑，动物" /></label>
         <label>场景标签<input value={form.scene} onChange={(e) => update('scene', e.target.value)} placeholder="实验室，会议，老照片" /></label>
-        <label>年代标签<input value={form.era} onChange={(e) => update('era', e.target.value)} placeholder="1950s，1960s" /></label>
-        <label>情绪标签<input value={form.emotion} onChange={(e) => update('emotion', e.target.value)} placeholder="庄重，紧张，感人" /></label>
-        <label>风格标签<input value={form.visual_style} onChange={(e) => update('visual_style', e.target.value)} placeholder="黑白，纪实，档案感" /></label>
         <label>关键词<input value={form.keywords} onChange={(e) => update('keywords', e.target.value)} placeholder="中国科学家，历史照片" /></label>
       </div>
       <label>来源备注<input value={form.source_note} onChange={(e) => update('source_note', e.target.value)} /></label>
@@ -435,13 +460,10 @@ function UploadTagDialog({ files, initialForm, onClose, onUpload }) {
   );
 }
 
-function AssetEditor({ asset, onClose, onSave }) {
+function AssetEditor({ asset, onClose, onSave, onDelete }) {
   const [form, setForm] = useState({
-    people: listToText(asset.people),
+    object: listToText(asset.object || asset.people),
     scene: listToText(asset.scene),
-    era: listToText(asset.era),
-    emotion: listToText(asset.emotion),
-    visual_style: listToText(asset.visual_style),
     keywords: listToText(asset.keywords),
     source_note: asset.source_note || '',
     copyright_note: asset.copyright_note || '',
@@ -455,11 +477,8 @@ function AssetEditor({ asset, onClose, onSave }) {
   function submit(ev) {
     ev.preventDefault();
     onSave(asset.id, {
-      people: textToList(form.people),
+      object: textToList(form.object),
       scene: textToList(form.scene),
-      era: textToList(form.era),
-      emotion: textToList(form.emotion),
-      visual_style: textToList(form.visual_style),
       keywords: textToList(form.keywords),
       source_note: form.source_note,
       copyright_note: form.copyright_note,
@@ -480,7 +499,11 @@ function AssetEditor({ asset, onClose, onSave }) {
         </div>
         <TagFields form={form} update={update} />
         <label className="check-row"><input type="checkbox" checked={form.is_available} onChange={(e) => update('is_available', e.target.checked)} /> 可用于项目匹配</label>
-        <div className="actions"><button type="button" onClick={onClose}>取消</button><button className="primary"><Save size={18} /> 保存标签</button></div>
+        <div className="actions">
+          <button type="button" className="danger" onClick={() => onDelete(asset)}><Trash2 size={18} /> 删除素材</button>
+          <button type="button" onClick={onClose}>取消</button>
+          <button className="primary"><Save size={18} /> 保存标签</button>
+        </div>
       </form>
     </div>
   );

@@ -22,6 +22,10 @@ button {
 }
 button:disabled { opacity: .45; cursor: not-allowed; }
 button.primary { background: #23645a; border-color: #23645a; color: white; }
+button.danger {
+  border-color: #d7a59c;
+  color: #8a3324;
+}
 input, textarea, select {
   width: 100%;
   border: 1px solid #c9d0c5;
@@ -166,15 +170,50 @@ h3 { font-size: 16px; line-height: 1.45; }
   border-radius: 8px;
   overflow: hidden;
 }
+.asset-card.analyzing {
+  background: #f0f2ef;
+  border-color: #c7cec4;
+  color: #66727a;
+}
+.asset-card.analyzing .preview img,
+.asset-card.analyzing .preview video {
+  filter: grayscale(1);
+  opacity: .48;
+}
+.asset-card.analyzing .preview::after {
+  content: "识别中";
+  position: absolute;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(23, 32, 38, .72);
+  color: #fff;
+  font-size: 13px;
+}
 .asset-card h3, .asset-card p, .asset-card small { padding: 0 12px; }
 .asset-card h3 { margin: 12px 0 6px; word-break: break-word; }
 .asset-card p { color: #58646d; font-size: 13px; min-height: 36px; }
 .asset-card small { display: block; color: #8a6248; margin-bottom: 12px; }
-.asset-edit {
-  width: calc(100% - 24px);
+.asset-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 12px 10px;
+}
+.asset-meta span {
+  padding: 4px 7px;
+  border-radius: 6px;
+  background: #edf0eb;
+  color: #45515a;
+  font-size: 12px;
+}
+.asset-actions {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
   margin: 0 12px 12px;
 }
 .preview {
+  position: relative;
   aspect-ratio: 9 / 12;
   background: #d7dbd2;
   display: grid;

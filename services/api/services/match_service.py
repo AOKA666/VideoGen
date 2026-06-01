@@ -17,21 +17,19 @@ def score_asset(shot: dict, asset: dict) -> tuple[int, str]:
     visual = shot.get("visual_need", "")
     joined = " ".join(shot_words + [voice, visual])
 
-    people_score = 1.0 if any(p and p in joined for p in asset.get("people", [])) else 0.0
+    object_tags = asset.get("object") or asset.get("people") or []
+    object_score = 1.0 if any(item and item in joined for item in object_tags) else 0.0
     scene_score = 1.0 if any(s and s in joined for s in asset.get("scene", [])) else _overlap(shot_words, asset.get("scene", []))
     keyword_score = 1.0 if any(k and k in joined for k in asset.get("keywords", [])) else _overlap(shot_words, asset.get("keywords", []))
-    era_score = 1.0 if any(e and e in joined for e in asset.get("era", [])) else 0.0
     quality_score = min(float(asset.get("quality_score", 75)) / 100, 1)
-    score = people_score * 40 + scene_score * 25 + keyword_score * 20 + era_score * 10 + quality_score * 5
+    score = object_score * 45 + scene_score * 30 + keyword_score * 20 + quality_score * 5
     reason = []
-    if people_score:
-        reason.append("人物标签匹配")
+    if object_score:
+        reason.append("主体标签匹配")
     if scene_score:
         reason.append("场景标签匹配")
     if keyword_score:
         reason.append("关键词匹配")
-    if era_score:
-        reason.append("年代/风格匹配")
     return round(score), "、".join(reason) or "仅有基础质量分"
 
 

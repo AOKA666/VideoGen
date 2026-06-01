@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import html
 import json
+import os
+import urllib.error
+import urllib.request
 import wave
 from pathlib import Path
 
@@ -36,10 +39,76 @@ def generate_svg_placeholder(path: Path, shot: dict) -> str:
 
 def build_image_prompt(shot: dict) -> str:
     return (
-        "realistic historical documentary style, archival photo texture, restrained color, "
-        f"{shot.get('visual_need', 'historical scene')}, "
-        "avoid recognizable real person's frontal face, no text, no watermark, vertical composition"
+        "真实历史纪实影像风格，档案照片质感，克制色彩，电影级构图，"
+        f"画面需求：{shot.get('visual_need', '历史纪实画面')}。"
+        f"旁白语境：{shot.get('voice_text', '')}。"
+        "不要生成文字、水印、Logo，不要夸张奇幻，不要过度美化。"
     )
+
+
+def ark_endpoint() -> str:
+    return os.getenv("ARK_ENDPOINT", "https://ark.cn-beijing.volces.com/api/v3")
+
+
+def ark_image_model() -> str:
+    return os.getenv("ARK_IMAGE_MODEL", "doubao-seedream-4.5")
+
+
+def image_size_for_ratio(video_ratio: str | None) -> str:
+    if video_ratio == "16:9":
+        return "1664x928"
+    if video_ratio == "1:1":
+        return "1328x1328"
+    return "928x1664"
+
+
+def generate_doubao_image(path: Path, shot: dict, video_ratio: str | None = "9:16") -> dict:
+    api_key = os.getenv("ARK_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("ARK_API_KEY is not configured")
+
+    prompt = build_image_prompt(shot)
+    payload = {
+        "model": ark_image_model(),
+        "prompt": prompt,
+        "negative_prompt": "文字，水印，logo，畸形手指，低清晰度，过曝，过度卡通，现代广告感",
+        "size": image_size_for_ratio(video_ratio),
+        "response_format": "url",
+        "watermark": False,
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        f"{ark_endpoint().rstrip('/')}/images/generations",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Volcengine Ark API {exc.code}: {error_body}") from exc
+
+    images = body.get("data") or body.get("images") or []
+    image_url = images[0].get("url") if images and isinstance(images[0], dict) else ""
+    if not image_url:
+        raise RuntimeError(f"Volcengine Ark response does not contain an image URL: {body}")
+
+    with urllib.request.urlopen(image_url, timeout=180) as response:
+        path.write_bytes(response.read())
+
+    return {
+        "prompt": prompt,
+        "provider": "volcengine_ark",
+        "model": ark_image_model(),
+        "remote_url": image_url,
+        "image_size": payload["size"],
+        "seed": body.get("seed"),
+    }
 
 
 def write_silent_wav(path: Path, duration_sec: float) -> None:
