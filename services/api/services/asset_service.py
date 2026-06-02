@@ -52,8 +52,6 @@ def fallback_analyze_asset(filename: str, file_type: str = "image") -> dict[str,
         tags["scene"] = list(dict.fromkeys(tags["scene"] + ["老照片", "历史档案"]))
     tags.update({
         "media_type": "photo" if file_type == "image" else "video",
-        "orientation": "unknown",
-        "quality_score": 75,
         "analysis_provider": "local_fallback",
     })
     return normalize_tags(tags, file_type)
@@ -73,8 +71,6 @@ def normalize_tags(tags: dict[str, Any], file_type: str) -> dict[str, Any]:
         "scene": as_list("scene"),
         "keywords": as_list("keywords"),
         "media_type": tags.get("media_type") or ("photo" if file_type == "image" else "video"),
-        "orientation": tags.get("orientation") or "unknown",
-        "quality_score": int(tags.get("quality_score") or 75),
         "analysis_provider": tags.get("analysis_provider") or "glm",
         "analysis_error": tags.get("analysis_error", ""),
     }
@@ -106,9 +102,8 @@ def analyze_image_with_glm(filename: str, file_path: Path, api_key: str) -> dict
         "你是历史纪实短视频素材库的图片打标助手。请根据图片内容和文件名生成标签。"
         "object 表示图片主体，可以是人物、动物、物品、建筑、标志物或其他核心对象，不要只识别人。"
         "只返回 JSON，不要 Markdown。字段必须包含："
-        "object, scene, keywords, orientation, quality_score。"
+        "object, scene, keywords。"
         "object/scene/keywords 都是中文字符串数组；"
-        "orientation 只能是 横屏/竖屏/方形/unknown；quality_score 为 0-100。"
         f"文件名：{filename}"
     )
     payload = {

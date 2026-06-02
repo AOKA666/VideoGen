@@ -35,6 +35,14 @@ input, textarea, select {
 }
 textarea { resize: vertical; line-height: 1.65; }
 label { display: grid; gap: 7px; color: #45515a; font-size: 14px; }
+.compact-control {
+  min-width: 220px;
+  gap: 5px;
+}
+.compact-control select {
+  min-height: 38px;
+  padding: 8px 10px;
+}
 
 .app { min-height: 100vh; display: grid; grid-template-columns: 260px 1fr; }
 .sidebar {
@@ -57,7 +65,26 @@ nav button {
   border-color: transparent;
 }
 nav button.active, nav button:hover { background: #25333b; color: #fff; }
-.sidebar select { margin-top: auto; background: #25333b; color: #fff; border-color: #3a4a54; }
+.project-picker {
+  margin-top: auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 42px;
+  gap: 8px;
+}
+.sidebar select { background: #25333b; color: #fff; border-color: #3a4a54; }
+.sidebar .icon-only {
+  width: 42px;
+  min-width: 42px;
+  padding: 0;
+  background: #25333b;
+  border-color: #3a4a54;
+  color: #f0b4a8;
+}
+.sidebar .icon-only:hover:not(:disabled) {
+  background: #3b2525;
+  border-color: #8a3324;
+  color: #fff;
+}
 
 main { min-width: 0; }
 .topbar {
@@ -111,6 +138,10 @@ h3 { font-size: 16px; line-height: 1.45; }
   gap: 10px;
 }
 .actions { justify-content: flex-end; margin-top: 12px; }
+.result audio {
+  width: 100%;
+  margin: 16px 0 4px;
+}
 
 .hidden-input { display: none; }
 .library-gate {

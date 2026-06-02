@@ -4,6 +4,10 @@ import { Archive, Download, Film, FolderOpen, ImagePlus, Library, Mic, RefreshCw
 import './styles.css';
 
 const API = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
+const VOICE_OPTIONS = [
+  { value: 'zh_male_m191_uranus_bigtts', label: '男声 · 沉稳叙事' },
+  { value: 'zh_female_vv_uranus_bigtts', label: '女声 · 清晰自然' },
+];
 
 async function request(path, options = {}) {
   const res = await fetch(`${API}${path}`, options);
@@ -44,11 +48,13 @@ function App() {
   const [project, setProject] = useState(null);
   const [shots, setShots] = useState([]);
   const [assets, setAssets] = useState([]);
+  const [generatedAssets, setGeneratedAssets] = useState([]);
   const [library, setLibrary] = useState(null);
   const [editingAsset, setEditingAsset] = useState(null);
   const [pendingUpload, setPendingUpload] = useState(null);
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
+  const [voiceType, setVoiceType] = useState(VOICE_OPTIONS[0].value);
   const folderFallbackRef = useRef(null);
   const uploadInputRef = useRef(null);
 
@@ -56,8 +62,13 @@ function App() {
   const selectedAssets = useMemo(() => {
     const map = new Map();
     assets.forEach((asset) => map.set(asset.id, asset));
+    generatedAssets.forEach((asset) => map.set(asset.id, {
+      ...asset,
+      file_type: 'image',
+      file_name: asset.file_name || `AI 占位图 ${asset.image_size || ''}`.trim(),
+    }));
     return map;
-  }, [assets]);
+  }, [assets, generatedAssets]);
 
   async function run(label, fn) {
     setBusy(true);
@@ -86,7 +97,13 @@ function App() {
       const data = await request(`/api/projects/${id}`);
       setProject(data.project);
       setShots(data.shots);
+      setGeneratedAssets(data.generated_assets || []);
       setProjectId(id);
+    } else {
+      setProject(null);
+      setShots([]);
+      setGeneratedAssets([]);
+      setProjectId('');
     }
   }
 
@@ -213,6 +230,16 @@ function App() {
     await refreshAll(projectId);
   }
 
+  async function deleteProject() {
+    if (!projectId || !project) return;
+    if (!window.confirm(`确认删除项目「${project.name}」吗？项目文案、分镜、生成文件和导出包都会删除。`)) return;
+    const deletedId = projectId;
+    const result = await run('删除项目', () => request(`/api/projects/${deletedId}`, { method: 'DELETE' }));
+    if (!result) return;
+    setTab('create');
+    await refreshAll('');
+  }
+
   async function matchAssets() {
     await run('匹配真实素材', () => request(`/api/projects/${projectId}/match-assets`, { method: 'POST' }));
     await refreshAll(projectId);
@@ -234,12 +261,24 @@ function App() {
   }
 
   async function generateVoiceAndSubtitles() {
-    await run('生成配音', () => request(`/api/projects/${projectId}/generate-voice`, { method: 'POST' }));
-    await run('生成字幕', () => request(`/api/projects/${projectId}/generate-subtitles`, { method: 'POST' }));
+    const voiceResult = await run('生成配音', () => request(`/api/projects/${projectId}/generate-voice`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ voice_type: voiceType }),
+    }));
+    if (!voiceResult) return false;
+    const subtitleResult = await run('生成字幕', () => request(`/api/projects/${projectId}/generate-subtitles`, { method: 'POST' }));
+    if (!subtitleResult) return false;
+    await refreshAll(projectId);
     setTab('export');
+    return true;
   }
 
   async function exportPackage() {
+    if (!project?.audio_url) {
+      const generated = await generateVoiceAndSubtitles();
+      if (!generated) return;
+    }
     const data = await run('导出素材包', () => request(`/api/projects/${projectId}/export/assets`, { method: 'POST' }));
     if (data?.download_url) window.open(`${API}${data.download_url}`, '_blank');
   }
@@ -256,10 +295,13 @@ function App() {
           <button className={tab === 'match' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('match')}><Search size={18} /> 匹配</button>
           <button className={tab === 'export' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('export')}><Download size={18} /> 导出</button>
         </nav>
-        <select value={projectId} onChange={(e) => refreshAll(e.target.value)}>
-          <option value="">选择项目</option>
-          {projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-        </select>
+        <div className="project-picker">
+          <select value={projectId} onChange={(e) => refreshAll(e.target.value)}>
+            <option value="">选择项目</option>
+            {projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+          <button className="danger icon-only" disabled={!projectId} title="删除项目" onClick={deleteProject}><Trash2 size={18} /></button>
+        </div>
       </aside>
 
       <main>
@@ -277,12 +319,6 @@ function App() {
               <h2>创建项目</h2>
               <label>项目名称<input name="name" placeholder="可留空，系统自动取标题" /></label>
               <label>原始文案<textarea name="raw_script" required rows="12" placeholder="粘贴历史人物/纪实解说文案" /></label>
-              <div className="grid">
-                <label>内容类型<select name="content_type" defaultValue="国之脊梁"><option>国之脊梁</option><option>历史人物</option><option>科学家故事</option><option>两弹一星</option><option>纪实解说</option></select></label>
-                <label>改写强度<select name="rewrite_level" defaultValue="medium"><option value="light">轻度</option><option value="medium">中度</option><option value="strong">强度</option></select></label>
-                <label>文案风格<select name="script_style" defaultValue="纪实故事型"><option>纪实故事型</option><option>爆款悬念型</option><option>情绪感染型</option><option>视频号中老年风格</option></select></label>
-                <label>配音风格<select name="voice_style" defaultValue="沉稳男声"><option>沉稳男声</option><option>温和女声</option><option>纪录片旁白</option></select></label>
-              </div>
               <button className="primary"><Save size={18} /> 创建并进入文案</button>
             </form>
             <div className="notes">
@@ -361,7 +397,11 @@ function App() {
 
         {tab === 'match' && (
           <section className="band">
-            <div className="toolbar"><button onClick={matchAssets}><RefreshCw size={18} /> 重新匹配</button><button className="primary" onClick={generateVoiceAndSubtitles}><Mic size={18} /> 生成配音与字幕</button></div>
+            <div className="toolbar">
+              <button onClick={matchAssets}><RefreshCw size={18} /> 重新匹配</button>
+              <VoiceSelect value={voiceType} onChange={setVoiceType} />
+              <button className="primary" onClick={generateVoiceAndSubtitles}><Mic size={18} /> 生成配音与字幕</button>
+            </div>
             <div className="shot-list">
               {shots.map((shot) => (
                 <div className="shot" key={shot.id}>
@@ -379,8 +419,13 @@ function App() {
         {tab === 'export' && (
           <section className="band result">
             <h2>结果导出</h2>
-            <p>素材包包含 raw_script、rewritten_script、storyboard.json/csv、subtitles.srt、timeline.json、asset_match_report.json、已选真实素材、AI 占位图和 main_voice.wav。</p>
-            <div className="actions"><button onClick={generateVoiceAndSubtitles}><Mic size={18} /> 重新生成音频字幕</button><button className="primary" onClick={exportPackage}><Download size={18} /> 导出 ZIP</button></div>
+            <p>素材包包含 raw_script、rewritten_script、storyboard.json/csv、subtitles.srt、timeline.json、asset_match_report.json、已选真实素材、AI 占位图和 main_voice.mp3。</p>
+            {project.audio_url && <audio controls src={`${API}${project.audio_url}`} />}
+            <div className="actions">
+              <VoiceSelect value={voiceType} onChange={setVoiceType} />
+              <button onClick={generateVoiceAndSubtitles}><Mic size={18} /> 重新生成音频字幕</button>
+              <button className="primary" onClick={exportPackage}><Download size={18} /> 导出 ZIP</button>
+            </div>
           </section>
         )}
       </main>
@@ -404,10 +449,6 @@ function AssetCard({ asset, onEdit, onDelete }) {
       <div className="preview">{asset.file_type === 'image' ? <img src={`${API}${asset.file_url}`} /> : <video src={`${API}${asset.file_url}`} controls />}</div>
       <h3>{asset.file_name}</h3>
       <p>{asset.analysis_status === 'analyzing' ? '识别中' : [...(asset.object || asset.people || []), ...(asset.scene || []), ...(asset.keywords || [])].slice(0, 6).join(' / ') || '待补充标签'}</p>
-      <div className="asset-meta">
-        <span>方向：{asset.orientation || 'unknown'}</span>
-        <span>质量：{asset.quality_score ?? 75}</span>
-      </div>
       <small>{asset.analysis_status === 'analyzing' ? '识别标签中，请稍候' : `${asset.analysis_provider || 'local_fallback'} · ${asset.copyright_note}`}</small>
       {(onEdit || onDelete) && (
         <div className="asset-actions">
@@ -416,6 +457,17 @@ function AssetCard({ asset, onEdit, onDelete }) {
         </div>
       )}
     </article>
+  );
+}
+
+function VoiceSelect({ value, onChange }) {
+  return (
+    <label className="compact-control">
+      音色
+      <select value={value} onChange={(e) => onChange(e.target.value)}>
+        {VOICE_OPTIONS.map((voice) => <option key={voice.value} value={voice.value}>{voice.label}</option>)}
+      </select>
+    </label>
   );
 }
 
@@ -516,7 +568,8 @@ function ShotCard({ shot, asset, onGenerate }) {
         <span className={`pill ${shot.status}`}>镜头 {shot.shot_index} · {shot.status}</span>
         <h3>{shot.voice_text}</h3>
         <p>画面需求：{shot.visual_need}</p>
-        <p>关键词：{[...(shot.exact_keywords || []), ...(shot.alternative_keywords || []), ...(shot.atmosphere_keywords || [])].join(' / ')}</p>
+        <p>需要主体：{(shot.required_object || []).join(' / ') || '未生成'}</p>
+        <p>需要场景：{(shot.required_scene || []).join(' / ') || '未生成'}</p>
       </div>
       <div className="shot-side">
         {asset ? <AssetCard asset={asset} /> : <div className="empty">暂无真实素材</div>}

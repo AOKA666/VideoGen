@@ -133,8 +133,6 @@ def build_asset(file: UploadFile, source_note: str, copyright_note: str, library
         "object": [],
         "scene": [],
         "keywords": [],
-        "orientation": "unknown",
-        "quality_score": 75,
         "analysis_status": "analyzing",
         "analysis_provider": "pending",
         "analysis_error": "",

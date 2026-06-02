@@ -3,12 +3,17 @@ from __future__ import annotations
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 
 from services.asset_service import new_id
-from services.generation_service import generate_doubao_image, generate_srt, write_silent_wav, write_timeline
+from services.generation_service import generate_doubao_image, generate_srt, synthesize_project_voice, write_timeline
 from services.store import load_db, project_dir, public_url, save_db
 
 router = APIRouter(prefix="/api/projects", tags=["generation"])
+
+
+class VoicePayload(BaseModel):
+    voice_type: str | None = None
 
 
 @router.post("/{project_id}/shots/{shot_id}/generate-image")
@@ -57,15 +62,30 @@ def generate_image(project_id: str, shot_id: str):
 
 
 @router.post("/{project_id}/generate-voice")
-def generate_voice(project_id: str):
+def generate_voice(project_id: str, payload: VoicePayload | None = None):
     db = load_db()
-    shots = [s for s in db["shots"] if s["project_id"] == project_id]
+    project = next((p for p in db["projects"] if p["id"] == project_id), None)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    shots = sorted([s for s in db["shots"] if s["project_id"] == project_id], key=lambda s: s["shot_index"])
     if not shots:
         raise HTTPException(400, "No shots")
-    duration = max(s.get("end_time", 0) for s in shots)
-    out = project_dir(project_id) / "audio" / "main_voice.wav"
-    write_silent_wav(out, duration)
-    return {"audio_url": public_url(out), "duration_sec": duration}
+    out = project_dir(project_id) / "audio" / "main_voice.mp3"
+    try:
+        result = synthesize_project_voice(out, shots, payload.voice_type if payload else None)
+    except Exception as exc:
+        raise HTTPException(502, str(exc)) from exc
+    project["voice_style"] = result["voice_type"]
+    project["audio_url"] = public_url(out)
+    project["audio_format"] = result["audio_format"]
+    project["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    save_db(db)
+    return {
+        "audio_url": public_url(out),
+        "audio_format": result["audio_format"],
+        "voice_type": result["voice_type"],
+        "provider": result["provider"],
+    }
 
 
 @router.post("/{project_id}/generate-subtitles")

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import shutil
 from datetime import datetime
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from services.store import load_db, project_dir, save_db
+from services.store import PROJECTS_DIR, load_db, project_dir, save_db
 from services.text_service import infer_title, rewrite_script
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
@@ -16,7 +17,6 @@ class ProjectCreate(BaseModel):
     name: str | None = None
     raw_script: str
     content_type: str = "国之脊梁"
-    rewrite_level: str = "medium"
     script_style: str = "纪实故事型"
     voice_style: str = "沉稳男声"
     video_ratio: str = "9:16"
@@ -42,7 +42,6 @@ def create_project(payload: ProjectCreate):
         "raw_script": payload.raw_script,
         "rewritten_script": "",
         "content_type": payload.content_type,
-        "rewrite_level": payload.rewrite_level,
         "script_style": payload.script_style,
         "voice_style": payload.voice_style,
         "video_ratio": payload.video_ratio,
@@ -63,7 +62,12 @@ def get_project(project_id: str):
     if not project:
         raise HTTPException(404, "Project not found")
     shots = [s for s in db["shots"] if s["project_id"] == project_id]
-    return {"project": project, "shots": sorted(shots, key=lambda s: s["shot_index"])}
+    generated_assets = [a for a in db.get("generated_assets", []) if a.get("project_id") == project_id]
+    return {
+        "project": project,
+        "shots": sorted(shots, key=lambda s: s["shot_index"]),
+        "generated_assets": generated_assets,
+    }
 
 
 @router.post("/{project_id}/rewrite")
@@ -72,7 +76,7 @@ def rewrite(project_id: str):
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
         raise HTTPException(404, "Project not found")
-    result = rewrite_script(project["raw_script"], project.get("rewrite_level", "medium"), project.get("script_style", "纪实故事型"))
+    result = rewrite_script(project["raw_script"], project.get("script_style", "纪实故事型"))
     project["rewritten_script"] = result["rewritten_script"]
     project["rewrite_provider"] = result.get("rewrite_provider", "")
     project["rewrite_error"] = result.get("rewrite_error", "")
@@ -93,3 +97,23 @@ def update_script(project_id: str, payload: ScriptUpdate):
     project["updated_at"] = datetime.now().isoformat(timespec="seconds")
     save_db(db)
     return {"status": "saved"}
+
+
+@router.delete("/{project_id}")
+def delete_project(project_id: str):
+    db = load_db()
+    project = next((p for p in db["projects"] if p["id"] == project_id), None)
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    db["projects"] = [p for p in db["projects"] if p["id"] != project_id]
+    db["shots"] = [s for s in db["shots"] if s.get("project_id") != project_id]
+    db["project_assets"] = [pa for pa in db.get("project_assets", []) if pa.get("project_id") != project_id]
+    db["generated_assets"] = [ga for ga in db.get("generated_assets", []) if ga.get("project_id") != project_id]
+    save_db(db)
+
+    target = (PROJECTS_DIR / project_id).resolve()
+    if target.exists() and PROJECTS_DIR.resolve() in target.parents:
+        shutil.rmtree(target)
+
+    return {"status": "deleted", "project_id": project_id}

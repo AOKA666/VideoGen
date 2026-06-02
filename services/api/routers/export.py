@@ -38,7 +38,17 @@ def export_assets(project_id: str):
     (export_dir / "rewritten_script.txt").write_text(project.get("rewritten_script", ""), encoding="utf-8")
     (export_dir / "storyboard.json").write_text(json.dumps(shots, ensure_ascii=False, indent=2), encoding="utf-8")
     with (export_dir / "storyboard.csv").open("w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=["shot_index", "voice_text", "duration_sec", "visual_need", "status", "asset_source", "match_score"])
+        writer = csv.DictWriter(f, fieldnames=[
+            "shot_index",
+            "voice_text",
+            "duration_sec",
+            "visual_need",
+            "required_object",
+            "required_scene",
+            "status",
+            "asset_source",
+            "match_score",
+        ])
         writer.writeheader()
         for shot in shots:
             writer.writerow({k: shot.get(k) for k in writer.fieldnames})
@@ -60,9 +70,14 @@ def export_assets(project_id: str):
         source = Path((asset or generated or {}).get("local_path", ""))
         if source.exists():
             shutil.copy2(source, media_dir / source.name)
-    audio = base / "audio" / "main_voice.wav"
-    if audio.exists():
-        shutil.copy2(audio, export_dir / "main_voice.wav")
+    copied_audio = False
+    for audio_name in ["main_voice.mp3", "main_voice.wav"]:
+        audio = base / "audio" / audio_name
+        if audio.exists():
+            shutil.copy2(audio, export_dir / audio_name)
+            copied_audio = True
+    if not copied_audio:
+        raise HTTPException(400, "No voice audio found. Please generate voice and subtitles before export.")
     zip_path = base / "exports" / f"{safe_filename(project['name'])}_assets.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for path in export_dir.rglob("*"):

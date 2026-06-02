@@ -5,6 +5,7 @@ import os
 import re
 import urllib.error
 import urllib.request
+from difflib import SequenceMatcher
 
 PERSON_HINTS = ["钱学森", "邓稼先", "于敏", "黄旭华", "郭永怀", "袁隆平", "王淦昌", "两弹一星"]
 SCENE_HINTS = ["实验室", "会议", "档案", "照片", "火箭", "导弹", "核潜艇", "宿舍", "办公室", "手稿", "文件"]
@@ -21,6 +22,70 @@ def infer_title(raw_script: str) -> str:
     return first[:24].strip("，。！？ ") or "未命名项目"
 
 
+def extract_opening_hook(raw_script: str) -> str:
+    sentences = split_sentences(raw_script)
+    for line in raw_script.splitlines():
+        cleaned = line.strip()
+        if cleaned and len(cleaned) <= 90:
+            return cleaned
+        if cleaned and sentences:
+            return sentences[0].strip()
+    return sentences[0].strip() if sentences else ""
+
+
+def preserve_opening_hook(raw_script: str, rewritten_script: str) -> str:
+    hook = extract_opening_hook(raw_script)
+    rewritten = rewritten_script.strip()
+    if not hook or rewritten.startswith(hook):
+        return rewritten
+
+    lines = [line.strip() for line in rewritten.splitlines() if line.strip()]
+    body_lines = lines[1:] if lines and is_similar_text(lines[0], hook) else lines
+    body = "\n".join(body_lines).strip()
+    return f"{hook}\n{body}" if body else hook
+
+
+def compact_text(text: str) -> str:
+    return re.sub(r"[\s\W_]+", "", text, flags=re.UNICODE)
+
+
+def is_similar_text(a: str, b: str) -> bool:
+    left = compact_text(a)
+    right = compact_text(b)
+    if not left or not right:
+        return False
+    return SequenceMatcher(None, left, right).ratio() >= 0.45
+
+
+def clean_rewritten_script(raw_script: str, rewritten_script: str) -> str:
+    text = rewritten_script.replace("\r\n", "\n").replace("\r", "\n").strip()
+    text = re.sub(r"</?raw_script>", "", text, flags=re.I).strip()
+
+    rewrite_markers = r"(?:二创口播稿|二创文案|改写稿|改写后文案|改写后|成稿|rewritten_script)\s*[:：]\s*"
+    marker_parts = re.split(rewrite_markers, text, flags=re.I)
+    if len(marker_parts) > 1 and marker_parts[-1].strip():
+        text = marker_parts[-1].strip()
+
+    raw_section = r"(?:原文|原始文案|raw_script)\s*[:：]\s*.*?(?=(?:二创口播稿|二创文案|改写稿|改写后文案|改写后|成稿|rewritten_script)\s*[:：]|$)"
+    text = re.sub(raw_section, "", text, flags=re.S | re.I).strip()
+
+    raw_clean = raw_script.strip()
+    if raw_clean and raw_clean in text:
+        text = text.replace(raw_clean, "").strip()
+
+    lines = []
+    seen = set()
+    for line in text.splitlines():
+        cleaned = line.strip()
+        if not cleaned or cleaned in {"原文", "原始文案", "二创", "二创文案", "二创口播稿", "改写稿"}:
+            continue
+        if cleaned in seen:
+            continue
+        seen.add(cleaned)
+        lines.append(cleaned)
+    return "\n".join(lines).strip()
+
+
 def bigmodel_endpoint() -> str:
     return os.getenv("BIGMODEL_ENDPOINT", "https://open.bigmodel.cn/api/paas/v4")
 
@@ -29,22 +94,22 @@ def bigmodel_model() -> str:
     return os.getenv("BIGMODEL_MODEL", "glm-5.1")
 
 
-def fallback_rewrite_script(raw_script: str, level: str = "medium", style: str = "纪实故事型") -> dict:
+def fallback_rewrite_script(raw_script: str, style: str = "纪实故事型") -> dict:
     sentences = split_sentences(raw_script)
     title = infer_title(raw_script)
-    hook = f"{title}，为什么值得被今天的人重新看见？"
+    hook = extract_opening_hook(raw_script) or f"{title}，为什么值得被今天的人重新看见？"
     body = []
     if sentences:
         body.append(hook)
         for sentence in sentences:
             cleaned = sentence.strip()
+            if cleaned == hook:
+                continue
             if len(cleaned) < 8:
                 continue
             body.append(cleaned)
         body.append("这些真实细节，比任何夸张的渲染都更有力量。")
     rewritten = "\n".join(body) if body else hook
-    if level == "strong":
-        rewritten = rewritten.replace("。", "。\n")
     return {
         "title": title,
         "hook": hook,
@@ -60,7 +125,9 @@ def normalize_rewrite_result(result: dict, raw_script: str, style: str) -> dict:
     hook = str(result.get("hook") or f"{title}，为什么值得被今天的人重新看见？").strip()
     rewritten_script = str(result.get("rewritten_script") or "").strip()
     if not rewritten_script:
-        rewritten_script = fallback_rewrite_script(raw_script, "medium", style)["rewritten_script"]
+        rewritten_script = fallback_rewrite_script(raw_script, style)["rewritten_script"]
+    rewritten_script = clean_rewritten_script(raw_script, rewritten_script)
+    rewritten_script = preserve_opening_hook(raw_script, rewritten_script)
     return {
         "title": title[:40] or infer_title(raw_script),
         "hook": hook,
@@ -71,20 +138,23 @@ def normalize_rewrite_result(result: dict, raw_script: str, style: str) -> dict:
     }
 
 
-def rewrite_script_with_glm(raw_script: str, level: str, style: str, api_key: str) -> dict:
-    level_map = {
-        "light": "轻度改写：保留原文核心信息和叙事顺序，优化表达和节奏。",
-        "medium": "中度改写：重组叙事节奏，强化短视频口播感，但不得改变事实。",
-        "strong": "强度改写：显著增强开头钩子、情绪推进和段落张力，但不得虚构事实。",
-    }
+def rewrite_script_with_glm(raw_script: str, style: str, api_key: str) -> dict:
+    opening_hook = extract_opening_hook(raw_script)
     prompt = (
         "你是历史纪实短视频口播文案改写助手。请把原始文案改写成适合短视频旁白的中文稿。"
         "你只能改写 <raw_script> 标签内的内容，禁止替换主题，禁止改成其他历史事件。"
         "要求：事实不虚构；不添加没有依据的具体时间、地点、人物关系；语言自然、有画面感；"
-        "必须根据语义分行，一个完整意思一行；每行就是后续一个分镜，不要把多个意思放在同一行；"
-        "每行尽量 8 到 28 个中文字符，适合配音；不要输出 Markdown。"
-        f"改写强度：{level_map.get(level, level_map['medium'])}"
+        "必须先通读全文再整体改写，不要一句一句机械对应原文。"
+        "开头黄金三秒文案必须一个字、一个标点都不改，并放在 rewritten_script 最开头；"
+        f"需要原样保留的开头黄金三秒是：{opening_hook}"
+        "除开头黄金三秒之外，剩余内容要大改，整体修改程度保持 50% 以上；"
+        "全面校对错别字、语病和标点错误，输出必须是通顺、干净的成稿。"
+        "原文案中呼吁点赞互动的钩子不要删除掉，但可以改写成更吸引人的表达；如果原文没有明显钩子，可以自己添加一个，放在开头黄金三秒之后。"
+        "必须根据语义分段，一个完整意思一段；每段就是后续一个分镜，不要把多个意思放在同一段，同样的意思也不要分段；"
+        "每段尽量 20 到 40 个中文字符，适合配音；不要输出 Markdown。"
         f"文案风格：{style}。"
+        "rewritten_script 字段里只能放最终二创口播稿正文，禁止包含原文、原始文案、对照稿、解释、标题标签或“二创口播稿：”这类前缀。"
+        "不要先输出一遍原文再输出二创稿，也不要把原文和二创内容混在一起。"
         "只返回 JSON，字段必须包含 title, hook, rewritten_script, script_style。"
         f"<raw_script>{raw_script}</raw_script>"
     )
@@ -126,13 +196,13 @@ def rewrite_script_with_glm(raw_script: str, level: str, style: str, api_key: st
     return normalize_rewrite_result(result, raw_script, style)
 
 
-def rewrite_script(raw_script: str, level: str = "medium", style: str = "纪实故事型") -> dict:
-    fallback = fallback_rewrite_script(raw_script, level, style)
+def rewrite_script(raw_script: str, style: str = "纪实故事型") -> dict:
+    fallback = fallback_rewrite_script(raw_script, style)
     api_key = os.getenv("BIGMODEL_API_KEY", "").strip()
     if not api_key:
         return fallback
     try:
-        return rewrite_script_with_glm(raw_script, level, style, api_key)
+        return rewrite_script_with_glm(raw_script, style, api_key)
     except Exception as exc:
         fallback["rewrite_error"] = str(exc)[:300]
         return fallback
@@ -192,10 +262,12 @@ def generate_shots(script: str) -> list[dict]:
     for idx, text in enumerate(chunks[:30], 1):
         tags = keywords_from_text(text)
         duration = max(3.0, min(6.0, round(len(text) / 7, 1)))
-        visual_need = "、".join(tags["people"] + tags["scene"][:2]) or "历史纪实画面"
-        exact = [f"{p} 老照片" for p in tags["people"]] or tags["keywords"][:3]
-        alternative = [f"中国科学家 {s}" for s in tags["scene"][:2]]
-        atmosphere = [f"历史档案 {e}" for e in tags["era"][:2]] + tags["emotion"]
+        required_object = tags["people"] or [
+            item for item in tags["keywords"]
+            if item not in tags["scene"] and item not in tags["era"] and item not in tags["emotion"]
+        ][:2]
+        required_scene = tags["scene"][:2] or ["历史档案"]
+        visual_need = "、".join(required_object + required_scene) or "历史纪实画面"
         shots.append({
             "shot_index": idx,
             "voice_text": text,
@@ -203,9 +275,8 @@ def generate_shots(script: str) -> list[dict]:
             "start_time": round(cursor, 2),
             "end_time": round(cursor + duration, 2),
             "visual_need": visual_need,
-            "exact_keywords": exact,
-            "alternative_keywords": alternative,
-            "atmosphere_keywords": atmosphere,
+            "required_object": required_object,
+            "required_scene": required_scene,
             "selected_asset_id": None,
             "asset_source": None,
             "match_score": 0,

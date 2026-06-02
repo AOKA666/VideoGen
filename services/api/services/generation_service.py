@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import html
+import base64
+import http.client
 import json
 import os
 import urllib.error
 import urllib.request
 import wave
+from json import JSONDecoder
 from pathlib import Path
+from uuid import uuid4
 
 from services.store import public_url
 
@@ -56,10 +60,10 @@ def ark_image_model() -> str:
 
 def image_size_for_ratio(video_ratio: str | None) -> str:
     if video_ratio == "16:9":
-        return "1664x928"
+        return "2560x1440"
     if video_ratio == "1:1":
-        return "1328x1328"
-    return "928x1664"
+        return "1920x1920"
+    return "1440x2560"
 
 
 def generate_doubao_image(path: Path, shot: dict, video_ratio: str | None = "9:16") -> dict:
@@ -119,6 +123,144 @@ def write_silent_wav(path: Path, duration_sec: float) -> None:
         wav.setsampwidth(2)
         wav.setframerate(frame_rate)
         wav.writeframes(b"\x00\x00" * frames)
+
+
+def volc_tts_endpoint() -> str:
+    return os.getenv("VOLC_TTS_ENDPOINT", "https://openspeech.bytedance.com/api/v3/tts/unidirectional")
+
+
+def volc_tts_resource_id() -> str:
+    return os.getenv("VOLC_TTS_RESOURCE_ID", "seed-tts-2.0")
+
+
+def volc_tts_voice() -> str:
+    return os.getenv("VOLC_TTS_VOICE", "zh_male_m191_uranus_bigtts")
+
+
+def parse_chunked_json_objects(text: str) -> list[dict]:
+    decoder = JSONDecoder()
+    idx = 0
+    items = []
+    if "\ndata:" in text or text.startswith("data:"):
+        for line in text.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data and data != "[DONE]":
+                items.append(json.loads(data))
+        return items
+    while idx < len(text):
+        while idx < len(text) and text[idx].isspace():
+            idx += 1
+        if idx >= len(text):
+            break
+        obj, end = decoder.raw_decode(text, idx)
+        if isinstance(obj, dict):
+            items.append(obj)
+        idx = end
+    return items
+
+
+def extract_audio_from_tts_response(body: bytes) -> bytes:
+    text = body.decode("utf-8", errors="replace").strip()
+    audio = bytearray()
+    for item in parse_chunked_json_objects(text):
+        if item.get("code") not in (None, 0, 200, 20000000):
+            raise RuntimeError(f"Volcengine TTS error: {item}")
+        data_obj = item.get("data")
+        payload_obj = item.get("payload") or {}
+        data = data_obj if isinstance(data_obj, str) else None
+        if isinstance(data_obj, dict):
+            data = data_obj.get("audio") or data_obj.get("audio_data") or data_obj.get("data")
+        data = data or item.get("audio") or item.get("audio_data")
+        if isinstance(payload_obj, dict):
+            data = data or payload_obj.get("data") or payload_obj.get("audio") or payload_obj.get("audio_data")
+        if data:
+            audio.extend(base64.b64decode(data))
+    if not audio:
+        raise RuntimeError(f"Volcengine TTS response does not contain audio data: {text[:500]}")
+    return bytes(audio)
+
+
+def read_tts_response(response) -> bytes:
+    chunks = []
+    while True:
+        try:
+            chunk = response.read(8192)
+        except http.client.IncompleteRead as exc:
+            if exc.partial:
+                chunks.append(exc.partial)
+            break
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def synthesize_volcengine_tts(text: str, voice_type: str | None = None) -> bytes:
+    api_key = os.getenv("VOLC_TTS_API_KEY", "").strip()
+    app_id = os.getenv("VOLC_TTS_APP_ID", "").strip()
+    access_key = os.getenv("VOLC_TTS_ACCESS_KEY", "").strip()
+    if not api_key and not (app_id and access_key):
+        raise RuntimeError("Configure VOLC_TTS_API_KEY or VOLC_TTS_APP_ID + VOLC_TTS_ACCESS_KEY")
+
+    payload = {
+        "user": {"uid": "video-draft-generator"},
+        "req_params": {
+            "text": text,
+            "speaker": voice_type or volc_tts_voice(),
+            "audio_params": {
+                "format": "mp3",
+                "sample_rate": 24000,
+                "speech_rate": 0,
+                "loudness_rate": 0,
+            },
+        },
+    }
+    data = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Connection": "keep-alive",
+        "X-Api-Resource-Id": volc_tts_resource_id(),
+        "X-Api-Request-Id": str(uuid4()),
+    }
+    if api_key:
+        headers["X-Api-Key"] = api_key
+    else:
+        headers["X-Api-App-Key"] = os.getenv("VOLC_TTS_APP_KEY", "aGjiRDfUWi")
+        headers["X-Api-App-Id"] = app_id
+        headers["X-Api-Access-Key"] = access_key
+
+    req = urllib.request.Request(
+        volc_tts_endpoint(),
+        data=data,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as response:
+            return extract_audio_from_tts_response(read_tts_response(response))
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Volcengine TTS API {exc.code}: {error_body}") from exc
+
+
+def synthesize_project_voice(path: Path, shots: list[dict], voice_type: str | None = None) -> dict:
+    chunks = []
+    for shot in shots:
+        text = str(shot.get("voice_text") or "").strip()
+        if not text:
+            continue
+        chunks.append(synthesize_volcengine_tts(text, voice_type))
+    if not chunks:
+        raise RuntimeError("No voice text to synthesize")
+    path.write_bytes(b"".join(chunks))
+    return {
+        "audio_format": "mp3",
+        "voice_type": voice_type or volc_tts_voice(),
+        "provider": "volcengine_tts",
+    }
 
 
 def format_srt_time(seconds: float) -> str:

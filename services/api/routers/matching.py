@@ -29,6 +29,10 @@ def match_assets(project_id: str):
             shot["selected_asset_id"] = best["asset_id"]
             shot["asset_source"] = "local"
             shot["match_score"] = best["match_score"]
+        else:
+            shot["selected_asset_id"] = None
+            shot["asset_source"] = None
+            shot["match_score"] = best["match_score"] if best else 0
         shot["status"] = status
         shot["updated_at"] = datetime.now().isoformat(timespec="seconds")
         for c in candidates:
