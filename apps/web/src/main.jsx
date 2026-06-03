@@ -55,6 +55,7 @@ function App() {
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
   const [voiceType, setVoiceType] = useState(VOICE_OPTIONS[0].value);
+  const [previewAsset, setPreviewAsset] = useState(null);
   const folderFallbackRef = useRef(null);
   const uploadInputRef = useRef(null);
 
@@ -69,6 +70,36 @@ function App() {
     }));
     return map;
   }, [assets, generatedAssets]);
+  const selectableAssets = useMemo(() => [
+    ...generatedAssets.map((asset) => ({
+      ...asset,
+      file_type: 'image',
+      file_name: asset.file_name || `网络图片 ${asset.image_size || ''}`.trim(),
+      asset_source: asset.asset_source || 'web_search',
+    })),
+    ...assets.map((asset) => ({ ...asset, asset_source: 'local' })),
+  ], [assets, generatedAssets]);
+  const generatedAssetsByShot = useMemo(() => {
+    const map = new Map();
+    generatedAssets.forEach((asset) => {
+      const list = map.get(asset.shot_id) || [];
+      list.push({
+        ...asset,
+        file_type: 'image',
+        file_name: asset.file_name || `网络图片 ${asset.image_size || ''}`.trim(),
+      });
+      map.set(asset.shot_id, list);
+    });
+    map.forEach((list) => list.sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || ''))));
+    return map;
+  }, [generatedAssets]);
+  const searchProgress = useMemo(() => {
+    const total = shots.length || project?.search_total || 0;
+    const completedByShots = shots.filter((shot) => ['web_downloaded', 'no_image'].includes(shot.status)).length;
+    const completed = Math.min(total || project?.search_total || 0, Math.max(completedByShots, project?.search_completed || 0));
+    const percent = total ? Math.min(100, Math.round((completed / total) * 100)) : 0;
+    return { total, completed, percent };
+  }, [project, shots]);
 
   async function run(label, fn) {
     setBusy(true);
@@ -118,6 +149,15 @@ function App() {
     }, 2500);
     return () => window.clearInterval(timer);
   }, [assets, projectId]);
+
+  useEffect(() => {
+    const activeStatuses = ['pending_search', 'analyzing_intent', 'searching'];
+    if (!projectId || !shots.some((shot) => activeStatuses.includes(shot.status)) && project?.status !== 'searching_images') return undefined;
+    const timer = window.setInterval(() => {
+      refreshAll(projectId);
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [shots, projectId, project]);
 
   async function chooseLibraryFolder() {
     if ('showDirectoryPicker' in window) {
@@ -241,7 +281,7 @@ function App() {
   }
 
   async function matchAssets() {
-    await run('匹配真实素材', () => request(`/api/projects/${projectId}/match-assets`, { method: 'POST' }));
+    await run('联网下载图片', () => request(`/api/projects/${projectId}/match-assets`, { method: 'POST' }));
     await refreshAll(projectId);
     setTab('match');
   }
@@ -251,11 +291,11 @@ function App() {
     await refreshAll(projectId);
   }
 
-  async function selectAsset(shotId, assetId) {
+  async function selectAsset(shotId, assetId, assetSource = 'web_search') {
     await run('指定素材', () => request(`/api/projects/${projectId}/shots/${shotId}/asset`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ asset_id: assetId, asset_source: 'local' }),
+      body: JSON.stringify({ asset_id: assetId, asset_source: assetSource }),
     }));
     await refreshAll(projectId);
   }
@@ -388,9 +428,19 @@ function App() {
 
         {tab === 'storyboard' && (
           <section className="band">
-            <div className="toolbar"><button className="primary" onClick={matchAssets}><Search size={18} /> 匹配素材库</button></div>
+            <SearchProgress progress={searchProgress} project={project} />
             <div className="shot-list">
-              {shots.map((shot) => <ShotCard key={shot.id} shot={shot} asset={selectedAssets.get(shot.selected_asset_id)} onGenerate={() => generateImage(shot.id)} />)}
+              {shots.map((shot) => (
+                <ShotCard
+                  key={shot.id}
+                  shot={shot}
+                  assets={generatedAssetsByShot.get(shot.id) || []}
+                  selectedAssetId={shot.selected_asset_id}
+                  onSelect={(assetId) => selectAsset(shot.id, assetId, 'web_search')}
+                  onPreview={setPreviewAsset}
+                  onGenerate={() => generateImage(shot.id)}
+                />
+              ))}
             </div>
           </section>
         )}
@@ -398,17 +448,27 @@ function App() {
         {tab === 'match' && (
           <section className="band">
             <div className="toolbar">
-              <button onClick={matchAssets}><RefreshCw size={18} /> 重新匹配</button>
               <VoiceSelect value={voiceType} onChange={setVoiceType} />
               <button className="primary" onClick={generateVoiceAndSubtitles}><Mic size={18} /> 生成配音与字幕</button>
             </div>
             <div className="shot-list">
               {shots.map((shot) => (
                 <div className="shot" key={shot.id}>
-                  <ShotCard shot={shot} asset={selectedAssets.get(shot.selected_asset_id)} onGenerate={() => generateImage(shot.id)} />
-                  <select value={shot.selected_asset_id || ''} onChange={(e) => selectAsset(shot.id, e.target.value)}>
+                  <ShotCard
+                    shot={shot}
+                    assets={generatedAssetsByShot.get(shot.id) || []}
+                    selectedAssetId={shot.selected_asset_id}
+                    onSelect={(assetId) => selectAsset(shot.id, assetId, 'web_search')}
+                    onPreview={setPreviewAsset}
+                    onGenerate={() => generateImage(shot.id)}
+                  />
+                  <select value={shot.selected_asset_id || ''} onChange={(e) => {
+                    const options = selectableAssets.filter((item) => !item.shot_id || item.shot_id === shot.id);
+                    const selected = options.find((asset) => asset.id === e.target.value);
+                    selectAsset(shot.id, e.target.value, selected?.asset_source || 'web_search');
+                  }}>
                     <option value="">手动选择素材</option>
-                    {assets.map((asset) => <option key={asset.id} value={asset.id}>{asset.file_name}</option>)}
+                    {selectableAssets.filter((item) => !item.shot_id || item.shot_id === shot.id).map((asset) => <option key={asset.id} value={asset.id}>{asset.file_name}</option>)}
                   </select>
                 </div>
               ))}
@@ -439,6 +499,7 @@ function App() {
         />
       )}
       {editingAsset && <AssetEditor asset={editingAsset} onClose={() => setEditingAsset(null)} onSave={saveAssetTags} onDelete={deleteAsset} />}
+      {previewAsset && <ImagePreview asset={previewAsset} onClose={() => setPreviewAsset(null)} />}
     </div>
   );
 }
@@ -468,6 +529,43 @@ function VoiceSelect({ value, onChange }) {
         {VOICE_OPTIONS.map((voice) => <option key={voice.value} value={voice.value}>{voice.label}</option>)}
       </select>
     </label>
+  );
+}
+
+function SearchProgress({ progress, project }) {
+  const label = progress.total
+    ? `${progress.completed} / ${progress.total} 个分镜图片完成`
+    : '等待生成分镜';
+  return (
+    <div className="progress-panel">
+      <div className="progress-row">
+        <strong>分镜图片进度</strong>
+        <span>{label}</span>
+      </div>
+      <div className="progress-track">
+        <div className="progress-fill" style={{ width: `${progress.percent}%` }} />
+      </div>
+      {project?.status === 'searching_images' && (
+        <small>正在处理镜头 {project.current_shot_index || '-'} {project.current_search_keyword ? `· ${project.current_search_keyword}` : ''}</small>
+      )}
+    </div>
+  );
+}
+
+function ImagePreview({ asset, onClose }) {
+  return (
+    <div className="image-preview-backdrop" onClick={onClose}>
+      <div className="image-preview" onClick={(e) => e.stopPropagation()}>
+        <div className="image-preview-head">
+          <strong>{asset.file_name || '图片预览'}</strong>
+          <button type="button" onClick={onClose}>关闭</button>
+        </div>
+        <img src={`${API}${asset.file_url}`} alt={asset.file_name || 'preview'} />
+        {(asset.source_page || asset.remote_url) && (
+          <a href={asset.source_page || asset.remote_url} target="_blank" rel="noreferrer">查看来源</a>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -561,18 +659,38 @@ function AssetEditor({ asset, onClose, onSave, onDelete }) {
   );
 }
 
-function ShotCard({ shot, asset, onGenerate }) {
+function ShotCard({ shot, assets = [], selectedAssetId, onSelect, onPreview, onGenerate }) {
+  const placeholders = Math.max(0, 3 - assets.length);
   return (
     <article className="shot-card">
       <div className="shot-main">
         <span className={`pill ${shot.status}`}>镜头 {shot.shot_index} · {shot.status}</span>
         <h3>{shot.voice_text}</h3>
-        <p>画面需求：{shot.visual_need}</p>
-        <p>需要主体：{(shot.required_object || []).join(' / ') || '未生成'}</p>
-        <p>需要场景：{(shot.required_scene || []).join(' / ') || '未生成'}</p>
+        <p>画面意图：{shot.visual_intent || shot.visual_need || '识别中'}</p>
+        <p>搜索关键词：{(shot.search_keywords || []).join(' / ') || shot.current_search_keyword || '生成中'}</p>
       </div>
       <div className="shot-side">
-        {asset ? <AssetCard asset={asset} /> : <div className="empty">暂无真实素材</div>}
+        <div className="shot-images">
+          {assets.map((item) => (
+            <button
+              type="button"
+              className={item.id === selectedAssetId ? 'image-choice selected' : 'image-choice'}
+              key={item.id}
+              onClick={() => {
+                onSelect?.(item.id);
+                onPreview?.(item);
+              }}
+              title="选择并预览这张图"
+            >
+              <AssetCard asset={item} />
+            </button>
+          ))}
+          {Array.from({ length: placeholders }).map((_, index) => (
+            <div className="search-placeholder" key={`placeholder-${index}`}>
+              {['pending_search', 'analyzing_intent', 'searching'].includes(shot.status) ? '搜索中' : '暂无图片'}
+            </div>
+          ))}
+        </div>
         <button onClick={onGenerate}><Wand2 size={18} /> AI 占位图</button>
       </div>
     </article>

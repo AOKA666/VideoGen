@@ -15,7 +15,7 @@ def ensure_storage() -> None:
     ASSETS_DIR.mkdir(parents=True, exist_ok=True)
     PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
     if not DB.exists():
-        save_db({"projects": [], "shots": [], "assets": [], "project_assets": [], "generated_assets": [], "asset_library": None})
+        save_db({"projects": [], "shots": [], "assets": [], "project_assets": [], "generated_assets": [], "asset_library": None, "web_image_failures": []})
         return
     data = json.loads(DB.read_text(encoding="utf-8"))
     changed = False
@@ -26,6 +26,7 @@ def ensure_storage() -> None:
         "project_assets": [],
         "generated_assets": [],
         "asset_library": None,
+        "web_image_failures": [],
     }.items():
         if key not in data:
             data[key] = default
