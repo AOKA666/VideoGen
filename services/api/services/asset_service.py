@@ -71,6 +71,8 @@ def normalize_tags(tags: dict[str, Any], file_type: str) -> dict[str, Any]:
         "scene": as_list("scene"),
         "keywords": as_list("keywords"),
         "media_type": tags.get("media_type") or ("photo" if file_type == "image" else "video"),
+        "visual_style": str(tags.get("visual_style") or "").strip(),
+        "is_real_photo": tags.get("is_real_photo"),
         "analysis_provider": tags.get("analysis_provider") or "glm",
         "analysis_error": tags.get("analysis_error", ""),
     }
@@ -106,6 +108,14 @@ def analyze_image_with_glm(filename: str, file_path: Path, api_key: str) -> dict
         "object/scene/keywords 都是中文字符串数组；"
         f"文件名：{filename}"
     )
+    prompt += (
+        "\n\n重要补充规则：必须判断图片是否真实照片。"
+        "软件截图、网页截图、CAD/三维建模界面、三维渲染图、插画、海报、PPT、图表、表情包都不是照片。"
+        "返回 JSON 必须额外包含 media_type, visual_style, is_real_photo。"
+        "media_type 只能是 photo、screenshot、render、illustration、poster、document、chart 之一。"
+        "非真实照片的 is_real_photo 必须为 false。"
+    )
+    prompt += "\n一页书、文章截图、帖子截图、评论截图、聊天记录、大段文字图片也不是可用分镜照片，is_real_photo 必须为 false。"
     payload = {
         "model": bigmodel_model(),
         "messages": [
@@ -120,6 +130,7 @@ def analyze_image_with_glm(filename: str, file_path: Path, api_key: str) -> dict
         ],
         "temperature": 0.2,
         "stream": False,
+        "thinking": {"type": "disabled"},
         "response_format": {"type": "json_object"},
     }
     data = json.dumps(payload).encode("utf-8")

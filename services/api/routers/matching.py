@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 
 from services.store import load_db, save_db
-from services.web_image_pipeline import mark_project_searching, reset_project_web_images, run_project_web_image_search
+from services.web_image_pipeline import mark_project_searching, rerun_shot_web_image_search, reset_project_web_images, run_project_web_image_search
 
 router = APIRouter(prefix="/api/projects", tags=["matching"])
 
@@ -21,6 +21,24 @@ def match_assets(project_id: str, background_tasks: BackgroundTasks):
     save_db(db)
     background_tasks.add_task(run_project_web_image_search, project_id)
     return {"project_id": project_id, "status": "searching_images", "count": len(shots)}
+
+
+@router.post("/{project_id}/shots/{shot_id}/retry-image-search")
+def retry_image_search(project_id: str, shot_id: str, background_tasks: BackgroundTasks):
+    db = load_db()
+    project = next((p for p in db["projects"] if p["id"] == project_id), None)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    shot = next((s for s in db["shots"] if s["project_id"] == project_id and s["id"] == shot_id), None)
+    if not shot:
+        raise HTTPException(404, "Shot not found")
+    if int(shot.get("search_attempts") or 0) >= 2:
+        raise HTTPException(409, "This shot has already used its one retry")
+    shot["status"] = "searching"
+    project["status"] = "searching_images"
+    save_db(db)
+    background_tasks.add_task(rerun_shot_web_image_search, project_id, shot_id)
+    return {"project_id": project_id, "shot_id": shot_id, "status": "searching"}
 
 
 @router.patch("/{project_id}/shots/{shot_id}/asset")

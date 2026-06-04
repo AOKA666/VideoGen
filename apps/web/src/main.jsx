@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Archive, Download, Film, FolderOpen, ImagePlus, Library, Mic, RefreshCw, Save, Scissors, Search, Tags, Trash2, Wand2 } from 'lucide-react';
+import { Archive, Download, Film, FolderOpen, ImagePlus, Library, Mic, RefreshCw, Save, Scissors, Search, Tags, Terminal, Trash2, Wand2 } from 'lucide-react';
 import './styles.css';
 
 const API = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
@@ -56,6 +56,10 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [voiceType, setVoiceType] = useState(VOICE_OPTIONS[0].value);
   const [previewAsset, setPreviewAsset] = useState(null);
+  const [consoleOpen, setConsoleOpen] = useState(false);
+  const [consoleStream, setConsoleStream] = useState('stderr');
+  const [consoleLog, setConsoleLog] = useState('');
+  const [consoleMeta, setConsoleMeta] = useState(null);
   const folderFallbackRef = useRef(null);
   const uploadInputRef = useRef(null);
 
@@ -95,7 +99,7 @@ function App() {
   }, [generatedAssets]);
   const searchProgress = useMemo(() => {
     const total = shots.length || project?.search_total || 0;
-    const completedByShots = shots.filter((shot) => ['web_downloaded', 'no_image'].includes(shot.status)).length;
+    const completedByShots = shots.filter((shot) => ['web_downloaded', 'no_image', 'ai_generated'].includes(shot.status)).length;
     const completed = Math.min(total || project?.search_total || 0, Math.max(completedByShots, project?.search_completed || 0));
     const percent = total ? Math.min(100, Math.round((completed / total) * 100)) : 0;
     return { total, completed, percent };
@@ -137,6 +141,21 @@ function App() {
       setProjectId('');
     }
   }
+
+  async function refreshConsoleLog(stream = consoleStream) {
+    const data = await request(`/api/system/logs?stream=${stream}&max_chars=20000`);
+    setConsoleLog(data.content || '');
+    setConsoleMeta(data);
+  }
+
+  useEffect(() => {
+    if (!consoleOpen) return undefined;
+    refreshConsoleLog(consoleStream).catch((err) => setConsoleLog(String(err.message || err)));
+    const timer = window.setInterval(() => {
+      refreshConsoleLog(consoleStream).catch((err) => setConsoleLog(String(err.message || err)));
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [consoleOpen, consoleStream]);
 
   useEffect(() => {
     refreshAll();
@@ -291,6 +310,11 @@ function App() {
     await refreshAll(projectId);
   }
 
+  async function retryImageSearch(shotId) {
+    await run('重新搜索图片', () => request(`/api/projects/${projectId}/shots/${shotId}/retry-image-search`, { method: 'POST' }));
+    await refreshAll(projectId);
+  }
+
   async function selectAsset(shotId, assetId, assetSource = 'web_search') {
     await run('指定素材', () => request(`/api/projects/${projectId}/shots/${shotId}/asset`, {
       method: 'PATCH',
@@ -350,7 +374,10 @@ function App() {
             <h1>{project?.name || '真实素材优先的短视频草稿工作台'}</h1>
             <p>{activeLibrary ? `当前素材库：${activeLibrary.name}` : '进入素材库前，需要先选择一个文件夹作为素材库。'}</p>
           </div>
-          <span className={busy ? 'status busy' : 'status'}>{message || '就绪'}</span>
+          <div className="top-actions">
+            <button type="button" onClick={() => setConsoleOpen(true)}><Terminal size={18} /> 后端控制台</button>
+            <span className={busy ? 'status busy' : 'status'}>{message || '就绪'}</span>
+          </div>
         </header>
 
         {tab === 'create' && (
@@ -439,6 +466,7 @@ function App() {
                   onSelect={(assetId) => selectAsset(shot.id, assetId, 'web_search')}
                   onPreview={setPreviewAsset}
                   onGenerate={() => generateImage(shot.id)}
+                  onRetry={() => retryImageSearch(shot.id)}
                 />
               ))}
             </div>
@@ -461,6 +489,7 @@ function App() {
                     onSelect={(assetId) => selectAsset(shot.id, assetId, 'web_search')}
                     onPreview={setPreviewAsset}
                     onGenerate={() => generateImage(shot.id)}
+                    onRetry={() => retryImageSearch(shot.id)}
                   />
                   <select value={shot.selected_asset_id || ''} onChange={(e) => {
                     const options = selectableAssets.filter((item) => !item.shot_id || item.shot_id === shot.id);
@@ -500,17 +529,31 @@ function App() {
       )}
       {editingAsset && <AssetEditor asset={editingAsset} onClose={() => setEditingAsset(null)} onSave={saveAssetTags} onDelete={deleteAsset} />}
       {previewAsset && <ImagePreview asset={previewAsset} onClose={() => setPreviewAsset(null)} />}
+      {consoleOpen && (
+        <BackendConsole
+          stream={consoleStream}
+          content={consoleLog}
+          meta={consoleMeta}
+          onStreamChange={setConsoleStream}
+          onRefresh={() => refreshConsoleLog(consoleStream)}
+          onClose={() => setConsoleOpen(false)}
+        />
+      )}
     </div>
   );
 }
 
 function AssetCard({ asset, onEdit, onDelete }) {
+  const imageScore = asset.score_result?.score ?? asset.match_score;
+  const imageReason = asset.score_result?.reason;
   return (
     <article className={asset.analysis_status === 'analyzing' ? 'asset-card analyzing' : 'asset-card'}>
       <div className="preview">{asset.file_type === 'image' ? <img src={`${API}${asset.file_url}`} /> : <video src={`${API}${asset.file_url}`} controls />}</div>
       <h3>{asset.file_name}</h3>
+      {imageScore !== undefined && imageScore !== null && <p>图片评分：{imageScore}</p>}
       <p>{asset.analysis_status === 'analyzing' ? '识别中' : [...(asset.object || asset.people || []), ...(asset.scene || []), ...(asset.keywords || [])].slice(0, 6).join(' / ') || '待补充标签'}</p>
       <small>{asset.analysis_status === 'analyzing' ? '识别标签中，请稍候' : `${asset.analysis_provider || 'local_fallback'} · ${asset.copyright_note}`}</small>
+      {imageReason && <small>{imageReason}</small>}
       {(onEdit || onDelete) && (
         <div className="asset-actions">
           {onEdit && <button disabled={asset.analysis_status === 'analyzing'} onClick={onEdit}><Tags size={16} /> 编辑标签</button>}
@@ -518,6 +561,28 @@ function AssetCard({ asset, onEdit, onDelete }) {
         </div>
       )}
     </article>
+  );
+}
+
+function BackendConsole({ stream, content, meta, onStreamChange, onRefresh, onClose }) {
+  return (
+    <div className="console-panel">
+      <div className="console-head">
+        <strong><Terminal size={18} /> 后端控制台</strong>
+        <div className="console-tools">
+          <select value={stream} onChange={(e) => onStreamChange(e.target.value)}>
+            <option value="stderr">运行日志</option>
+            <option value="stdout">标准输出</option>
+            <option value="legacy_stderr">历史错误日志</option>
+            <option value="legacy_stdout">历史输出日志</option>
+          </select>
+          <button type="button" onClick={onRefresh}><RefreshCw size={16} /> 刷新</button>
+          <button type="button" onClick={onClose}>关闭</button>
+        </div>
+      </div>
+      <small>{meta?.exists ? meta.path : '日志文件还没有生成'}</small>
+      <pre>{content || '暂无日志输出'}</pre>
+    </div>
   );
 }
 
@@ -659,8 +724,12 @@ function AssetEditor({ asset, onClose, onSave, onDelete }) {
   );
 }
 
-function ShotCard({ shot, assets = [], selectedAssetId, onSelect, onPreview, onGenerate }) {
-  const placeholders = Math.max(0, 3 - assets.length);
+function ShotCard({ shot, assets = [], selectedAssetId, onSelect, onPreview, onGenerate, onRetry }) {
+  const visibleAssets = [...assets]
+    .sort((a, b) => (b.id === selectedAssetId ? 1 : 0) - (a.id === selectedAssetId ? 1 : 0))
+    .slice(0, 1);
+  const placeholders = Math.max(0, 1 - visibleAssets.length);
+  const canRetry = (shot.search_attempts || 0) < 2 && !['pending_search', 'analyzing_intent', 'searching'].includes(shot.status);
   return (
     <article className="shot-card">
       <div className="shot-main">
@@ -670,8 +739,9 @@ function ShotCard({ shot, assets = [], selectedAssetId, onSelect, onPreview, onG
         <p>搜索关键词：{(shot.search_keywords || []).join(' / ') || shot.current_search_keyword || '生成中'}</p>
       </div>
       <div className="shot-side">
+        <button onClick={onRetry} disabled={!canRetry}><RefreshCw size={18} /> 重新搜索</button>
         <div className="shot-images">
-          {assets.map((item) => (
+          {visibleAssets.map((item) => (
             <button
               type="button"
               className={item.id === selectedAssetId ? 'image-choice selected' : 'image-choice'}

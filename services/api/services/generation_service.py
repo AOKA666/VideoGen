@@ -4,6 +4,7 @@ import html
 import base64
 import http.client
 import json
+import mimetypes
 import os
 import urllib.error
 import urllib.request
@@ -58,12 +59,99 @@ def ark_image_model() -> str:
     return os.getenv("ARK_IMAGE_MODEL", "doubao-seedream-4.5")
 
 
+def ark_image_edit_model() -> str:
+    return os.getenv("ARK_IMAGE_EDIT_MODEL", ark_image_model())
+
+
 def image_size_for_ratio(video_ratio: str | None) -> str:
     if video_ratio == "16:9":
         return "2560x1440"
     if video_ratio == "1:1":
         return "1920x1920"
     return "1440x2560"
+
+
+def _multipart_form_data(fields: dict[str, str], files: list[tuple[str, str, str, bytes]]) -> tuple[bytes, str]:
+    boundary = f"----VideoGenArkBoundary{uuid4().hex}"
+    chunks: list[bytes] = []
+    for name, value in fields.items():
+        chunks.extend([
+            f"--{boundary}\r\n".encode("ascii"),
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("ascii"),
+            str(value).encode("utf-8"),
+            b"\r\n",
+        ])
+    for name, filename, mime, data in files:
+        chunks.extend([
+            f"--{boundary}\r\n".encode("ascii"),
+            f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'.encode("utf-8"),
+            f"Content-Type: {mime}\r\n\r\n".encode("ascii"),
+            data,
+            b"\r\n",
+        ])
+    chunks.append(f"--{boundary}--\r\n".encode("ascii"))
+    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+
+def remove_watermark_with_seedream(path: Path, shot: dict | None = None) -> dict:
+    api_key = os.getenv("ARK_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("ARK_API_KEY is not configured")
+    if not path.exists():
+        raise RuntimeError(f"Image does not exist: {path}")
+
+    prompt = (
+        "请对这张图片做写实修复：只移除可见水印、logo、平台署名、角落文字、覆盖式文字标记；"
+        "保持主体、构图、色彩、清晰度和画面内容不变，不要新增文字，不要改成插画。"
+    )
+    if shot:
+        prompt += f" 分镜画面语境：{shot.get('visual_need') or shot.get('voice_text') or ''}"
+    mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+    body, content_type = _multipart_form_data(
+        {
+            "model": ark_image_edit_model(),
+            "prompt": prompt,
+            "response_format": "url",
+            "watermark": "false",
+        },
+        [("image", path.name, mime, path.read_bytes())],
+    )
+    req = urllib.request.Request(
+        f"{ark_endpoint().rstrip('/')}/images/edits",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": content_type,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as response:
+            response_body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Volcengine Ark image edit API {exc.code}: {error_body}") from exc
+
+    images = response_body.get("data") or response_body.get("images") or []
+    image = images[0] if images and isinstance(images[0], dict) else {}
+    image_url = image.get("url") or image.get("image_url")
+    image_b64 = image.get("b64_json") or image.get("base64")
+    if image_url:
+        with urllib.request.urlopen(image_url, timeout=180) as response:
+            edited = response.read()
+    elif image_b64:
+        edited = base64.b64decode(image_b64)
+    else:
+        raise RuntimeError(f"Volcengine Ark image edit response does not contain an image: {response_body}")
+
+    path.write_bytes(edited)
+    return {
+        "watermark_checked_by_ai": True,
+        "watermark_removed": True,
+        "provider": "volcengine_ark",
+        "model": ark_image_edit_model(),
+        "remote_url": image_url or "",
+    }
 
 
 def generate_doubao_image(path: Path, shot: dict, video_ratio: str | None = "9:16") -> dict:

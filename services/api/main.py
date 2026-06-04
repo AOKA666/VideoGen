@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from routers import assets, export, generation, matching, projects, shots
+from routers import assets, export, generation, matching, projects, shots, system
 from services.env import load_env_local
 from services.store import ensure_storage
 
@@ -27,6 +27,7 @@ app.include_router(shots.router)
 app.include_router(matching.router)
 app.include_router(generation.router)
 app.include_router(export.router)
+app.include_router(system.router)
 
 
 @app.get("/api/health")

@@ -9,7 +9,7 @@ import urllib.request
 
 ABSTRACT_WORDS = ["伟大", "震撼", "感人", "精神", "贡献", "意义", "重要", "传奇", "辉煌"]
 MIN_KEYWORDS_PER_SHOT = 3
-MAX_KEYWORDS_PER_SHOT = 5
+MAX_KEYWORDS_PER_SHOT = 3
 MAX_KEYWORD_CHARS = 10
 KNOWN_PEOPLE = [
     "钱学森", "邓稼先", "于敏", "黄旭华", "郭永怀", "袁隆平", "王淦昌", "屠呦呦",

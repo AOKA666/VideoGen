@@ -11,6 +11,8 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from services.image_scoring_service import aspect_ratio_score
+
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -172,7 +174,7 @@ class WebImageSearchProvider:
 def search_keywords_for_shot(shot: dict) -> list[str]:
     explicit_keywords = [str(x).strip() for x in shot.get("search_keywords") or [] if str(x).strip()]
     if explicit_keywords:
-        return explicit_keywords
+        return explicit_keywords[:3]
     objects = [str(x).strip() for x in shot.get("required_object") or [] if str(x).strip()]
     scenes = [str(x).strip() for x in shot.get("required_scene") or [] if str(x).strip()]
     visual_need = str(shot.get("visual_need") or "").strip()
@@ -188,7 +190,11 @@ def search_keywords_for_shot(shot: dict) -> list[str]:
     if voice_text:
         seeds.append(f"{voice_text[:24]} 配图")
     seeds.append("历史纪实 老照片")
-    return list(dict.fromkeys(seeds))
+    return list(dict.fromkeys(seeds))[:3]
+
+
+def search_query_for_shot(shot: dict) -> str:
+    return " ".join(search_keywords_for_shot(shot)[:3]).strip()
 
 
 def _extension_from_content(content_type: str, url: str) -> str:
@@ -274,31 +280,33 @@ def download_images_for_shot(
     *,
     images_per_shot: int = 3,
     results_per_keyword: int = 12,
-    delay: float = 0.8,
-    timeout: int = 10,
+    delay: float = 0.1,
+    timeout: int = 6,
     on_download=None,
+    exclude_urls: set[str] | None = None,
+    exclude_hashes: set[str] | None = None,
+    exclude_sources: set[str] | None = None,
 ) -> tuple[list[ImageResult], list[dict], list[dict]]:
     provider = WebImageSearchProvider(timeout=timeout)
     search_results: list[ImageResult] = []
     downloaded: list[dict] = []
     failures: list[dict] = []
-    seen_hashes = set()
-    seen_urls = set()
-    seen_sources = set()
+    seen_hashes = set(exclude_hashes or set())
+    seen_urls = {_url_key(url) for url in (exclude_urls or set()) if url}
+    seen_sources = {_url_key(url) for url in (exclude_sources or set()) if url}
     seen_dimensions = set()
 
-    for keyword_index, keyword in enumerate(search_keywords_for_shot(shot), start=1):
-        if len(downloaded) >= images_per_shot:
-            break
-        if keyword_index > 1:
-            time.sleep(delay)
+    keyword = search_query_for_shot(shot)
+    if keyword:
         results = provider.search(keyword, results_per_keyword)
         search_results.extend(results)
         if not results:
             failures.append({"keyword": keyword, "stage": "search", "error": "no image result"})
-            continue
+        elif delay:
+            time.sleep(delay)
         for result_index, result in enumerate(results, start=1):
-            if len(downloaded) >= images_per_shot:
+            max_downloads = max(images_per_shot, min(results_per_keyword, images_per_shot * 3))
+            if len(downloaded) >= max_downloads:
                 break
             candidate_key = _url_key(result.image_url or result.thumb_url)
             source_key = _url_key(result.source_page)
@@ -310,7 +318,7 @@ def download_images_for_shot(
             item = download_image(
                 result,
                 output_dir,
-                f"shot_{shot['shot_index']:03d}_kw_{keyword_index:02d}_img_{result_index:03d}",
+                f"shot_{shot['shot_index']:03d}_search_img_{result_index:03d}",
                 timeout=timeout,
             )
             if not item:
@@ -327,10 +335,15 @@ def download_images_for_shot(
                 "source_page": result.source_page,
                 "image_url": result.image_url,
                 "source": result.source,
+                "aspect_ratio_score": aspect_ratio_score(item),
             })
             downloaded.append(item)
             if on_download:
                 on_download(item, len(downloaded))
 
     failures.extend(provider.failures)
+    downloaded.sort(key=lambda item: (item.get("aspect_ratio_score") or 0, item.get("width", 0) * item.get("height", 0)), reverse=True)
+    for item in downloaded[images_per_shot:]:
+        Path(item["local_path"]).unlink(missing_ok=True)
+    downloaded = downloaded[:images_per_shot]
     return search_results, downloaded, failures
