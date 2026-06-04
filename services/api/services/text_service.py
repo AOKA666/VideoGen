@@ -5,16 +5,115 @@ import os
 import re
 import urllib.error
 import urllib.request
+from collections import Counter
 from difflib import SequenceMatcher
 
 PERSON_HINTS = ["钱学森", "邓稼先", "于敏", "黄旭华", "郭永怀", "袁隆平", "王淦昌", "两弹一星"]
 SCENE_HINTS = ["实验室", "会议", "档案", "照片", "火箭", "导弹", "核潜艇", "宿舍", "办公室", "手稿", "文件"]
 ERA_HINTS = ["1950", "1960", "1970", "上世纪", "建国", "抗战"]
+MIN_REWRITE_LENGTH_RATIO = 0.85
+MAX_REWRITE_LENGTH_RATIO = 1.25
+MIN_REWRITE_DIFFERENCE = 45
+MAX_REWRITE_ATTEMPTS = 3
+
+
+class RewriteQualityError(RuntimeError):
+    def __init__(self, result: dict):
+        comparison = result.get("rewrite_comparison") or {}
+        difference = comparison.get("overall_difference", 0)
+        super().__init__(f"rewrite difference {difference}% below {MIN_REWRITE_DIFFERENCE}%")
+        self.result = result
+
+
+def content_length(text: str) -> int:
+    return len(re.sub(r"\s+", "", text or ""))
+
+
+def lcs_length(text1: str, text2: str) -> int:
+    if not text1 or not text2:
+        return 0
+    previous = [0] * (len(text2) + 1)
+    for char1 in text1:
+        current = [0]
+        for index2, char2 in enumerate(text2, start=1):
+            if char1 == char2:
+                current.append(previous[index2 - 1] + 1)
+            else:
+                current.append(max(previous[index2], current[-1]))
+        previous = current
+    return previous[-1]
+
+
+def segment_for_similarity(text: str) -> list[str]:
+    cleaned = re.sub(r"[，。！？；：、“”‘’《》【】（）,.!?;:'\"<>\[\]\(\)]", " ", text or "")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    words: list[str] = []
+    for length in range(4, 1, -1):
+        for index in range(0, max(0, len(cleaned) - length + 1)):
+            word = cleaned[index:index + length]
+            if not re.search(r"\s", word):
+                words.append(word)
+    words.extend(char for char in cleaned if not re.search(r"\s", char))
+    return words
+
+
+def cosine_similarity(words1: list[str], words2: list[str]) -> float:
+    counter1 = Counter(words1)
+    counter2 = Counter(words2)
+    all_words = set(counter1) | set(counter2)
+    if not all_words:
+        return 0.0
+    dot_product = sum(counter1[word] * counter2[word] for word in all_words)
+    magnitude1 = sum(value * value for value in counter1.values()) ** 0.5
+    magnitude2 = sum(value * value for value in counter2.values()) ** 0.5
+    if not magnitude1 or not magnitude2:
+        return 0.0
+    return dot_product / (magnitude1 * magnitude2)
+
+
+def compare_scripts(text1: str, text2: str) -> dict:
+    text1 = text1 or ""
+    text2 = text2 or ""
+    total_chars = len(text1) + len(text2)
+    char_similarity = round((lcs_length(text1, text2) * 2 / total_chars) * 100) if total_chars else 0
+
+    words1 = segment_for_similarity(text1)
+    words2 = segment_for_similarity(text2)
+    set1 = set(words1)
+    set2 = set(words2)
+    intersection = set1 & set2
+    union = set1 | set2
+    jaccard_similarity = len(intersection) / len(union) if union else 0
+    semantic_similarity = round(((jaccard_similarity + cosine_similarity(words1, words2)) / 2) * 100)
+    overall_similarity = round((char_similarity + semantic_similarity) / 2)
+    overall_difference = max(0, min(100, 100 - overall_similarity))
+
+    return {
+        "character_similarity": char_similarity,
+        "semantic_similarity": semantic_similarity,
+        "overall_difference": overall_difference,
+        "text1_length": len(text1),
+        "text2_length": len(text2),
+        "common_keywords": [word for word in intersection if len(word) >= 2][:10],
+        "unique_keywords1": [word for word in set1 - set2 if len(word) >= 2][:10],
+        "unique_keywords2": [word for word in set2 - set1 if len(word) >= 2][:10],
+        "passed": overall_difference >= MIN_REWRITE_DIFFERENCE,
+    }
 
 
 def split_sentences(text: str) -> list[str]:
     parts = re.split(r"(?<=[。！？!?；;])\s*", text.strip())
     return [p.strip() for p in parts if p.strip()]
+
+
+def paragraphize_script(text: str) -> str:
+    sentences = split_sentences(text)
+    if sentences:
+        return "\n".join(sentences)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if lines:
+        return "\n".join(lines)
+    return text.strip()
 
 
 def infer_title(raw_script: str) -> str:
@@ -110,6 +209,8 @@ def fallback_rewrite_script(raw_script: str, style: str = "纪实故事型") -> 
             body.append(cleaned)
         body.append("这些真实细节，比任何夸张的渲染都更有力量。")
     rewritten = "\n".join(body) if body else hook
+    if content_length(raw_script) and content_length(rewritten) < int(content_length(raw_script) * MIN_REWRITE_LENGTH_RATIO):
+        rewritten = paragraphize_script(raw_script)
     return {
         "title": title,
         "hook": hook,
@@ -117,6 +218,7 @@ def fallback_rewrite_script(raw_script: str, style: str = "纪实故事型") -> 
         "script_style": style,
         "rewrite_provider": "local_fallback",
         "rewrite_error": "",
+        "rewrite_comparison": compare_scripts(raw_script, rewritten),
     }
 
 
@@ -128,6 +230,7 @@ def normalize_rewrite_result(result: dict, raw_script: str, style: str) -> dict:
         rewritten_script = fallback_rewrite_script(raw_script, style)["rewritten_script"]
     rewritten_script = clean_rewritten_script(raw_script, rewritten_script)
     rewritten_script = preserve_opening_hook(raw_script, rewritten_script)
+    comparison = compare_scripts(raw_script, rewritten_script)
     return {
         "title": title[:40] or infer_title(raw_script),
         "hook": hook,
@@ -135,38 +238,91 @@ def normalize_rewrite_result(result: dict, raw_script: str, style: str) -> dict:
         "script_style": str(result.get("script_style") or style),
         "rewrite_provider": result.get("rewrite_provider") or bigmodel_model(),
         "rewrite_error": result.get("rewrite_error", ""),
+        "rewrite_comparison": comparison,
+        "rewrite_difference": comparison["overall_difference"],
     }
 
 
-def rewrite_script_with_glm(raw_script: str, style: str, api_key: str) -> dict:
+def build_rewrite_prompt(raw_script: str, style: str, attempt: int, previous: dict | None = None) -> str:
     opening_hook = extract_opening_hook(raw_script)
+    raw_len = content_length(raw_script)
+    min_len = int(raw_len * MIN_REWRITE_LENGTH_RATIO)
+    max_len = int(raw_len * MAX_REWRITE_LENGTH_RATIO)
+    retry_instruction = ""
+    if previous:
+        comparison = previous.get("rewrite_comparison") or {}
+        retry_instruction = (
+            f"上一版总体差异度只有 {comparison.get('overall_difference', 0)}%，未达到 {MIN_REWRITE_DIFFERENCE}%。"
+            f"字符相似度 {comparison.get('character_similarity', 0)}%，语义相似度 {comparison.get('semantic_similarity', 0)}%。"
+            "这说明上一版仍然太像原文。请不要继续做同义词替换，必须重新组织正文：改变叙述视角、句子顺序、铺垫方式、转折方式和情绪推进。"
+        )
     prompt = (
-        "你是历史纪实短视频口播文案改写助手。请把原始文案改写成适合短视频旁白的中文稿。"
+        "你是历史纪实短视频二创编剧，不是润色编辑。你的任务是把原始文案重写成另一版完整口播稿。"
         "你只能改写 <raw_script> 标签内的内容，禁止替换主题，禁止改成其他历史事件。"
-        "要求：事实不虚构；不添加没有依据的具体时间、地点、人物关系；语言自然、有画面感；"
-        "必须先通读全文再整体改写，不要一句一句机械对应原文。"
+        "事实边界：不虚构；不添加没有依据的具体时间、地点、人物关系；人物、年代、事件、因果关系必须保留。"
+        "改写目标：保留事实点和信息量，但重建表达方式。不要逐句翻译、不要逐句扩写、不要只做同义词替换。"
+        f"原文去除空白后的长度约 {raw_len} 个中文字符；二创稿不能写得太简略，"
+        f"rewritten_script 去除空白后的长度必须控制在 {min_len} 到 {max_len} 个中文字符之间，"
+        "信息量、叙事层次和关键细节要和原文案接近，禁止压缩成摘要、提纲或短版解说，也不要省略原文中的重要事实。"
         "开头黄金三秒文案必须一个字、一个标点都不改，并放在 rewritten_script 最开头；"
         f"需要原样保留的开头黄金三秒是：{opening_hook}"
-        "除开头黄金三秒之外，剩余内容要大改，整体修改程度保持 50% 以上；"
+        f"除开头黄金三秒之外，剩余内容必须大改；系统会用字符相似度和语义相似度自动对比，最终总体差异度必须达到 {MIN_REWRITE_DIFFERENCE}% 以上。"
+        "后文改写硬性规则："
+        "1. 不要保留原文连续 8 个字以上的表达，专有名词、年份和固定称谓除外。"
+        "2. 原文每个事实点都要覆盖，但可以换叙述顺序、换句式、换铺垫、换转折。"
+        "3. 把原文的直述句尽量改成悬念句、因果句、补充说明句或镜头化描述。"
+        "4. 能换表达就换表达，例如“远赴重洋赴美留学”不要照抄，可改成“踏上去美国求学的路”。"
+        "5. 不要连续沿用原文的段落结构；可以把一个长句拆成两段，也可以把相邻短句重组为一段。"
+        "6. 不要为了差异度删除内容，必须用新的说法把信息补回来。"
+        "二创写法建议：先在心里提取事实清单，再用新的叙事路径重写；可以从人物选择、时代压力、行动细节、结果意义等角度重新组织。"
         "全面校对错别字、语病和标点错误，输出必须是通顺、干净的成稿。"
-        "原文案中呼吁点赞互动的钩子不要删除掉，但可以改写成更吸引人的表达；如果原文没有明显钩子，可以自己添加一个，放在开头黄金三秒之后。"
+        "原文案中呼吁点赞互动的钩子不要删除掉，但必须改写成更吸引人的表达；如果原文没有明显钩子，可以自己添加一个，放在开头黄金三秒之后。"
         "必须根据语义分段，一个完整意思一段；每段就是后续一个分镜，不要把多个意思放在同一段，同样的意思也不要分段；"
-        "每段尽量 20 到 40 个中文字符，适合配音；不要输出 Markdown。"
+        "每段尽量 20 到 50 个中文字符，适合配音；如果为了保持总字数需要，可以保留更多分段，不要删减事实细节。不要输出 Markdown。"
         f"文案风格：{style}。"
+        f"这是第 {attempt} 次生成。{retry_instruction}"
         "rewritten_script 字段里只能放最终二创口播稿正文，禁止包含原文、原始文案、对照稿、解释、标题标签或“二创口播稿：”这类前缀。"
         "不要先输出一遍原文再输出二创稿，也不要把原文和二创内容混在一起。"
         "只返回 JSON，字段必须包含 title, hook, rewritten_script, script_style。"
         f"<raw_script>{raw_script}</raw_script>"
     )
+    return prompt
+
+
+def rewrite_script_with_glm(raw_script: str, style: str, api_key: str) -> dict:
+    raw_len = content_length(raw_script)
+    best_result: dict | None = None
+    last_result: dict | None = None
+    for attempt in range(1, MAX_REWRITE_ATTEMPTS + 1):
+        prompt = build_rewrite_prompt(raw_script, style, attempt, last_result)
+        result = request_glm_rewrite(prompt, raw_script, style, api_key, raw_len)
+        comparison = result.get("rewrite_comparison") or {}
+        if not best_result or comparison.get("overall_difference", 0) > (best_result.get("rewrite_comparison") or {}).get("overall_difference", 0):
+            best_result = result
+        if comparison.get("overall_difference", 0) >= MIN_REWRITE_DIFFERENCE:
+            result["rewrite_attempts"] = attempt
+            return result
+        last_result = result
+
+    assert best_result is not None
+    comparison = best_result.get("rewrite_comparison") or {}
+    best_result["rewrite_attempts"] = MAX_REWRITE_ATTEMPTS
+    best_result["rewrite_error"] = (
+        f"rewrite difference {comparison.get('overall_difference', 0)}% below {MIN_REWRITE_DIFFERENCE}% after {MAX_REWRITE_ATTEMPTS} attempts"
+    )
+    raise RewriteQualityError(best_result)
+
+
+def request_glm_rewrite(prompt: str, raw_script: str, style: str, api_key: str, raw_len: int) -> dict:
     payload = {
         "model": bigmodel_model(),
         "messages": [
             {"role": "system", "content": "你只输出可解析 JSON。"},
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.45,
-        "top_p": 0.7,
-        "max_tokens": 4096,
+        "temperature": 0.65,
+        "top_p": 0.85,
+        "max_tokens": max(4096, min(12000, raw_len * 4)),
         "stream": False,
         "thinking": {"type": "disabled"},
         "response_format": {"type": "json_object"},
@@ -203,6 +359,8 @@ def rewrite_script(raw_script: str, style: str = "纪实故事型") -> dict:
         return fallback
     try:
         return rewrite_script_with_glm(raw_script, style, api_key)
+    except RewriteQualityError:
+        raise
     except Exception as exc:
         fallback["rewrite_error"] = str(exc)[:300]
         return fallback
@@ -259,7 +417,7 @@ def generate_shots(script: str) -> list[dict]:
                     chunks.append(buf + "。")
     shots = []
     cursor = 0.0
-    for idx, text in enumerate(chunks[:30], 1):
+    for idx, text in enumerate(chunks, 1):
         tags = keywords_from_text(text)
         duration = max(3.0, min(6.0, round(len(text) / 7, 1)))
         required_object = tags["people"] or [

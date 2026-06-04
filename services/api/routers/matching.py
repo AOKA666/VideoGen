@@ -3,7 +3,13 @@ from __future__ import annotations
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 
 from services.store import load_db, save_db
-from services.web_image_pipeline import mark_project_searching, rerun_shot_web_image_search, reset_project_web_images, run_project_web_image_search
+from services.web_image_pipeline import (
+    mark_project_searching,
+    request_stop_project_search,
+    rerun_shot_web_image_search,
+    reset_project_web_images,
+    run_project_web_image_search,
+)
 
 router = APIRouter(prefix="/api/projects", tags=["matching"])
 
@@ -21,6 +27,19 @@ def match_assets(project_id: str, background_tasks: BackgroundTasks):
     save_db(db)
     background_tasks.add_task(run_project_web_image_search, project_id)
     return {"project_id": project_id, "status": "searching_images", "count": len(shots)}
+
+
+@router.post("/{project_id}/stop-image-search")
+def stop_image_search(project_id: str):
+    db = load_db()
+    project = next((p for p in db["projects"] if p["id"] == project_id), None)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    if project.get("status") != "searching_images":
+        return {"project_id": project_id, "status": project.get("status"), "stopped": False}
+    request_stop_project_search(db, project_id)
+    save_db(db)
+    return {"project_id": project_id, "status": "search_stopped", "stopped": True}
 
 
 @router.post("/{project_id}/shots/{shot_id}/retry-image-search")

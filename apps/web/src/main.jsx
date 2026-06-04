@@ -60,8 +60,10 @@ function App() {
   const [consoleStream, setConsoleStream] = useState('stderr');
   const [consoleLog, setConsoleLog] = useState('');
   const [consoleMeta, setConsoleMeta] = useState(null);
+  const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const folderFallbackRef = useRef(null);
   const uploadInputRef = useRef(null);
+  const lastProjectStatusRef = useRef('');
 
   const activeLibrary = validLibrary(library) ? library : null;
   const selectedAssets = useMemo(() => {
@@ -178,6 +180,19 @@ function App() {
     return () => window.clearInterval(timer);
   }, [shots, projectId, project]);
 
+  useEffect(() => {
+    const previous = lastProjectStatusRef.current;
+    const current = project?.status || '';
+    if (previous === 'searching_images' && current === 'search_failed') {
+      setMessage(project?.search_error ? `处理失败：${project.search_error}` : '分镜图片处理失败');
+    } else if (previous === 'searching_images' && current === 'search_stopped') {
+      setMessage('');
+    } else if (previous === 'searching_images' && current && current !== 'searching_images') {
+      setMessage('分镜图片处理完成');
+    }
+    lastProjectStatusRef.current = current;
+  }, [project?.status, project?.search_error]);
+
   async function chooseLibraryFolder() {
     if ('showDirectoryPicker' in window) {
       const dir = await window.showDirectoryPicker({ mode: 'read' });
@@ -236,10 +251,23 @@ function App() {
   }
 
   async function generateShots() {
-    await saveScript();
-    await run('生成分镜', () => request(`/api/projects/${projectId}/shots`, { method: 'POST' }));
-    await refreshAll(projectId);
     setTab('storyboard');
+    setBusy(true);
+    setMessage('生成分镜中...');
+    try {
+      await request(`/api/projects/${projectId}/script`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rewritten_script: project.rewritten_script }),
+      });
+      await request(`/api/projects/${projectId}/shots`, { method: 'POST' });
+      await refreshAll(projectId);
+      setMessage('分镜已生成，正在分析关键词和搜索图片...');
+    } catch (err) {
+      setMessage(`生成分镜失败：${err.message}`);
+    } finally {
+      setBusy(false);
+    }
   }
 
   function handleUploadPick(ev) {
@@ -305,6 +333,13 @@ function App() {
     setTab('match');
   }
 
+  async function stopImageSearch() {
+    if (!projectId) return;
+    setMessage('正在停止图片搜索...');
+    await request(`/api/projects/${projectId}/stop-image-search`, { method: 'POST' });
+    await refreshAll(projectId);
+  }
+
   async function generateImage(shotId) {
     await run('生成占位图', () => request(`/api/projects/${projectId}/shots/${shotId}/generate-image`, { method: 'POST' }));
     await refreshAll(projectId);
@@ -347,6 +382,27 @@ function App() {
     if (data?.download_url) window.open(`${API}${data.download_url}`, '_blank');
   }
 
+  const workflowBusy = busy || project?.status === 'searching_images';
+  const workflowMessage = (() => {
+    if (project?.status === 'search_failed') {
+      return project.search_error ? `处理失败：${project.search_error}` : '分镜图片处理失败';
+    }
+    if (project?.status === 'search_stopped') return message || '就绪';
+    if (project?.status !== 'searching_images') return message || '就绪';
+    if (project.search_stage === 'stopping') return '正在停止图片搜索...';
+    if (project.search_stage === 'analyzing_intent') {
+      return project.current_search_keyword || '正在分析分镜关键词...';
+    }
+    if (project.search_stage === 'intent_ready') {
+      return '关键词已生成，准备搜索图片...';
+    }
+    if (project.search_stage === 'downloading') {
+      const total = project.search_total || shots.length || 0;
+      return `正在搜索图片 ${project.search_completed || 0}/${total}`;
+    }
+    return '正在处理分镜图片...';
+  })();
+
   return (
     <div className="app">
       <aside className="sidebar">
@@ -360,10 +416,16 @@ function App() {
           <button className={tab === 'export' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('export')}><Download size={18} /> 导出</button>
         </nav>
         <div className="project-picker">
-          <select value={projectId} onChange={(e) => refreshAll(e.target.value)}>
-            <option value="">选择项目</option>
-            {projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-          </select>
+          <ProjectSelect
+            projects={projects}
+            projectId={projectId}
+            open={projectMenuOpen}
+            onOpenChange={setProjectMenuOpen}
+            onSelect={(id) => {
+              setProjectMenuOpen(false);
+              refreshAll(id);
+            }}
+          />
           <button className="danger icon-only" disabled={!projectId} title="删除项目" onClick={deleteProject}><Trash2 size={18} /></button>
         </div>
       </aside>
@@ -376,7 +438,7 @@ function App() {
           </div>
           <div className="top-actions">
             <button type="button" onClick={() => setConsoleOpen(true)}><Terminal size={18} /> 后端控制台</button>
-            <span className={busy ? 'status busy' : 'status'}>{message || '就绪'}</span>
+            <span className={workflowBusy ? 'status busy' : 'status'}>{workflowMessage}</span>
           </div>
         </header>
 
@@ -447,6 +509,13 @@ function App() {
                 <h2>二创口播稿</h2>
                 <button onClick={rewrite}><RefreshCw size={18} /> 生成</button>
               </div>
+              {project.rewrite_comparison && (
+                <p>
+                  总体差异度：{project.rewrite_comparison.overall_difference ?? project.rewrite_difference ?? '-'}%
+                  {' · '}字符相似度：{project.rewrite_comparison.character_similarity ?? '-'}%
+                  {' · '}语义相似度：{project.rewrite_comparison.semantic_similarity ?? '-'}%
+                </p>
+              )}
               <textarea value={project.rewritten_script || ''} rows="22" onChange={(e) => setProject({ ...project, rewritten_script: e.target.value })} />
               <div className="actions"><button onClick={saveScript}><Save size={18} /> 保存</button><button className="primary" onClick={generateShots}><Archive size={18} /> 生成分镜</button></div>
             </div>
@@ -455,7 +524,7 @@ function App() {
 
         {tab === 'storyboard' && (
           <section className="band">
-            <SearchProgress progress={searchProgress} project={project} />
+            <SearchProgress progress={searchProgress} project={project} onStop={stopImageSearch} />
             <div className="shot-list">
               {shots.map((shot) => (
                 <ShotCard
@@ -543,12 +612,34 @@ function App() {
   );
 }
 
+function ProjectSelect({ projects, projectId, open, onOpenChange, onSelect }) {
+  const selected = projects.find((item) => item.id === projectId);
+  return (
+    <div className="custom-select">
+      <button type="button" className={open ? 'custom-select-trigger open' : 'custom-select-trigger'} onClick={() => onOpenChange(!open)}>
+        <span>{selected?.name || '选择项目'}</span>
+      </button>
+      {open && (
+        <div className="custom-select-menu">
+          <button type="button" className={!projectId ? 'selected' : ''} onClick={() => onSelect('')}>选择项目</button>
+          {projects.map((item) => (
+            <button type="button" key={item.id} className={item.id === projectId ? 'selected' : ''} onClick={() => onSelect(item.id)}>
+              {item.name}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AssetCard({ asset, onEdit, onDelete }) {
   const imageScore = asset.score_result?.score ?? asset.match_score;
   const imageReason = asset.score_result?.reason;
+  const src = asset.file_url ? `${API}${asset.file_url}` : '';
   return (
     <article className={asset.analysis_status === 'analyzing' ? 'asset-card analyzing' : 'asset-card'}>
-      <div className="preview">{asset.file_type === 'image' ? <img src={`${API}${asset.file_url}`} /> : <video src={`${API}${asset.file_url}`} controls />}</div>
+      <div className="preview">{asset.file_type === 'image' ? <SafeImage src={src} alt={asset.file_name} /> : <video src={src} controls />}</div>
       <h3>{asset.file_name}</h3>
       {imageScore !== undefined && imageScore !== null && <p>图片评分：{imageScore}</p>}
       <p>{asset.analysis_status === 'analyzing' ? '识别中' : [...(asset.object || asset.people || []), ...(asset.scene || []), ...(asset.keywords || [])].slice(0, 6).join(' / ') || '待补充标签'}</p>
@@ -562,6 +653,17 @@ function AssetCard({ asset, onEdit, onDelete }) {
       )}
     </article>
   );
+}
+
+function SafeImage({ src, alt }) {
+  const [broken, setBroken] = useState(false);
+  useEffect(() => {
+    setBroken(false);
+  }, [src]);
+  if (!src || broken) {
+    return <div className="image-fallback">图片文件不可用</div>;
+  }
+  return <img src={src} alt={alt || ''} onError={() => setBroken(true)} />;
 }
 
 function BackendConsole({ stream, content, meta, onStreamChange, onRefresh, onClose }) {
@@ -597,27 +699,90 @@ function VoiceSelect({ value, onChange }) {
   );
 }
 
-function SearchProgress({ progress, project }) {
+function formatElapsed(seconds) {
+  const value = Math.max(0, Number(seconds) || 0);
+  const minutes = Math.floor(value / 60);
+  const rest = value % 60;
+  return minutes ? `${minutes}分${String(rest).padStart(2, '0')}秒` : `${rest}秒`;
+}
+
+function SearchProgress({ progress, project, onStop }) {
+  const [tick, setTick] = useState(0);
+  const stage = project?.search_stage || '';
+  const searching = project?.status === 'searching_images';
+  const stopping = searching && stage === 'stopping';
+  const stopped = project?.status === 'search_stopped';
+  const analyzingIntent = project?.status === 'searching_images' && stage === 'analyzing_intent';
+  const startedAt = project?.intent_analysis_started_at ? new Date(project.intent_analysis_started_at).getTime() : 0;
+  const elapsed = startedAt ? Math.floor((Date.now() - startedAt) / 1000) : 0;
+  const keywordEstimate = project?.intent_keyword_estimate || (progress.total ? `${progress.total * 3}-${progress.total * 5}` : '');
+  const batchInfo = project?.intent_batches_total
+    ? `批次 ${project.intent_batches_completed || 0}/${project.intent_batches_total}`
+    : `预计 ${keywordEstimate} 个关键词`;
+  const statusText = analyzingIntent
+    ? `${project?.current_search_keyword || `正在分析 ${progress.total || project?.search_total || '-'} 个分镜关键词`} · ${batchInfo} · 已运行 ${formatElapsed(elapsed)}`
+    : `正在处理镜头 ${project?.current_shot_index || '-'} ${project?.current_search_keyword ? `· ${project.current_search_keyword}` : ''}`;
+  const helperText = analyzingIntent
+    ? 'GLM 正在按 10 个镜头一批生成关键词；每批完成后会立即保存，全部完成后自动进入逐镜头搜图。'
+    : '';
   const label = progress.total
     ? `${progress.completed} / ${progress.total} 个分镜图片完成`
     : '等待生成分镜';
+
+  useEffect(() => {
+    if (!analyzingIntent) return undefined;
+    const timer = window.setInterval(() => setTick((value) => value + 1), 1000);
+    return () => window.clearInterval(timer);
+  }, [analyzingIntent]);
+
   return (
     <div className="progress-panel">
       <div className="progress-row">
         <strong>分镜图片进度</strong>
-        <span>{label}</span>
+        <div className="progress-actions">
+          <span>{label}</span>
+          {searching && (
+            <button type="button" className="danger compact-button" disabled={stopping} onClick={onStop}>
+              <RefreshCw size={16} /> {stopping ? '停止中' : '停止搜索'}
+            </button>
+          )}
+        </div>
       </div>
       <div className="progress-track">
-        <div className="progress-fill" style={{ width: `${progress.percent}%` }} />
+        <div
+          className={[
+            'progress-fill',
+            searching ? 'active' : '',
+            analyzingIntent ? 'indeterminate' : '',
+            stopped ? 'stopped' : '',
+          ].filter(Boolean).join(' ')}
+          style={{ width: `${analyzingIntent ? 18 + (tick % 5) * 3 : progress.percent}%` }}
+        />
       </div>
       {project?.status === 'searching_images' && (
-        <small>正在处理镜头 {project.current_shot_index || '-'} {project.current_search_keyword ? `· ${project.current_search_keyword}` : ''}</small>
+        <div className="progress-detail">
+          <small>{statusText}</small>
+          {helperText && <small>{helperText}</small>}
+        </div>
+      )}
+      {project?.status === 'search_failed' && (
+        <div className="progress-detail error">
+          <small>{project.current_search_keyword || '关键词分析失败'}</small>
+          <small>{project.search_error || 'GLM 没有返回有效结果，请稍后重试。'}</small>
+        </div>
+      )}
+      {project?.status === 'search_stopped' && (
+        <div className="progress-detail">
+          <small>图片搜索已停止</small>
+          <small>已完成的候选图会保留，未处理镜头可稍后重新搜索。</small>
+        </div>
       )}
     </div>
   );
 }
 
 function ImagePreview({ asset, onClose }) {
+  const src = asset.file_url ? `${API}${asset.file_url}` : '';
   return (
     <div className="image-preview-backdrop" onClick={onClose}>
       <div className="image-preview" onClick={(e) => e.stopPropagation()}>
@@ -625,7 +790,7 @@ function ImagePreview({ asset, onClose }) {
           <strong>{asset.file_name || '图片预览'}</strong>
           <button type="button" onClick={onClose}>关闭</button>
         </div>
-        <img src={`${API}${asset.file_url}`} alt={asset.file_name || 'preview'} />
+        <SafeImage src={src} alt={asset.file_name || 'preview'} />
         {(asset.source_page || asset.remote_url) && (
           <a href={asset.source_page || asset.remote_url} target="_blank" rel="noreferrer">查看来源</a>
         )}
@@ -709,7 +874,7 @@ function AssetEditor({ asset, onClose, onSave, onDelete }) {
           <button type="button" onClick={onClose}>关闭</button>
         </div>
         <div className="editor-preview">
-          {asset.file_type === 'image' ? <img src={`${API}${asset.file_url}`} /> : <video src={`${API}${asset.file_url}`} controls />}
+          {asset.file_type === 'image' ? <SafeImage src={`${API}${asset.file_url}`} alt={asset.file_name} /> : <video src={`${API}${asset.file_url}`} controls />}
           <strong>{asset.file_name}</strong>
         </div>
         <TagFields form={form} update={update} />
@@ -727,8 +892,8 @@ function AssetEditor({ asset, onClose, onSave, onDelete }) {
 function ShotCard({ shot, assets = [], selectedAssetId, onSelect, onPreview, onGenerate, onRetry }) {
   const visibleAssets = [...assets]
     .sort((a, b) => (b.id === selectedAssetId ? 1 : 0) - (a.id === selectedAssetId ? 1 : 0))
-    .slice(0, 1);
-  const placeholders = Math.max(0, 1 - visibleAssets.length);
+    .slice(0, 2);
+  const placeholders = Math.max(0, 2 - visibleAssets.length);
   const canRetry = (shot.search_attempts || 0) < 2 && !['pending_search', 'analyzing_intent', 'searching'].includes(shot.status);
   return (
     <article className="shot-card">

@@ -8,6 +8,10 @@ import urllib.request
 
 
 ABSTRACT_WORDS = ["伟大", "震撼", "感人", "精神", "贡献", "意义", "重要", "传奇", "辉煌"]
+TEMPLATE_KEYWORDS = [
+    "无有效文本", "默认", "空镜头", "模糊背景", "产品", "介绍", "视觉", "场景", "描述", "背景", "素材", "图片",
+    "人物肖像", "正面照", "侧面照", "表情特写", "人物动作", "环境",
+]
 MIN_KEYWORDS_PER_SHOT = 3
 MAX_KEYWORDS_PER_SHOT = 3
 MAX_KEYWORD_CHARS = 10
@@ -29,6 +33,10 @@ VISUAL_TERMS = [
     "白衬衫", "鲜花", "花束", "纪念碑", "日本国旗", "国旗", "轮船", "港口",
     "登船", "撕国旗", "黑白照", "资料照",
 ]
+
+
+class SearchIntentBatchError(RuntimeError):
+    pass
 
 
 def bigmodel_endpoint() -> str:
@@ -60,7 +68,7 @@ def _unique(items: list[str]) -> list[str]:
 
 def _clean_text(value: str, *, max_chars: int) -> str:
     cleaned = re.sub(r"[，。！？、；：,.!?;:\n\r]+", " ", str(value))
-    for word in ABSTRACT_WORDS:
+    for word in [*ABSTRACT_WORDS, *TEMPLATE_KEYWORDS]:
         cleaned = cleaned.replace(word, "")
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return " ".join(cleaned.split()[:4])[:max_chars]
@@ -101,7 +109,7 @@ def _intent_terms(visual_intent: str) -> list[str]:
 
 def _finalize_keywords(candidates: list[str]) -> list[str]:
     keywords = [_clean_keyword(item) for item in candidates]
-    keywords = [item for item in _unique(keywords) if item and item not in ABSTRACT_WORDS]
+    keywords = [item for item in _unique(keywords) if item and item not in [*ABSTRACT_WORDS, *TEMPLATE_KEYWORDS]]
     for fallback in GENERIC_VISUAL_KEYWORDS:
         if len(keywords) >= MIN_KEYWORDS_PER_SHOT:
             break
@@ -124,6 +132,12 @@ def extract_visual_terms(text: str) -> list[str]:
         derived_terms.append("嘴角血迹")
     if "踏上" in text and "轮船" in text:
         derived_terms.append("登船")
+    if ("美国" in text or "赴美" in text) and ("求学" in text or "留学" in text):
+        derived_terms.append("留学生")
+    if "回国" in text:
+        derived_terms.append("回国")
+    if "大漠" in text or "戈壁" in text:
+        derived_terms.append("戈壁基地")
     regex_terms = re.findall(r"\d{4}年|\d{2}岁|上世纪\d{2}年代|20世纪\d{2}年代|19\d{2}年代", text)
     regex_terms.extend(re.findall(r"[\u4e00-\u9fff]{2,8}(?:实验室|办公室|宿舍|基地|火车站|会议|照片|档案|手稿|文件|导弹|火箭|工厂|课堂)", text))
     if "博士" in text:
@@ -146,14 +160,14 @@ def intent_based_keywords(people: list[str], visual_terms: list[str], visual_int
 
 
 def sanitize_intent(result: dict, shot_text: str) -> dict:
-    people = _as_list(result.get("people")) or find_people(shot_text)
+    people = _unique(_as_list(result.get("people")) + find_people(shot_text))
     visual_intent = str(result.get("visual_intent") or "").strip()
     visual_terms = extract_visual_terms(f"{shot_text} {visual_intent}")
     if not visual_intent:
         visual_intent = " ".join([*(people[:1]), *visual_terms[:3], "历史纪实画面"]).strip() or "历史纪实画面"
 
     ai_keywords = _as_list(result.get("search_keywords"))
-    keywords = _finalize_keywords(ai_keywords + intent_based_keywords(people[:1], visual_terms, visual_intent))
+    keywords = _finalize_keywords(intent_based_keywords(people[:1], visual_terms, visual_intent) + ai_keywords)
     return {
         "visual_intent": _clean_visual_intent(visual_intent) or "历史纪实画面",
         "search_keywords": keywords,
@@ -182,7 +196,7 @@ def ai_search_intent(shot_text: str, full_text: str) -> dict:
         return fallback_search_intent(shot_text, full_text)
 
     prompt = f"""
-你是短视频分镜素材搜索助手。只分析当前镜头。
+你是短视频分镜素材搜索助手。请读取“当前镜头”的具体文字，生成适合图片搜索的真实画面关键词。
 
 要求：
 1. 只输出严格 JSON，不要 Markdown。
@@ -192,6 +206,14 @@ def ai_search_intent(shot_text: str, full_text: str) -> dict:
 5. 关键词参考“精准人物/事件、替代场景、氛围细节”的组合，例如：邓稼先旧照、嘴角血迹特写、科学家病重旧照、手帕血迹、档案照片。
 6. 禁止把“伟大、震撼、感人、精神、贡献、意义”等抽象词作为关键词。
 7. 当前镜头有人物名时，1-2 个关键词可以包含人物名；不要让所有关键词都变成人物通用照。
+8. 禁止输出“默认、空镜头、模糊背景、产品、介绍、视觉、场景、描述、背景、素材、图片”这类模板词。
+
+示例：
+当前镜头：邓稼先在美国求学时，常常泡在物理实验室里。
+输出关键词：["邓稼先留学", "物理实验室", "黑板公式"]
+
+当前镜头：回国后，他隐姓埋名奔赴大漠深处。
+输出关键词：["邓稼先回国", "戈壁基地", "科研旧照"]
 
 全文仅供理解背景，不要强行从全文补人物：
 {full_text}
@@ -234,19 +256,16 @@ def ai_search_intent(shot_text: str, full_text: str) -> dict:
         result = json.loads(_extract_json_object(str(content)))
         result["provider"] = bigmodel_model()
         return sanitize_intent(result, shot_text)
-    except (urllib.error.URLError, KeyError, ValueError, json.JSONDecodeError) as exc:
+    except (urllib.error.URLError, TimeoutError, KeyError, ValueError, json.JSONDecodeError) as exc:
         fallback = fallback_search_intent(shot_text, full_text)
         fallback["error"] = str(exc)[:300]
         return fallback
 
 
-def ai_search_intents(shots: list[dict], full_text: str) -> dict[str, dict]:
+def ai_search_intents(shots: list[dict], full_text: str, *, timeout: int = 90, retries: int = 1) -> dict[str, dict]:
     api_key = os.getenv("BIGMODEL_API_KEY", "").strip()
     if not api_key:
-        return {
-            str(shot.get("id") or shot.get("shot_index")): fallback_search_intent(str(shot.get("voice_text") or ""), full_text)
-            for shot in shots
-        }
+        raise SearchIntentBatchError("BIGMODEL_API_KEY 未配置，无法使用 GLM 分析分镜关键词")
 
     shot_items = [
         {
@@ -257,17 +276,26 @@ def ai_search_intents(shots: list[dict], full_text: str) -> dict[str, dict]:
         for shot in shots
     ]
     prompt = f"""
-你是短视频分镜素材搜索助手。请一次性分析所有分镜，但每个分镜只依据自己的 voice_text 生成画面意图和搜索关键词。
+你是短视频分镜素材搜索助手。请读取分镜列表中每个对象的 voice_text 字段，分别生成适合图片搜索的真实画面关键词。
 
 要求：
 1. 只输出严格 JSON，不要 Markdown。
-2. 每个分镜都必须返回 visual_intent、people、search_keywords。
+2. 当前批次里的每个分镜都必须返回 visual_intent、people、search_keywords。
 3. search_keywords 输出 3-5 个简短中文关键词，每个不超过 10 个汉字。
 4. 关键词必须具体、可搜索、偏视觉化，适合百度图片。
 5. 关键词参考“精准人物/事件、替代场景、氛围细节”的组合，例如：邓稼先旧照、嘴角血迹特写、科学家病重旧照、手帕血迹、档案照片。
 6. 禁止把“伟大、震撼、感人、精神、贡献、意义”等抽象词作为关键词。
 7. 当前分镜有人物名时，1-2 个关键词可以包含人物名；不要让所有关键词都变成人物通用照。
 8. 全文仅供理解背景，不要强行从全文给每个分镜补人物。
+9. voice_text 都是有效文本，禁止输出“无有效文本、默认、空镜头、模糊背景、产品、介绍、视觉、场景、描述、背景、素材、图片”这类模板词。
+10. 必须从 voice_text 中抽取人物、动作、地点、年代、物件或情绪细节来组成关键词。
+
+示例：
+voice_text：邓稼先在美国求学时，常常泡在物理实验室里。
+search_keywords：["邓稼先留学", "物理实验室", "黑板公式"]
+
+voice_text：回国后，他隐姓埋名奔赴大漠深处。
+search_keywords：["邓稼先回国", "戈壁基地", "科研旧照"]
 
 全文背景：
 {full_text}
@@ -300,44 +328,41 @@ def ai_search_intents(shots: list[dict], full_text: str) -> dict[str, dict]:
         "thinking": {"type": "disabled"},
         "response_format": {"type": "json_object"},
     }
-    req = urllib.request.Request(
-        f"{bigmodel_endpoint().rstrip('/')}/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as response:
-            body = json.loads(response.read().decode("utf-8"))
-        content = body["choices"][0]["message"]["content"]
-        if isinstance(content, list):
-            content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
-        result = json.loads(_extract_json_object(str(content)))
-        raw_items = result.get("shots") if isinstance(result, dict) else []
-        intents: dict[str, dict] = {}
-        shot_text_by_id = {str(item["id"]): item["voice_text"] for item in shot_items}
-        for item in raw_items or []:
-            if not isinstance(item, dict):
-                continue
-            shot_id = str(item.get("id") or "")
-            if shot_id not in shot_text_by_id:
-                continue
-            item["provider"] = bigmodel_model()
-            intents[shot_id] = sanitize_intent(item, shot_text_by_id[shot_id])
-        for shot in shot_items:
-            if shot["id"] not in intents:
-                fallback = fallback_search_intent(shot["voice_text"], full_text)
-                fallback["error"] = "batch AI response missing this shot"
-                intents[shot["id"]] = fallback
-        return intents
-    except (urllib.error.URLError, KeyError, ValueError, json.JSONDecodeError) as exc:
-        return {
-            shot["id"]: {
-                **fallback_search_intent(shot["voice_text"], full_text),
-                "error": str(exc)[:300],
-            }
-            for shot in shot_items
-        }
+    last_error: Exception | None = None
+    for attempt in range(max(1, retries + 1)):
+        req = urllib.request.Request(
+            f"{bigmodel_endpoint().rstrip('/')}/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                body = json.loads(response.read().decode("utf-8"))
+            content = body["choices"][0]["message"]["content"]
+            if isinstance(content, list):
+                content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+            result = json.loads(_extract_json_object(str(content)))
+            raw_items = result.get("shots") if isinstance(result, dict) else []
+            intents: dict[str, dict] = {}
+            shot_text_by_id = {str(item["id"]): item["voice_text"] for item in shot_items}
+            for item in raw_items or []:
+                if not isinstance(item, dict):
+                    continue
+                shot_id = str(item.get("id") or "")
+                if shot_id not in shot_text_by_id:
+                    continue
+                item["provider"] = bigmodel_model()
+                intents[shot_id] = sanitize_intent(item, shot_text_by_id[shot_id])
+            missing_ids = [shot["id"] for shot in shot_items if shot["id"] not in intents]
+            if missing_ids:
+                raise SearchIntentBatchError(f"GLM 返回缺少 {len(missing_ids)} 个分镜关键词")
+            return intents
+        except SearchIntentBatchError as exc:
+            last_error = exc
+        except (urllib.error.URLError, TimeoutError, KeyError, ValueError, json.JSONDecodeError) as exc:
+            last_error = exc
+    raise SearchIntentBatchError(f"GLM 分镜关键词分析失败：{str(last_error)[:300]}")
 
 
 def apply_intent_to_shot(shot: dict, intent: dict) -> dict:

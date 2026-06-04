@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import shutil
 from datetime import datetime
+from pathlib import Path
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from services.store import PROJECTS_DIR, load_db, project_dir, save_db
-from services.text_service import infer_title, rewrite_script
+from services.text_service import RewriteQualityError, infer_title, rewrite_script
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
@@ -62,7 +63,11 @@ def get_project(project_id: str):
     if not project:
         raise HTTPException(404, "Project not found")
     shots = [s for s in db["shots"] if s["project_id"] == project_id]
-    generated_assets = [a for a in db.get("generated_assets", []) if a.get("project_id") == project_id]
+    generated_assets = [
+        a for a in db.get("generated_assets", [])
+        if a.get("project_id") == project_id
+        and (not a.get("local_path") or Path(str(a.get("local_path"))).exists())
+    ]
     return {
         "project": project,
         "shots": sorted(shots, key=lambda s: s["shot_index"]),
@@ -76,10 +81,17 @@ def rewrite(project_id: str):
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
         raise HTTPException(404, "Project not found")
-    result = rewrite_script(project["raw_script"], project.get("script_style", "纪实故事型"))
+    try:
+        result = rewrite_script(project["raw_script"], project.get("script_style", "纪实故事型"))
+    except RewriteQualityError as exc:
+        detail = exc.result.get("rewrite_error") or str(exc)
+        raise HTTPException(422, detail) from exc
     project["rewritten_script"] = result["rewritten_script"]
     project["rewrite_provider"] = result.get("rewrite_provider", "")
     project["rewrite_error"] = result.get("rewrite_error", "")
+    project["rewrite_comparison"] = result.get("rewrite_comparison", {})
+    project["rewrite_difference"] = result.get("rewrite_difference", 0)
+    project["rewrite_attempts"] = result.get("rewrite_attempts", 1)
     project["status"] = "script_ready"
     project["updated_at"] = datetime.now().isoformat(timespec="seconds")
     save_db(db)

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from services.image_scoring_service import aspect_ratio_score
+from services.image_postprocess_service import detect_blocking_watermark
 
 
 USER_AGENT = (
@@ -260,6 +261,12 @@ def download_image(
     ratio = max(width / max(height, 1), height / max(width, 1))
     if ratio > 4:
         return None
+    watermark = detect_blocking_watermark(
+        data,
+        " ".join([result.title, result.keyword, result.source_page, result.image_url, result.source]),
+    )
+    if watermark.get("rejected"):
+        return None
     ext = _extension_from_content(content_type, result.image_url)
     path = output_dir / f"{filename_stem}{ext}"
     path.write_bytes(data)
@@ -278,8 +285,11 @@ def download_images_for_shot(
     shot: dict,
     output_dir: Path,
     *,
-    images_per_shot: int = 3,
+    images_per_shot: int = 6,
+    images_per_keyword: int = 2,
     results_per_keyword: int = 12,
+    keyword_start: int = 0,
+    keyword_limit: int = 3,
     delay: float = 0.1,
     timeout: int = 6,
     on_download=None,
@@ -296,17 +306,21 @@ def download_images_for_shot(
     seen_sources = {_url_key(url) for url in (exclude_sources or set()) if url}
     seen_dimensions = set()
 
-    keyword = search_query_for_shot(shot)
-    if keyword:
+    keywords = search_keywords_for_shot(shot)[keyword_start:keyword_start + keyword_limit]
+    for offset, keyword in enumerate(keywords, start=1):
+        keyword_index = keyword_start + offset
+        if len(downloaded) >= images_per_shot:
+            break
         results = provider.search(keyword, results_per_keyword)
         search_results.extend(results)
         if not results:
             failures.append({"keyword": keyword, "stage": "search", "error": "no image result"})
-        elif delay:
+            continue
+        if keyword_index > 1 and delay:
             time.sleep(delay)
+        keyword_downloaded = 0
         for result_index, result in enumerate(results, start=1):
-            max_downloads = max(images_per_shot, min(results_per_keyword, images_per_shot * 3))
-            if len(downloaded) >= max_downloads:
+            if len(downloaded) >= images_per_shot or keyword_downloaded >= images_per_keyword:
                 break
             candidate_key = _url_key(result.image_url or result.thumb_url)
             source_key = _url_key(result.source_page)
@@ -318,7 +332,7 @@ def download_images_for_shot(
             item = download_image(
                 result,
                 output_dir,
-                f"shot_{shot['shot_index']:03d}_search_img_{result_index:03d}",
+                f"shot_{shot['shot_index']:03d}_kw_{keyword_index:02d}_img_{result_index:03d}",
                 timeout=timeout,
             )
             if not item:
@@ -338,12 +352,10 @@ def download_images_for_shot(
                 "aspect_ratio_score": aspect_ratio_score(item),
             })
             downloaded.append(item)
+            keyword_downloaded += 1
             if on_download:
                 on_download(item, len(downloaded))
 
     failures.extend(provider.failures)
     downloaded.sort(key=lambda item: (item.get("aspect_ratio_score") or 0, item.get("width", 0) * item.get("height", 0)), reverse=True)
-    for item in downloaded[images_per_shot:]:
-        Path(item["local_path"]).unlink(missing_ok=True)
-    downloaded = downloaded[:images_per_shot]
     return search_results, downloaded, failures
