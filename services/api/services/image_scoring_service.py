@@ -41,6 +41,13 @@ TEXT_HEAVY_WORDS = [
     "text", "book page", "article", "post", "comment", "forum", "webpage", "page",
     "paragraph", "document", "novel", "ebook",
 ]
+DESIGN_HEAVY_WORDS = [
+    "logo", "icon", "symbol", "sign", "warning sign", "badge", "emblem", "seal",
+    "thumbnail", "cover", "title card", "poster", "banner", "infographic", "table",
+    "chart", "list", "directory",
+    "封面", "标题", "大字", "海报", "标志", "图标", "徽章", "警示牌", "警告牌",
+    "表格", "名单", "目录", "信息图", "宣传图",
+]
 
 
 def _as_list(value: Any) -> list[str]:
@@ -63,6 +70,36 @@ def _text_parts(*values: Any) -> str:
 
 def _contains_any(text: str, words: list[str]) -> list[str]:
     return [word for word in words if word and word.lower() in text]
+
+
+def _component_boxes_bool(mask: np.ndarray, *, max_components: int = 1000) -> list[tuple[int, int, int, int, int]]:
+    height, width = mask.shape
+    visited = np.zeros(mask.shape, dtype=bool)
+    boxes: list[tuple[int, int, int, int, int]] = []
+    components = 0
+    for y in range(height):
+        for x in range(width):
+            if not mask[y, x] or visited[y, x]:
+                continue
+            components += 1
+            if components > max_components:
+                return boxes
+            stack = [(y, x)]
+            visited[y, x] = True
+            area = 0
+            min_y = max_y = y
+            min_x = max_x = x
+            while stack:
+                cy, cx = stack.pop()
+                area += 1
+                min_y, max_y = min(min_y, cy), max(max_y, cy)
+                min_x, max_x = min(min_x, cx), max(max_x, cx)
+                for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not visited[ny, nx]:
+                        visited[ny, nx] = True
+                        stack.append((ny, nx))
+            boxes.append((min_x, min_y, max_x + 1, max_y + 1, area))
+    return boxes
 
 
 def _score_overlap(candidates: list[str], evidence: str, max_score: int, *, partial: int = 4) -> tuple[int, list[str], list[str]]:
@@ -228,6 +265,179 @@ def _text_heavy_reason(item: dict) -> str:
     return ""
 
 
+def _table_or_document_reason(item: dict) -> str:
+    if Image is None or np is None:
+        return ""
+    path = Path(item.get("local_path") or "")
+    if not path.exists():
+        return ""
+    try:
+        image = Image.open(path).convert("L")
+        image.thumbnail((320, 320))
+        gray = np.asarray(image, dtype=np.float32) / 255.0
+    except Exception:
+        return ""
+    if gray.size == 0:
+        return ""
+
+    height, width = gray.shape
+    if float((gray > 0.74).mean()) < 0.42:
+        return ""
+    gx = np.abs(np.diff(gray, axis=1, append=gray[:, -1:]))
+    gy = np.abs(np.diff(gray, axis=0, append=gray[-1:, :]))
+    vertical_lines = gx > 0.20
+    horizontal_lines = gy > 0.20
+    col_hits = int((vertical_lines.mean(axis=0) > 0.22).sum())
+    row_hits = int((horizontal_lines.mean(axis=1) > 0.20).sum())
+    row_ink = (gray < 0.55).mean(axis=1)
+    many_text_rows = int((row_ink > 0.025).sum()) > height * 0.28
+    if row_hits >= 8 and col_hits >= 3 and many_text_rows:
+        return "table/document screenshot"
+    if row_hits >= 14 and many_text_rows:
+        return "document/list screenshot"
+    return ""
+
+
+def _large_title_card_reason(item: dict) -> str:
+    if Image is None or np is None:
+        return ""
+    path = Path(item.get("local_path") or "")
+    if not path.exists():
+        return ""
+    try:
+        image = Image.open(path).convert("RGB")
+        image.thumbnail((360, 360))
+        arr = np.asarray(image, dtype=np.float32) / 255.0
+    except Exception:
+        return ""
+    if arr.size == 0:
+        return ""
+
+    maxc = arr.max(axis=2)
+    minc = arr.min(axis=2)
+    saturation = (maxc - minc) / np.maximum(maxc, 0.001)
+    gray = arr.mean(axis=2)
+    height, width = gray.shape
+    red_or_yellow_text = (
+        ((arr[:, :, 0] > 0.62) & (arr[:, :, 1] < 0.45) & (arr[:, :, 2] < 0.45))
+        | ((arr[:, :, 0] > 0.70) & (arr[:, :, 1] > 0.55) & (arr[:, :, 2] < 0.34))
+        | ((arr[:, :, 2] > 0.62) & (arr[:, :, 0] < 0.50) & (arr[:, :, 1] > 0.42))
+    )
+    white_title = (gray > 0.78) & (saturation < 0.24)
+    title_fill = red_or_yellow_text | white_title
+    title_boxes = []
+    for x1, y1, x2, y2, area in _component_boxes_bool(title_fill, max_components=1200):
+        box_w = x2 - x1
+        box_h = y2 - y1
+        if area < width * height * 0.004:
+            continue
+        if box_w > width * 0.10 and box_h > height * 0.045 and box_h < height * 0.42:
+            title_boxes.append((x1, y1, x2, y2, area))
+    if len(title_boxes) >= 2:
+        x1 = min(box[0] for box in title_boxes)
+        y1 = min(box[1] for box in title_boxes)
+        x2 = max(box[2] for box in title_boxes)
+        y2 = max(box[3] for box in title_boxes)
+        covered = ((x2 - x1) * (y2 - y1)) / max(width * height, 1)
+        fill = sum(box[4] for box in title_boxes) / max(width * height, 1)
+        if covered > 0.10 and fill > 0.018:
+            return "large colored title text / thumbnail cover"
+
+    gx = np.abs(np.diff(gray, axis=1, append=gray[:, -1:]))
+    gy = np.abs(np.diff(gray, axis=0, append=gray[-1:, :]))
+    high_contrast = ((gx + gy) > 0.16) & ((gray < 0.28) | (gray > 0.72) | (saturation > 0.46))
+
+    boxes = _component_boxes_bool(high_contrast, max_components=1400)
+    large_boxes = []
+    for x1, y1, x2, y2, area in boxes:
+        box_w = x2 - x1
+        box_h = y2 - y1
+        if box_w < width * 0.08 or box_h < height * 0.035:
+            continue
+        if box_h > height * 0.42:
+            continue
+        if area < width * height * 0.0015:
+            continue
+        large_boxes.append((x1, y1, x2, y2, area))
+
+    if large_boxes:
+        x1 = min(box[0] for box in large_boxes)
+        y1 = min(box[1] for box in large_boxes)
+        x2 = max(box[2] for box in large_boxes)
+        y2 = max(box[3] for box in large_boxes)
+        covered = ((x2 - x1) * (y2 - y1)) / max(width * height, 1)
+        ink = sum(box[4] for box in large_boxes) / max(width * height, 1)
+        colorful = float((saturation > 0.38).mean())
+        if len(large_boxes) >= 3 and covered > 0.16 and ink > 0.018:
+            return "large title text / thumbnail cover"
+        if len(large_boxes) >= 2 and colorful > 0.22 and covered > 0.12:
+            return "large title text / poster"
+
+    return ""
+
+
+def _icon_or_logo_reason(item: dict) -> str:
+    if Image is None or np is None:
+        return ""
+    path = Path(item.get("local_path") or "")
+    if not path.exists():
+        return ""
+    try:
+        image = Image.open(path).convert("RGB")
+        image.thumbnail((260, 260))
+        arr = np.asarray(image, dtype=np.float32) / 255.0
+    except Exception:
+        return ""
+    if arr.size == 0:
+        return ""
+
+    maxc = arr.max(axis=2)
+    minc = arr.min(axis=2)
+    saturation = (maxc - minc) / np.maximum(maxc, 0.001)
+    gray = arr.mean(axis=2)
+    light_bg = float((gray > 0.82).mean())
+    dark_area = float((gray < 0.18).mean())
+    saturated_area = float((saturation > 0.42).mean())
+    yellow_red_blue = (
+        ((arr[:, :, 0] > 0.72) & (arr[:, :, 1] > 0.48) & (arr[:, :, 2] < 0.28))
+        | ((arr[:, :, 0] > 0.58) & (arr[:, :, 1] < 0.36) & (arr[:, :, 2] < 0.36))
+        | ((arr[:, :, 2] > 0.55) & (arr[:, :, 0] < 0.45))
+    )
+    emblem_colors = float(yellow_red_blue.mean())
+
+    quantized = (arr * 8).astype(np.int16)
+    _, counts = np.unique(quantized.reshape(-1, 3), axis=0, return_counts=True)
+    top_cover = float(np.sort(counts)[-12:].sum() / max(counts.sum(), 1)) if len(counts) else 0.0
+
+    edges = (
+        np.abs(np.diff(gray, axis=1, append=gray[:, -1:]))
+        + np.abs(np.diff(gray, axis=0, append=gray[-1:, :]))
+    ) > 0.18
+    foreground = (saturation > 0.34) | (gray < 0.22)
+    boxes = _component_boxes_bool(foreground, max_components=700)
+    large_components = [
+        box for box in boxes
+        if box[4] > foreground.size * 0.035
+        and (box[2] - box[0]) > foreground.shape[1] * 0.18
+        and (box[3] - box[1]) > foreground.shape[0] * 0.18
+    ]
+
+    if light_bg > 0.35 and top_cover > 0.72 and saturated_area + dark_area > 0.18 and len(large_components) <= 4:
+        return "icon/logo/sign graphic"
+    if emblem_colors > 0.30 and top_cover > 0.65 and float(edges.mean()) > 0.035 and len(large_components) <= 5:
+        return "emblem/warning/logo graphic"
+    return ""
+
+
+def _local_design_reasons(item: dict) -> list[str]:
+    reasons = []
+    for detector in (_table_or_document_reason, _large_title_card_reason, _icon_or_logo_reason):
+        reason = detector(item)
+        if reason:
+            reasons.append(reason)
+    return list(dict.fromkeys(reasons))
+
+
 def _non_photo_reasons(item: dict, tags: dict | None, all_text: str, *, visual: bool) -> list[str]:
     tags = tags or {}
     reasons: list[str] = []
@@ -244,12 +454,16 @@ def _non_photo_reasons(item: dict, tags: dict | None, all_text: str, *, visual: 
     text_hits = _contains_any(style_text, TEXT_HEAVY_WORDS)
     if text_hits:
         reasons.extend(text_hits[:3])
+    design_hits = _contains_any(style_text, DESIGN_HEAVY_WORDS)
+    if design_hits:
+        reasons.extend(design_hits[:3])
     ui_reason = _ui_screenshot_reason(item)
     if ui_reason:
         reasons.append(ui_reason)
     text_reason = _text_heavy_reason(item)
     if text_reason:
         reasons.append(text_reason)
+    reasons.extend(_local_design_reasons(item))
     return list(dict.fromkeys(reasons))
 
 
@@ -318,6 +532,7 @@ def _score_from_evidence(shot: dict, item: dict, visual_text: str, tags: dict | 
         "matched": matched,
         "missing": list(dict.fromkeys([*missing, "真实历史照片"])) if non_photo_reasons else missing,
         "non_photo_reasons": non_photo_reasons,
+        "hard_rejected": bool(non_photo_reasons) or score <= 40,
         "tags": tags or {},
         "scoring_provider": "visual" if visual else "quick",
     }

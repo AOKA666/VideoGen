@@ -41,7 +41,7 @@ def update_shot(project_id: str, shot_id: str, patch: dict):
     shot = next((s for s in db["shots"] if s["project_id"] == project_id and s["id"] == shot_id), None)
     if not shot:
         raise HTTPException(404, "Shot not found")
-    allowed = {"voice_text", "duration_sec", "visual_need", "visual_intent", "required_object", "required_scene", "search_keywords"}
+    allowed = {"voice_text", "duration_sec", "visual_need", "visual_intent", "required_object", "required_scene", "search_keywords", "archive_keywords"}
     for key, value in patch.items():
         if key in allowed:
             shot[key] = value

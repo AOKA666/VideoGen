@@ -2,17 +2,17 @@ from __future__ import annotations
 
 import shutil
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
 from services.asset_service import new_id
 from services.generation_service import generate_doubao_image, generate_svg_placeholder
-from services.image_postprocess_service import remove_watermark_if_present
 from services.image_scoring_service import rank_images_for_shot
 from services.search_intent_service import SearchIntentBatchError, ai_search_intents, apply_intent_to_shot
 from services.store import load_db, project_dir, public_url, save_db
-from services.web_image_service import download_images_for_shot, search_query_for_shot
+from services.web_image_service import _url_key, download_images_for_shot, search_query_for_shot
 
 
 def _now() -> str:
@@ -21,14 +21,14 @@ def _now() -> str:
 
 DONE_STATUSES = {"web_downloaded", "no_image", "ai_generated"}
 ACTIVE_SEARCH_STATUSES = {"pending_search", "analyzing_intent", "searching"}
-MIN_ACCEPT_SCORE = 30
+MIN_ACCEPT_SCORE = 40
 MAX_SEARCH_ROUNDS = 2
-INTENT_BATCH_SIZE = 10
+INTENT_BATCH_SIZE = 5
 DEFAULT_CANDIDATE_LIMIT = 2
 FAST_IMAGES_PER_SHOT = 2
 FAST_IMAGES_PER_KEYWORD = 2
-FULL_IMAGES_PER_SHOT = 4
-FULL_IMAGES_PER_KEYWORD = 2
+FULL_IMAGES_PER_SHOT = 8
+FULL_IMAGES_PER_KEYWORD = 4
 FAST_VISUAL_SCORE_LIMIT = 0
 FULL_VISUAL_SCORE_LIMIT = 0
 
@@ -135,6 +135,7 @@ def mark_project_searching(db: dict, project_id: str) -> None:
         shot["status"] = "pending_search"
         shot["downloaded_image_count"] = 0
         shot["search_keywords"] = []
+        shot["archive_keywords"] = []
         shot["web_image_seen_urls"] = []
         shot["web_image_seen_hashes"] = []
         shot["web_image_seen_sources"] = []
@@ -158,6 +159,58 @@ def _remember_seen_images(shot: dict, items: list[dict]) -> None:
         *(shot.get("web_image_seen_sources") or []),
         *[item.get("source_page") for item in items if item.get("source_page")],
     ]))
+
+
+def _project_seen_images(db: dict, project_id: str, *, exclude_shot_id: str | None = None) -> dict[str, set[str]]:
+    seen = {"urls": set(), "hashes": set(), "sources": set()}
+    for asset in db.get("generated_assets", []):
+        if asset.get("project_id") != project_id:
+            continue
+        if exclude_shot_id and asset.get("shot_id") == exclude_shot_id:
+            continue
+        if asset.get("asset_source") not in {"web_search", "ai_generated"}:
+            continue
+        if asset.get("remote_url"):
+            seen["urls"].add(_url_key(asset["remote_url"]))
+        if asset.get("hash"):
+            seen["hashes"].add(asset["hash"])
+        if asset.get("source_page"):
+            seen["sources"].add(_url_key(asset["source_page"]))
+    return seen
+
+
+def _project_has_image(db: dict, project_id: str, item: dict, *, shot_id: str | None = None) -> bool:
+    seen = _project_seen_images(db, project_id, exclude_shot_id=shot_id)
+    image_url = _url_key(item.get("image_url") or "")
+    source_page = _url_key(item.get("source_page") or "")
+    return (
+        bool(item.get("hash") and item["hash"] in seen["hashes"])
+        or bool(image_url and image_url in seen["urls"])
+        or bool(source_page and source_page in seen["sources"])
+    )
+
+
+def _project_unique_items(db: dict, project_id: str, shot_id: str, items: list[dict]) -> list[dict]:
+    unique = []
+    seen = _project_seen_images(db, project_id, exclude_shot_id=shot_id)
+    for item in items:
+        image_url = _url_key(item.get("image_url") or "")
+        source_page = _url_key(item.get("source_page") or "")
+        image_hash = item.get("hash") or ""
+        if (
+            (image_hash and image_hash in seen["hashes"])
+            or (image_url and image_url in seen["urls"])
+            or (source_page and source_page in seen["sources"])
+        ):
+            continue
+        unique.append(item)
+        if image_hash:
+            seen["hashes"].add(image_hash)
+        if image_url:
+            seen["urls"].add(image_url)
+        if source_page:
+            seen["sources"].add(source_page)
+    return unique
 
 
 def _cleanup_unselected(items: list[dict], keep_items: dict | list[dict] | None) -> None:
@@ -205,6 +258,8 @@ def _clear_shot_web_assets(db: dict, project_id: str, shot_id: str) -> None:
 
 
 def _register_downloaded_image(db: dict, project_id: str, shot: dict, item: dict, index: int = 1) -> None:
+    if _project_has_image(db, project_id, item, shot_id=shot["id"]):
+        return
     now = _now()
     asset_id = new_id()
     path = Path(item["local_path"])
@@ -283,14 +338,17 @@ def _reject_scored_image(item: dict | None) -> bool:
     if not item:
         return False
     score_result = item.get("score_result") or {}
-    return bool(score_result.get("non_photo_reasons")) or int(score_result.get("score") or 0) < MIN_ACCEPT_SCORE
+    return bool(score_result.get("non_photo_reasons")) or int(score_result.get("score") or 0) <= MIN_ACCEPT_SCORE
 
 
 def _cleanup_watermark(item: dict | None, shot: dict | None = None) -> None:
     if not item:
         return
-    path = Path(item.get("local_path") or "")
-    item["watermark"] = remove_watermark_if_present(path)
+    item["watermark"] = {
+        "watermark_detected": False,
+        "watermark_removed": False,
+        "regions": [],
+    }
 
 
 def _generate_ai_asset(project_id: str, shot: dict) -> dict:
@@ -361,14 +419,14 @@ def _download_and_rank_shot(project_id: str, shot: dict) -> dict:
     failures: list[dict] = []
     all_downloaded: list[dict] = []
     top_items: list[dict] = []
-    seen_urls = set(shot.get("web_image_seen_urls") or [])
-    seen_hashes = set(shot.get("web_image_seen_hashes") or [])
-    seen_sources = set(shot.get("web_image_seen_sources") or [])
+    seen_urls = set(shot.get("web_image_seen_urls") or []) | set(shot.get("_project_seen_urls") or [])
+    seen_hashes = set(shot.get("web_image_seen_hashes") or []) | set(shot.get("_project_seen_hashes") or [])
+    seen_sources = set(shot.get("web_image_seen_sources") or []) | set(shot.get("_project_seen_sources") or [])
     search_rounds = [
         {
             "images_per_shot": FAST_IMAGES_PER_SHOT,
             "images_per_keyword": FAST_IMAGES_PER_KEYWORD,
-            "results_per_keyword": 8,
+            "results_per_keyword": 12,
             "timeout": 5,
             "visual_limit": FAST_VISUAL_SCORE_LIMIT,
             "keyword_start": 0,
@@ -377,7 +435,7 @@ def _download_and_rank_shot(project_id: str, shot: dict) -> dict:
         {
             "images_per_shot": FULL_IMAGES_PER_SHOT,
             "images_per_keyword": FULL_IMAGES_PER_KEYWORD,
-            "results_per_keyword": 10,
+            "results_per_keyword": 24,
             "timeout": 6,
             "visual_limit": FULL_VISUAL_SCORE_LIMIT,
             "keyword_start": 1,
@@ -440,7 +498,7 @@ def _download_and_rank_shot(project_id: str, shot: dict) -> dict:
             "failures": failures,
             "stopped": True,
         }
-    ai_asset = None
+    ai_asset = _generate_ai_asset(project_id, shot) if not top_items else None
     return {
         "shot_id": shot["id"],
         "shot_index": shot["shot_index"],
@@ -461,6 +519,8 @@ def _apply_search_result(db: dict, project_id: str, result: dict) -> None:
     downloaded = result.get("downloaded") or []
     top_items = result.get("top_items") or ([result["best"]] if result.get("best") else [])
     _remember_seen_images(shot, downloaded)
+    top_items = _project_unique_items(db, project_id, shot["id"], top_items)
+    _cleanup_unselected(downloaded, top_items)
     if top_items:
         for index, item in enumerate(top_items[:DEFAULT_CANDIDATE_LIMIT], start=1):
             _register_downloaded_image(db, project_id, shot, item, index)
@@ -497,6 +557,10 @@ def _search_shots_batch(project_id: str, shots: list[dict], *, total: int) -> bo
         shot["status"] = "searching"
         shot["current_search_keyword"] = search_query_for_shot(shot)
         shot["_project_video_ratio"] = project.get("video_ratio", "1:1") if project else "1:1"
+        project_seen = _project_seen_images(db, project_id, exclude_shot_id=shot.get("id"))
+        shot["_project_seen_urls"] = list(project_seen["urls"])
+        shot["_project_seen_hashes"] = list(project_seen["hashes"])
+        shot["_project_seen_sources"] = list(project_seen["sources"])
         shot["downloaded_image_count"] = 0
         shot["updated_at"] = _now()
     if project:
@@ -559,6 +623,42 @@ def _search_shots_batch(project_id: str, shots: list[dict], *, total: int) -> bo
     return True
 
 
+def _analyze_intents_with_progress(project_id: str, batch: list[dict], full_text: str, *, batch_index: int, total_batches: int, analyzed_count: int, total: int) -> dict[str, dict]:
+    batch_start = batch[0].get("shot_index", analyzed_count + 1) if batch else analyzed_count + 1
+    batch_end = batch[-1].get("shot_index", analyzed_count + len(batch)) if batch else analyzed_count
+    started = time.monotonic()
+    batch_started_at = _now()
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(ai_search_intents, batch, full_text)
+    try:
+        while not future.done():
+            if _project_stop_requested(project_id):
+                future.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise SearchIntentBatchError("图片搜索已停止")
+            elapsed = int(time.monotonic() - started)
+            db = load_db()
+            project = next((p for p in db.get("projects", []) if p.get("id") == project_id), None)
+            if project:
+                project["search_stage"] = "analyzing_intent"
+                project["current_shot_index"] = batch_start
+                project["intent_batches_total"] = total_batches
+                project["intent_batches_completed"] = batch_index - 1
+                project["intent_shots_completed"] = analyzed_count
+                project["intent_batch_started_at"] = batch_started_at
+                project["intent_batch_elapsed"] = elapsed
+                project["current_search_keyword"] = (
+                    f"正在分析关键词：第 {batch_start}-{batch_end} 个分镜"
+                    f"（{batch_index}/{total_batches} 批），GLM 正在返回中，已等待 {elapsed} 秒"
+                )
+                project["updated_at"] = _now()
+                save_db(db)
+            time.sleep(3)
+        return future.result()
+    finally:
+        executor.shutdown(wait=future.done(), cancel_futures=True)
+
+
 def run_project_web_image_search(project_id: str) -> None:
     db = load_db()
     project = next((p for p in db.get("projects", []) if p.get("id") == project_id), None)
@@ -612,7 +712,15 @@ def run_project_web_image_search(project_id: str) -> None:
             save_db(db)
 
         try:
-            intents = ai_search_intents(batch, full_text)
+            intents = _analyze_intents_with_progress(
+                project_id,
+                batch,
+                full_text,
+                batch_index=batch_index,
+                total_batches=len(batches),
+                analyzed_count=analyzed_count,
+                total=total,
+            )
         except SearchIntentBatchError as exc:
             db = load_db()
             project = next((p for p in db.get("projects", []) if p.get("id") == project_id), None)

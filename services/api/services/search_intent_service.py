@@ -15,11 +15,49 @@ TEMPLATE_KEYWORDS = [
 MIN_KEYWORDS_PER_SHOT = 3
 MAX_KEYWORDS_PER_SHOT = 3
 MAX_KEYWORD_CHARS = 10
+MAX_ARCHIVE_KEYWORDS_PER_SHOT = 3
 KNOWN_PEOPLE = [
     "钱学森", "邓稼先", "于敏", "黄旭华", "郭永怀", "袁隆平", "王淦昌", "屠呦呦",
     "孙家栋", "程开甲", "钱三强", "钱伟长", "竺可桢", "华罗庚", "李四光", "林俊德",
     "焦裕禄", "雷锋", "张富清", "黄大年", "南仁东",
 ]
+KNOWN_PEOPLE_EN = {
+    "钱学森": "Qian Xuesen",
+    "邓稼先": "Deng Jiaxian",
+    "于敏": "Yu Min",
+    "黄旭华": "Huang Xuhua",
+    "顾维钧": "Wellington Koo",
+    "杨洁篪": "Yang Jiechi",
+    "王伟": "Wang Wei",
+    "赵忠尧": "Zhao Zhongyao",
+    "汤飞凡": "Tang Feifan",
+    "爱迪生": "Thomas Edison",
+}
+ARCHIVE_TERM_EN = {
+    "旧照": "photograph",
+    "资料照": "archival photograph",
+    "历史照片": "historical photograph",
+    "黑白旧照": "black and white photograph",
+    "导弹": "missile",
+    "战机": "fighter jet",
+    "轰炸机": "bomber aircraft",
+    "军舰": "warship",
+    "航母": "aircraft carrier",
+    "撤侨": "evacuation",
+    "大使馆": "embassy",
+    "北约": "NATO",
+    "南海": "South China Sea",
+    "塞尔维亚": "Serbia",
+    "科索沃": "Kosovo",
+    "原子弹": "atomic bomb",
+    "氢弹": "hydrogen bomb",
+    "蘑菇云": "mushroom cloud",
+    "两弹一星": "Two Bombs One Satellite",
+    "实验室": "laboratory",
+    "科学家": "scientist",
+    "回国": "return to China",
+    "留学": "study abroad",
+}
 GENERIC_VISUAL_KEYWORDS = ["历史档案", "黑白旧照", "纪实照片", "老照片", "档案照片"]
 KEYWORD_FILLER_WORDS = [
     "画面", "展现", "表现", "体现", "突出", "呈现", "当前镜头", "特写画面", "历史纪实",
@@ -119,6 +157,48 @@ def _finalize_keywords(candidates: list[str]) -> list[str]:
     return keywords[:MAX_KEYWORDS_PER_SHOT]
 
 
+def _clean_archive_keyword(keyword: str) -> str:
+    cleaned = re.sub(r"[^\w\s\-'.,]", " ", str(keyword or ""), flags=re.U)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = re.sub(r"\bphotograph\s+photograph\b", "photograph", cleaned, flags=re.I)
+    cleaned = re.sub(r"\barchive\s+archival\b", "archival", cleaned, flags=re.I)
+    if not cleaned:
+        return ""
+    if "photo" not in cleaned.lower() and "archive" not in cleaned.lower():
+        cleaned = f"{cleaned} photograph"
+    return cleaned[:80]
+
+
+def _archive_keywords_from_terms(people: list[str], visual_terms: list[str], keywords: list[str], shot_text: str) -> list[str]:
+    candidates: list[str] = []
+    for person in people:
+        english = KNOWN_PEOPLE_EN.get(person)
+        if english:
+            candidates.extend([f"{english} photograph", f"{english} archival photograph"])
+    combined = " ".join([shot_text, *visual_terms, *keywords])
+    for cn, en in ARCHIVE_TERM_EN.items():
+        if cn in combined:
+            candidates.append(f"China {en} photograph")
+            candidates.append(f"{en} archival photograph")
+    if "中国" in combined:
+        candidates.append("China historical photograph")
+    if "军事" in combined or "军" in combined:
+        candidates.append("Chinese military photograph")
+    if not candidates:
+        for keyword in keywords[:MAX_ARCHIVE_KEYWORDS_PER_SHOT]:
+            candidates.append(f"China {keyword} photograph")
+    cleaned = [_clean_archive_keyword(item) for item in candidates]
+    return _unique([item for item in cleaned if item])[:MAX_ARCHIVE_KEYWORDS_PER_SHOT]
+
+
+def _finalize_archive_keywords(candidates: list[str], people: list[str], visual_terms: list[str], keywords: list[str], shot_text: str) -> list[str]:
+    cleaned = [_clean_archive_keyword(item) for item in candidates]
+    cleaned = _unique([item for item in cleaned if item])
+    if len(cleaned) < MAX_ARCHIVE_KEYWORDS_PER_SHOT:
+        cleaned.extend(_archive_keywords_from_terms(people, visual_terms, keywords, shot_text))
+    return _unique(cleaned)[:MAX_ARCHIVE_KEYWORDS_PER_SHOT]
+
+
 def find_people(text: str) -> list[str]:
     return [name for name in KNOWN_PEOPLE if name in text]
 
@@ -168,9 +248,11 @@ def sanitize_intent(result: dict, shot_text: str) -> dict:
 
     ai_keywords = _as_list(result.get("search_keywords"))
     keywords = _finalize_keywords(intent_based_keywords(people[:1], visual_terms, visual_intent) + ai_keywords)
+    archive_keywords = _finalize_archive_keywords(_as_list(result.get("archive_keywords")), people[:1], visual_terms, keywords, shot_text)
     return {
         "visual_intent": _clean_visual_intent(visual_intent) or "历史纪实画面",
         "search_keywords": keywords,
+        "archive_keywords": archive_keywords,
         "people": people[:3],
         "provider": result.get("provider") or "ai",
         "error": "",
@@ -181,9 +263,11 @@ def fallback_search_intent(shot_text: str, _full_text: str = "") -> dict:
     people = find_people(shot_text)
     visual_terms = extract_visual_terms(shot_text)
     visual_intent = " ".join([*(people[:1]), *visual_terms[:3], "历史纪实画面"]).strip() or "历史纪实画面"
+    keywords = intent_based_keywords(people[:1], visual_terms, visual_intent)
     return {
         "visual_intent": _clean_visual_intent(visual_intent),
-        "search_keywords": intent_based_keywords(people[:1], visual_terms, visual_intent),
+        "search_keywords": keywords,
+        "archive_keywords": _archive_keywords_from_terms(people[:1], visual_terms, keywords, shot_text),
         "people": people[:3],
         "provider": "local_fallback",
         "error": "",
@@ -202,11 +286,12 @@ def ai_search_intent(shot_text: str, full_text: str) -> dict:
 1. 只输出严格 JSON，不要 Markdown。
 2. visual_intent 是当前镜头的画面意图。
 3. search_keywords 输出 3-5 个简短中文关键词，每个不超过 10 个汉字。
-4. 关键词必须具体、可搜索、偏视觉化，适合百度图片。
-5. 关键词参考“精准人物/事件、替代场景、氛围细节”的组合，例如：邓稼先旧照、嘴角血迹特写、科学家病重旧照、手帕血迹、档案照片。
-6. 禁止把“伟大、震撼、感人、精神、贡献、意义”等抽象词作为关键词。
-7. 当前镜头有人物名时，1-2 个关键词可以包含人物名；不要让所有关键词都变成人物通用照。
-8. 禁止输出“默认、空镜头、模糊背景、产品、介绍、视觉、场景、描述、背景、素材、图片”这类模板词。
+4. archive_keywords 输出 2-3 个英文关键词，适合 Historical Photographs of China、NARA 等英文档案库搜索；必须包含具体人物、事件、地点、物件，优先使用英文名称。
+5. 关键词必须具体、可搜索、偏视觉化，适合百度图片。
+6. 关键词参考“精准人物/事件、替代场景、氛围细节”的组合，例如：邓稼先旧照、嘴角血迹特写、科学家病重旧照、手帕血迹、档案照片。
+7. 禁止把“伟大、震撼、感人、精神、贡献、意义”等抽象词作为关键词。
+8. 当前镜头有人物名时，1-2 个关键词可以包含人物名；不要让所有关键词都变成人物通用照。
+9. 禁止输出“默认、空镜头、模糊背景、产品、介绍、视觉、场景、描述、背景、素材、图片”这类模板词。
 
 示例：
 当前镜头：邓稼先在美国求学时，常常泡在物理实验室里。
@@ -225,7 +310,8 @@ def ai_search_intent(shot_text: str, full_text: str) -> dict:
 {{
   "visual_intent": "画面意图",
   "people": ["当前镜头出现的人物名"],
-  "search_keywords": ["短关键词1", "短关键词2", "短关键词3", "短关键词4", "短关键词5"]
+  "search_keywords": ["短关键词1", "短关键词2", "短关键词3", "短关键词4", "短关键词5"],
+  "archive_keywords": ["English archive keyword 1", "English archive keyword 2", "English archive keyword 3"]
 }}
 """.strip()
     payload = {
@@ -280,15 +366,16 @@ def ai_search_intents(shots: list[dict], full_text: str, *, timeout: int = 90, r
 
 要求：
 1. 只输出严格 JSON，不要 Markdown。
-2. 当前批次里的每个分镜都必须返回 visual_intent、people、search_keywords。
+2. 当前批次里的每个分镜都必须返回 visual_intent、people、search_keywords、archive_keywords。
 3. search_keywords 输出 3-5 个简短中文关键词，每个不超过 10 个汉字。
-4. 关键词必须具体、可搜索、偏视觉化，适合百度图片。
-5. 关键词参考“精准人物/事件、替代场景、氛围细节”的组合，例如：邓稼先旧照、嘴角血迹特写、科学家病重旧照、手帕血迹、档案照片。
-6. 禁止把“伟大、震撼、感人、精神、贡献、意义”等抽象词作为关键词。
-7. 当前分镜有人物名时，1-2 个关键词可以包含人物名；不要让所有关键词都变成人物通用照。
-8. 全文仅供理解背景，不要强行从全文给每个分镜补人物。
-9. voice_text 都是有效文本，禁止输出“无有效文本、默认、空镜头、模糊背景、产品、介绍、视觉、场景、描述、背景、素材、图片”这类模板词。
-10. 必须从 voice_text 中抽取人物、动作、地点、年代、物件或情绪细节来组成关键词。
+4. archive_keywords 输出 2-3 个英文关键词，适合 Historical Photographs of China、NARA 等英文档案库搜索；必须包含具体人物、事件、地点、物件，优先使用英文名称。
+5. 关键词必须具体、可搜索、偏视觉化，适合百度图片。
+6. 关键词参考“精准人物/事件、替代场景、氛围细节”的组合，例如：邓稼先旧照、嘴角血迹特写、科学家病重旧照、手帕血迹、档案照片。
+7. 禁止把“伟大、震撼、感人、精神、贡献、意义”等抽象词作为关键词。
+8. 当前分镜有人物名时，1-2 个关键词可以包含人物名；不要让所有关键词都变成人物通用照。
+9. 全文仅供理解背景，不要强行从全文给每个分镜补人物。
+10. voice_text 都是有效文本，禁止输出“无有效文本、默认、空镜头、模糊背景、产品、介绍、视觉、场景、描述、背景、素材、图片”这类模板词。
+11. 必须从 voice_text 中抽取人物、动作、地点、年代、物件或情绪细节来组成关键词。
 
 示例：
 voice_text：邓稼先在美国求学时，常常泡在物理实验室里。
@@ -310,7 +397,8 @@ search_keywords：["邓稼先回国", "戈壁基地", "科研旧照"]
       "id": "分镜 id",
       "visual_intent": "画面意图",
       "people": ["当前分镜出现的人物名"],
-      "search_keywords": ["短关键词1", "短关键词2", "短关键词3", "短关键词4", "短关键词5"]
+      "search_keywords": ["短关键词1", "短关键词2", "短关键词3", "短关键词4", "短关键词5"],
+      "archive_keywords": ["English archive keyword 1", "English archive keyword 2", "English archive keyword 3"]
     }}
   ]
 }}
@@ -369,6 +457,12 @@ def apply_intent_to_shot(shot: dict, intent: dict) -> dict:
     shot["visual_intent"] = intent["visual_intent"]
     shot["visual_need"] = intent["visual_intent"]
     shot["search_keywords"] = intent["search_keywords"]
+    shot["archive_keywords"] = intent.get("archive_keywords") or _archive_keywords_from_terms(
+        intent.get("people", []),
+        extract_visual_terms(str(shot.get("voice_text") or "")),
+        intent.get("search_keywords") or [],
+        str(shot.get("voice_text") or ""),
+    )
     shot["search_intent_provider"] = intent.get("provider", "")
     shot["search_intent_error"] = intent.get("error", "")
     shot["required_object"] = intent.get("people", [])
