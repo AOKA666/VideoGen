@@ -68,10 +68,15 @@ def get_project(project_id: str):
         if a.get("project_id") == project_id
         and (not a.get("local_path") or Path(str(a.get("local_path"))).exists())
     ]
+    web_image_diagnostics = [
+        item for item in db.get("web_image_diagnostics", [])
+        if item.get("project_id") == project_id
+    ]
     return {
         "project": project,
         "shots": sorted(shots, key=lambda s: s["shot_index"]),
         "generated_assets": generated_assets,
+        "web_image_diagnostics": web_image_diagnostics,
     }
 
 

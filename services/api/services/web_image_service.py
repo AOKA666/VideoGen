@@ -1,26 +1,37 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import logging
 import mimetypes
+import os
+import random
 import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import math
+from uuid import uuid4
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
-from services.image_scoring_service import aspect_ratio_score
+from services.image_scoring_service import aspect_ratio_score, quick_score_image_for_shot
 from services.image_postprocess_service import detect_blocking_watermark
+from services.search_intent_service import validate_core_keyword
 
 
+logger = logging.getLogger("uvicorn.error")
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
 )
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+RANDOM = random.SystemRandom()
+TENCENT_IMAGE_HOST = "wimgs.tencentcloudapi.com"
+TENCENT_IMAGE_SERVICE = "wimgs"
+TENCENT_IMAGE_VERSION = "2025-11-06"
 BLOCKED_SOURCE_WORDS = [
     "tuchacha", "图查查", "ztupic", "renrendoc", "人人文库", "docin", "道客巴巴",
 ]
@@ -81,85 +92,84 @@ def is_blocked_image_source(*values: str | None) -> bool:
 
 
 class WebImageSearchProvider:
-    def __init__(self, timeout: int = 10):
+    def __init__(self, timeout: int = 10, provider_name: str = "so"):
         self.timeout = timeout
+        self.provider_name = provider_name if provider_name in {"so", "tencent"} else "so"
         self.failures: list[dict] = []
+        self.diagnostics: list[dict] = []
 
-    def search(self, keyword: str, limit: int = 12, archive_keyword: str | None = None) -> list[ImageResult]:
+    def search(self, keyword: str, limit: int = 12) -> list[ImageResult]:
         results: list[ImageResult] = []
         primary_limit = max(6, limit)
-        archive_limit = max(2, min(6, math.ceil(limit / 4)))
-        archive_query = (archive_keyword or keyword).strip()
-        source_queries = [
-            (self._search_baidu, keyword),
-            (self._search_so, keyword),
-            (self._search_bing, keyword),
-        ]
-        if archive_query and archive_query != keyword:
-            source_queries.append((self._search_bing, archive_query))
-        source_queries.extend([
-            (self._search_hpc, archive_query),
-            (self._search_nara, archive_query),
-            (self._search_ntu_old_photos, keyword),
-        ])
-        for source, query in source_queries:
+        source_queries = [(
+            self._search_tencent if self.provider_name == "tencent" else self._search_so,
+            keyword,
+            primary_limit,
+        )]
+        for source, query, source_limit in source_queries:
             if not query:
                 continue
+            started = time.monotonic()
+            source_name = source.__name__.removeprefix("_search_")
             try:
-                source_limit = archive_limit if source.__name__ in {"_search_hpc", "_search_nara", "_search_ntu_old_photos"} else primary_limit
-                results.extend(source(query, source_limit))
+                source_results = source(query, source_limit)
+                results.extend(source_results)
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                logger.info(
+                    "[搜图] 渠道=%s 关键词=%s 返回=%d 耗时=%dms",
+                    source_name,
+                    query,
+                    len(source_results),
+                    elapsed_ms,
+                )
+                self.diagnostics.append({
+                    "type": "source",
+                    "keyword": query,
+                    "source": source_name,
+                    "returned": len(source_results),
+                    "elapsed_ms": elapsed_ms,
+                })
             except Exception as exc:
-                if source.__name__ not in {"_search_hpc", "_search_nara", "_search_ntu_old_photos"}:
-                    self.failures.append({
-                        "keyword": query,
-                        "stage": source.__name__,
-                        "error": str(exc)[:300],
-                    })
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                logger.warning(
+                    "[搜图] 渠道=%s 关键词=%s 请求失败 耗时=%dms 错误=%s",
+                    source_name,
+                    query,
+                    elapsed_ms,
+                    str(exc)[:200],
+                )
+                self.diagnostics.append({
+                    "type": "source",
+                    "keyword": query,
+                    "source": source_name,
+                    "returned": 0,
+                    "elapsed_ms": elapsed_ms,
+                    "error": str(exc)[:300],
+                })
+                self.failures.append({
+                    "keyword": query,
+                    "stage": source.__name__,
+                    "error": str(exc)[:300],
+                })
         return _unique_results(results)[:limit]
 
-    def _search_baidu(self, keyword: str, limit: int) -> list[ImageResult]:
-        params = {
-            "tn": "resultjson_com",
-            "ipn": "rj",
-            "ct": "201326592",
-            "is": "",
-            "fp": "result",
-            "queryWord": keyword,
-            "cl": "2",
-            "lm": "-1",
-            "ie": "utf-8",
-            "oe": "utf-8",
-            "word": keyword,
-            "pn": "0",
-            "rn": str(max(1, min(limit, 30))),
-        }
-        url = f"https://image.baidu.com/search/acjson?{urllib.parse.urlencode(params)}"
-        body = _request(url, timeout=self.timeout, referer="https://image.baidu.com/")
-        data = json.loads(body.decode("utf-8", errors="ignore"))
-        results = []
-        for item in data.get("data") or []:
-            if not isinstance(item, dict):
-                continue
-            image_url = _clean_url(item.get("objURL") or item.get("hoverURL") or item.get("middleURL") or item.get("thumbURL"))
-            thumb_url = _clean_url(item.get("thumbURL") or item.get("middleURL"))
-            if not image_url:
-                continue
-            replace_url = item.get("replaceUrl") or []
-            source_page = item.get("fromURL") or (replace_url[0].get("FromURL") if replace_url and isinstance(replace_url[0], dict) else "")
-            if is_blocked_image_source(source_page, image_url, thumb_url, item.get("fromPageTitleEnc"), item.get("fromPageTitle")):
-                continue
-            results.append(ImageResult(
-                keyword=keyword,
-                title=str(item.get("fromPageTitleEnc") or item.get("fromPageTitle") or keyword),
-                thumb_url=thumb_url,
-                image_url=image_url,
-                source_page=_clean_url(source_page),
-                source="baidu_image",
-            ))
-        return results
-
     def _search_so(self, keyword: str, limit: int) -> list[ImageResult]:
-        params = {"q": keyword, "src": "srp", "sn": "0", "pn": str(max(1, min(limit, 30)))}
+        pool_size = max(20, min(30, limit * 3))
+        start = RANDOM.choice((0, 10, 20, 30, 40))
+        logger.info(
+            "[搜图] 360请求 关键词=%s 随机起点=%d 候选池=%d 最多返回=%d",
+            keyword,
+            start,
+            pool_size,
+            limit,
+        )
+        params = {
+            "q": keyword,
+            "src": "srp",
+            "sn": str(start),
+            "pn": str(pool_size),
+            "_": str(int(time.time() * 1000)),
+        }
         url = f"https://image.so.com/j?{urllib.parse.urlencode(params)}"
         body = _request(url, timeout=self.timeout, referer="https://image.so.com/")
         data = json.loads(body.decode("utf-8", errors="ignore"))
@@ -178,200 +188,119 @@ class WebImageSearchProvider:
                 source_page=_clean_url(item.get("link")),
                 source="so_image_fallback",
             ))
-        return results
+        RANDOM.shuffle(results)
+        return results[:limit]
 
-    def _search_bing(self, keyword: str, limit: int) -> list[ImageResult]:
-        params = {"q": keyword, "form": "HDRSC2", "first": "1"}
-        url = f"https://www.bing.com/images/search?{urllib.parse.urlencode(params)}"
-        html = _request(url, timeout=self.timeout, referer="https://www.bing.com/").decode("utf-8", errors="ignore")
-        results = []
-        for match in re.finditer(r'm="({.+?})"', html):
-            if len(results) >= limit:
-                break
-            raw = match.group(1).replace("&quot;", '"')
+
+    def _search_tencent(self, keyword: str, limit: int) -> list[ImageResult]:
+        secret_id = os.getenv("TENCENT_CLOUD_SECRET_ID", "").strip()
+        secret_key = os.getenv("TENCENT_CLOUD_SECRET_KEY", "").strip()
+        if not secret_id or not secret_key:
+            raise RuntimeError("腾讯云联网图像搜索密钥未配置")
+
+        timestamp = int(time.time())
+        date = datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%d")
+        payload = json.dumps({"Query": keyword}, ensure_ascii=False, separators=(",", ":"))
+        hashed_payload = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        canonical_headers = (
+            "content-type:application/json; charset=utf-8\n"
+            f"host:{TENCENT_IMAGE_HOST}\n"
+            f"x-tc-action:{'SearchByText'.lower()}\n"
+        )
+        signed_headers = "content-type;host;x-tc-action"
+        canonical_request = "\n".join([
+            "POST",
+            "/",
+            "",
+            canonical_headers,
+            signed_headers,
+            hashed_payload,
+        ])
+        credential_scope = f"{date}/{TENCENT_IMAGE_SERVICE}/tc3_request"
+        string_to_sign = "\n".join([
+            "TC3-HMAC-SHA256",
+            str(timestamp),
+            credential_scope,
+            hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+        ])
+
+        def sign(key: bytes, message: str) -> bytes:
+            return hmac.new(key, message.encode("utf-8"), hashlib.sha256).digest()
+
+        secret_date = sign(("TC3" + secret_key).encode("utf-8"), date)
+        secret_service = sign(secret_date, TENCENT_IMAGE_SERVICE)
+        secret_signing = sign(secret_service, "tc3_request")
+        signature = hmac.new(secret_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+        authorization = (
+            f"TC3-HMAC-SHA256 Credential={secret_id}/{credential_scope}, "
+            f"SignedHeaders={signed_headers}, Signature={signature}"
+        )
+        headers = {
+            "Authorization": authorization,
+            "Content-Type": "application/json; charset=utf-8",
+            "Host": TENCENT_IMAGE_HOST,
+            "X-TC-Action": "SearchByText",
+            "X-TC-Timestamp": str(timestamp),
+            "X-TC-Version": TENCENT_IMAGE_VERSION,
+        }
+        logger.info("[搜图] 腾讯请求 关键词=%s 最多使用=%d", keyword, limit)
+        request = urllib.request.Request(
+            f"https://{TENCENT_IMAGE_HOST}",
+            data=payload.encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"腾讯图像搜索 HTTP {exc.code}: {detail[:500]}") from exc
+
+        response = body.get("Response") or {}
+        if response.get("Error"):
+            error = response["Error"]
+            raise RuntimeError(f"{error.get('Code', 'TencentError')}: {error.get('Message', '')}")
+        results: list[ImageResult] = []
+        for raw_item in response.get("Images") or []:
             try:
-                item = json.loads(raw)
+                item = json.loads(raw_item) if isinstance(raw_item, str) else raw_item
             except json.JSONDecodeError:
                 continue
-            image_url = _clean_url(item.get("murl"))
+            if not isinstance(item, dict):
+                continue
+            image_url = _clean_url(item.get("origPicUrl") or item.get("thumbnailUrl"))
+            thumb_url = _clean_url(item.get("thumbnailUrl") or item.get("origPicUrl"))
+            source_page = _clean_url(item.get("siteUrl"))
             if not image_url:
                 continue
-            if is_blocked_image_source(item.get("purl"), image_url, item.get("t")):
+            title = str(item.get("title") or item.get("siteName") or keyword)
+            if is_blocked_image_source(source_page, image_url, thumb_url, title):
                 continue
             results.append(ImageResult(
                 keyword=keyword,
-                title=str(item.get("t") or keyword),
-                thumb_url=_clean_url(item.get("turl")),
-                image_url=image_url,
-                source_page=_clean_url(item.get("purl")),
-                source="bing_image_fallback",
-            ))
-        return results
-
-    def _html_image_results(
-        self,
-        *,
-        keyword: str,
-        html: str,
-        base_url: str,
-        source: str,
-        source_page: str,
-        limit: int,
-    ) -> list[ImageResult]:
-        results: list[ImageResult] = []
-        for match in re.finditer(r"<img\b[^>]*>", html, flags=re.I):
-            if len(results) >= limit:
-                break
-            tag = match.group(0)
-            src_match = re.search(r"""(?:src|data-src|data-original|data-lazy-src)=["']([^"']+)["']""", tag, flags=re.I)
-            if not src_match:
-                continue
-            image_url = urllib.parse.urljoin(base_url, src_match.group(1).replace("&amp;", "&"))
-            if not image_url.startswith(("http://", "https://")):
-                continue
-            lower = image_url.lower()
-            if any(skip in lower for skip in ("logo", "icon", "sprite", "favicon", "placeholder", "loading")):
-                continue
-            title_match = re.search(r"""(?:alt|title)=["']([^"']+)["']""", tag, flags=re.I)
-            title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else keyword
-            if is_blocked_image_source(source_page, image_url, title):
-                continue
-            results.append(ImageResult(
-                keyword=keyword,
-                title=title or keyword,
-                thumb_url=image_url,
+                title=title,
+                thumb_url=thumb_url,
                 image_url=image_url,
                 source_page=source_page,
-                source=source,
+                source="tencent_wimgs",
             ))
-        return results
-
-    def _search_hpc(self, keyword: str, limit: int) -> list[ImageResult]:
-        params = {"search_api_fulltext": keyword}
-        url = f"https://hpcbristol.net/search?{urllib.parse.urlencode(params)}"
-        html = _request(url, timeout=min(self.timeout, 3), referer="https://hpcbristol.net/").decode("utf-8", errors="ignore")
-        return self._html_image_results(
-            keyword=keyword,
-            html=html,
-            base_url="https://hpcbristol.net/",
-            source="historical_photographs_of_china",
-            source_page=url,
-            limit=limit,
-        )
-
-    def _search_nara(self, keyword: str, limit: int) -> list[ImageResult]:
-        params = {
-            "q": f"{keyword} photograph",
-            "availableOnline": "true",
-            "limit": str(max(1, min(limit, 20))),
-        }
-        url = f"https://catalog.archives.gov/api/v2/records/search?{urllib.parse.urlencode(params)}"
-        body = _request(url, timeout=min(self.timeout, 3), referer="https://catalog.archives.gov/")
-        try:
-            data = json.loads(body.decode("utf-8", errors="ignore"))
-        except json.JSONDecodeError:
-            html = body.decode("utf-8", errors="ignore")
-            return self._html_image_results(
-                keyword=keyword,
-                html=html,
-                base_url="https://catalog.archives.gov/",
-                source="nara",
-                source_page=f"https://catalog.archives.gov/search?q={urllib.parse.quote(keyword)}",
-                limit=limit,
-            )
-
-        urls: list[str] = []
-
-        def collect_images(value):
-            if len(urls) >= limit:
-                return
-            if isinstance(value, dict):
-                for key, item in value.items():
-                    if isinstance(item, str) and key.lower() in {"url", "objecturl", "thumbnailurl", "downloadurl"}:
-                        if item.startswith(("http://", "https://")) and re.search(r"\.(jpe?g|png|webp)(\?|$)", item, flags=re.I):
-                            urls.append(item)
-                    else:
-                        collect_images(item)
-            elif isinstance(value, list):
-                for item in value:
-                    collect_images(item)
-
-        collect_images(data)
-        results = []
-        for image_url in list(dict.fromkeys(urls))[:limit]:
-            if is_blocked_image_source(url, image_url):
-                continue
-            results.append(ImageResult(
-                keyword=keyword,
-                title=f"NARA {keyword}",
-                thumb_url=image_url,
-                image_url=image_url,
-                source_page=url,
-                source="nara",
-            ))
-        return results
-
-    def _search_ntu_old_photos(self, keyword: str, limit: int) -> list[ImageResult]:
-        params = {"q": keyword}
-        url = f"https://dl.lib.ntu.edu.tw/s/photo/photo?{urllib.parse.urlencode(params)}"
-        html = _request(url, timeout=min(self.timeout, 3), referer="https://dl.lib.ntu.edu.tw/").decode("utf-8", errors="ignore")
-        return self._html_image_results(
-            keyword=keyword,
-            html=html,
-            base_url="https://dl.lib.ntu.edu.tw/",
-            source="ntu_old_photos",
-            source_page=url,
-            limit=limit,
-        )
+        RANDOM.shuffle(results)
+        return results[:limit]
 
 
 def search_keywords_for_shot(shot: dict) -> list[str]:
     explicit_keywords = [str(x).strip() for x in shot.get("search_keywords") or [] if str(x).strip()]
-    if explicit_keywords:
-        return explicit_keywords[:3]
-    objects = [str(x).strip() for x in shot.get("required_object") or [] if str(x).strip()]
-    scenes = [str(x).strip() for x in shot.get("required_scene") or [] if str(x).strip()]
-    visual_need = str(shot.get("visual_need") or "").strip()
-    voice_text = str(shot.get("voice_text") or "").strip()
-    seeds = []
-    if objects:
-        seeds.append(" ".join(objects[:2] + ["老照片"]))
-        seeds.append(" ".join(objects[:2] + ["历史照片"]))
-    if scenes:
-        seeds.append(" ".join(scenes[:2] + ["历史照片"]))
-    if visual_need:
-        seeds.append(f"{visual_need} 历史照片")
-    if voice_text:
-        seeds.append(f"{voice_text[:24]} 配图")
-    seeds.append("历史纪实 老照片")
-    return list(dict.fromkeys(seeds))[:3]
-
-
-def archive_keywords_for_shot(shot: dict) -> list[str]:
-    explicit_keywords = [str(x).strip() for x in shot.get("archive_keywords") or [] if str(x).strip()]
-    if explicit_keywords:
-        return explicit_keywords[:3]
-    keywords = search_keywords_for_shot(shot)
-    people = [str(x).strip() for x in shot.get("required_object") or [] if str(x).strip()]
-    scenes = [str(x).strip() for x in shot.get("required_scene") or [] if str(x).strip()]
-    seeds = []
-    for person in people[:2]:
-        if re.search(r"[A-Za-z]", person):
-            seeds.append(f"{person} photograph")
-    if any("导弹" in item or "missile" in item.lower() for item in [*keywords, *scenes]):
-        seeds.append("Chinese missile photograph")
-    if any("战机" in item or "飞机" in item or "航班" in item for item in [*keywords, *scenes]):
-        seeds.append("Chinese aircraft photograph")
-    if any("军舰" in item or "航母" in item or "海军" in item for item in [*keywords, *scenes]):
-        seeds.append("Chinese navy warship photograph")
-    if any("大使馆" in item for item in [*keywords, *scenes]):
-        seeds.append("Chinese embassy bombing photograph")
-    seeds.append("China historical photograph")
-    return list(dict.fromkeys(seeds))[:3]
+    if not explicit_keywords:
+        return []
+    try:
+        return [validate_core_keyword(explicit_keywords[0])]
+    except ValueError:
+        return []
 
 
 def search_query_for_shot(shot: dict) -> str:
-    return " ".join(search_keywords_for_shot(shot)[:3]).strip()
+    return " ".join(search_keywords_for_shot(shot)[:1]).strip()
 
 
 def _extension_from_content(content_type: str, url: str) -> str:
@@ -415,8 +344,11 @@ def download_image(
     min_width: int = 300,
     min_height: int = 300,
     min_file_size: int = 20 * 1024,
+    reject_reasons: list[str] | None = None,
 ) -> dict | None:
     if is_blocked_image_source(result.title, result.keyword, result.source_page, result.image_url, result.thumb_url, result.source):
+        if reject_reasons is not None:
+            reject_reasons.append("来源屏蔽")
         return None
     output_dir.mkdir(parents=True, exist_ok=True)
     req = urllib.request.Request(result.image_url, headers={"User-Agent": USER_AGENT, "Referer": result.source_page or result.thumb_url or ""})
@@ -424,26 +356,40 @@ def download_image(
         with urllib.request.urlopen(req, timeout=timeout) as response:
             content_type = response.headers.get("Content-Type", "")
             if "image" not in content_type.lower():
+                if reject_reasons is not None:
+                    reject_reasons.append("非图片响应")
                 return None
             data = response.read(8 * 1024 * 1024)
-    except (urllib.error.URLError, TimeoutError, ValueError):
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        if reject_reasons is not None:
+            reject_reasons.append(f"下载失败:{type(exc).__name__}")
         return None
     if len(data) < min_file_size:
+        if reject_reasons is not None:
+            reject_reasons.append("文件过小")
         return None
     size = _image_size(data)
     if not size:
+        if reject_reasons is not None:
+            reject_reasons.append("无法识别尺寸")
         return None
     width, height = size
     if width < min_width or height < min_height:
+        if reject_reasons is not None:
+            reject_reasons.append("尺寸过小")
         return None
     ratio = max(width / max(height, 1), height / max(width, 1))
     if ratio > 4:
+        if reject_reasons is not None:
+            reject_reasons.append("比例过窄")
         return None
     watermark = detect_blocking_watermark(
         data,
         " ".join([result.title, result.keyword, result.source_page, result.image_url, result.source]),
     )
     if watermark.get("rejected"):
+        if reject_reasons is not None:
+            reject_reasons.append(f"水印:{watermark.get('reason') or '疑似水印'}")
         return None
     ext = _extension_from_content(content_type, result.image_url)
     path = output_dir / f"{filename_stem}{ext}"
@@ -467,34 +413,53 @@ def download_images_for_shot(
     images_per_keyword: int = 2,
     results_per_keyword: int = 12,
     keyword_start: int = 0,
-    keyword_limit: int = 3,
+    keyword_limit: int = 1,
     delay: float = 0.1,
     timeout: int = 6,
     on_download=None,
     exclude_urls: set[str] | None = None,
     exclude_hashes: set[str] | None = None,
     exclude_sources: set[str] | None = None,
-) -> tuple[list[ImageResult], list[dict], list[dict]]:
-    provider = WebImageSearchProvider(timeout=timeout)
+    provider_name: str = "so",
+) -> tuple[list[ImageResult], list[dict], list[dict], list[dict]]:
+    provider = WebImageSearchProvider(timeout=timeout, provider_name=provider_name)
+    download_batch_id = uuid4().hex[:8]
     search_results: list[ImageResult] = []
     downloaded: list[dict] = []
     failures: list[dict] = []
+    diagnostics: list[dict] = []
     seen_hashes = set(exclude_hashes or set())
     seen_urls = {_url_key(url) for url in (exclude_urls or set()) if url}
     seen_sources = {_url_key(url) for url in (exclude_sources or set()) if url}
     seen_dimensions = set()
 
     keywords = search_keywords_for_shot(shot)[keyword_start:keyword_start + keyword_limit]
-    archive_keywords = archive_keywords_for_shot(shot)[keyword_start:keyword_start + keyword_limit]
+    if not keywords:
+        logger.warning("[搜图] 镜头=%s 没有有效核心关键词，跳过", shot.get("shot_index"))
     for offset, keyword in enumerate(keywords, start=1):
         keyword_index = keyword_start + offset
-        archive_keyword = archive_keywords[offset - 1] if offset - 1 < len(archive_keywords) else ""
         if len(downloaded) >= images_per_shot:
             break
-        results = provider.search(keyword, results_per_keyword, archive_keyword=archive_keyword)
+        logger.info(
+            "[搜图] 镜头=%s 关键词=%s 开始检查候选=%d 下载目标=%d",
+            shot.get("shot_index"),
+            keyword,
+            results_per_keyword,
+            images_per_keyword,
+        )
+        results = provider.search(keyword, results_per_keyword)
         search_results.extend(results)
+        keyword_diag = {
+            "type": "keyword",
+            "keyword": keyword,
+            "result_count": len(results),
+            "attempted_downloads": 0,
+            "downloaded": 0,
+            "rejected": {},
+        }
         if not results:
             failures.append({"keyword": keyword, "stage": "search", "error": "no image result"})
+            diagnostics.append(keyword_diag)
             continue
         if keyword_index > 1 and delay:
             time.sleep(delay)
@@ -505,21 +470,47 @@ def download_images_for_shot(
             candidate_key = _url_key(result.image_url or result.thumb_url)
             source_key = _url_key(result.source_page)
             if candidate_key in seen_urls or (source_key and source_key in seen_sources):
+                keyword_diag["rejected"]["重复URL/来源"] = keyword_diag["rejected"].get("重复URL/来源", 0) + 1
+                logger.info(
+                    "[搜图] 镜头=%s 候选=%d/%d 过滤=重复URL或来源",
+                    shot.get("shot_index"),
+                    result_index,
+                    len(results),
+                )
                 continue
             seen_urls.add(candidate_key)
             if source_key:
                 seen_sources.add(source_key)
+            reject_reasons: list[str] = []
+            keyword_diag["attempted_downloads"] += 1
             item = download_image(
                 result,
                 output_dir,
-                f"shot_{shot['shot_index']:03d}_kw_{keyword_index:02d}_img_{result_index:03d}",
+                f"shot_{shot['shot_index']:03d}_{download_batch_id}_kw_{keyword_index:02d}_img_{result_index:03d}",
                 timeout=timeout,
+                reject_reasons=reject_reasons,
             )
             if not item:
+                reason = reject_reasons[0] if reject_reasons else "未知过滤"
+                keyword_diag["rejected"][reason] = keyword_diag["rejected"].get(reason, 0) + 1
+                logger.info(
+                    "[搜图] 镜头=%s 候选=%d/%d 过滤=%s",
+                    shot.get("shot_index"),
+                    result_index,
+                    len(results),
+                    reason,
+                )
                 continue
             dimension_key = (item["width"], item["height"], item["file_size"])
             if item["hash"] in seen_hashes or dimension_key in seen_dimensions:
                 Path(item["local_path"]).unlink(missing_ok=True)
+                keyword_diag["rejected"]["重复图片"] = keyword_diag["rejected"].get("重复图片", 0) + 1
+                logger.info(
+                    "[搜图] 镜头=%s 候选=%d/%d 过滤=重复图片",
+                    shot.get("shot_index"),
+                    result_index,
+                    len(results),
+                )
                 continue
             seen_hashes.add(item["hash"])
             seen_dimensions.add(dimension_key)
@@ -531,11 +522,45 @@ def download_images_for_shot(
                 "source": result.source,
                 "aspect_ratio_score": aspect_ratio_score(item),
             })
+            quick_score = quick_score_image_for_shot(shot, item)
+            if quick_score.get("non_photo_reasons"):
+                Path(item["local_path"]).unlink(missing_ok=True)
+                reason = f"非照片:{quick_score['non_photo_reasons'][0]}"
+                keyword_diag["rejected"][reason] = keyword_diag["rejected"].get(reason, 0) + 1
+                logger.info(
+                    "[搜图] 镜头=%s 候选=%d/%d 过滤=%s",
+                    shot.get("shot_index"),
+                    result_index,
+                    len(results),
+                    reason,
+                )
+                continue
             downloaded.append(item)
             keyword_downloaded += 1
+            keyword_diag["downloaded"] += 1
+            logger.info(
+                "[搜图] 镜头=%s 候选=%d/%d 下载成功=%dx%d 来源=%s",
+                shot.get("shot_index"),
+                result_index,
+                len(results),
+                item["width"],
+                item["height"],
+                result.source_page or result.image_url,
+            )
             if on_download:
                 on_download(item, len(downloaded))
+        diagnostics.append(keyword_diag)
+        logger.info(
+            "[搜图] 镜头=%s 关键词=%s 本轮完成 返回=%d 尝试下载=%d 成功=%d 过滤=%s",
+            shot.get("shot_index"),
+            keyword,
+            len(results),
+            keyword_diag["attempted_downloads"],
+            keyword_diag["downloaded"],
+            keyword_diag["rejected"] or "无",
+        )
 
     failures.extend(provider.failures)
+    diagnostics.extend(provider.diagnostics)
     downloaded.sort(key=lambda item: (item.get("aspect_ratio_score") or 0, item.get("width", 0) * item.get("height", 0)), reverse=True)
-    return search_results, downloaded, failures
+    return search_results, downloaded, failures, diagnostics

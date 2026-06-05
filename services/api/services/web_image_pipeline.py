@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import os
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -12,7 +13,10 @@ from services.generation_service import generate_doubao_image, generate_svg_plac
 from services.image_scoring_service import rank_images_for_shot
 from services.search_intent_service import SearchIntentBatchError, ai_search_intents, apply_intent_to_shot
 from services.store import load_db, project_dir, public_url, save_db
-from services.web_image_service import _url_key, download_images_for_shot, search_query_for_shot
+from services.web_image_service import _url_key, download_images_for_shot, search_keywords_for_shot, search_query_for_shot
+
+
+logger = logging.getLogger("uvicorn.error")
 
 
 def _now() -> str:
@@ -21,7 +25,7 @@ def _now() -> str:
 
 DONE_STATUSES = {"web_downloaded", "no_image", "ai_generated"}
 ACTIVE_SEARCH_STATUSES = {"pending_search", "analyzing_intent", "searching"}
-MIN_ACCEPT_SCORE = 40
+MIN_ACCEPT_SCORE = 30
 MAX_SEARCH_ROUNDS = 2
 INTENT_BATCH_SIZE = 5
 DEFAULT_CANDIDATE_LIMIT = 2
@@ -35,9 +39,9 @@ FULL_VISUAL_SCORE_LIMIT = 0
 
 def web_image_concurrency() -> int:
     try:
-        return max(1, min(8, int(os.getenv("WEB_IMAGE_CONCURRENCY", "4"))))
+        return max(1, min(8, int(os.getenv("WEB_IMAGE_CONCURRENCY", "6"))))
     except ValueError:
-        return 4
+        return 6
 
 
 def _intent_batches(shots: list[dict], batch_size: int = INTENT_BATCH_SIZE) -> list[list[dict]]:
@@ -104,6 +108,10 @@ def reset_project_web_images(db: dict, project_id: str) -> None:
         item for item in db.get("web_image_failures", [])
         if item.get("project_id") != project_id
     ]
+    db["web_image_diagnostics"] = [
+        item for item in db.get("web_image_diagnostics", [])
+        if item.get("project_id") != project_id
+    ]
     images_dir = project_dir(project_id) / "images"
     for folder in images_dir.glob("shot_*"):
         if folder.is_dir():
@@ -135,13 +143,12 @@ def mark_project_searching(db: dict, project_id: str) -> None:
         shot["status"] = "pending_search"
         shot["downloaded_image_count"] = 0
         shot["search_keywords"] = []
-        shot["archive_keywords"] = []
+        shot.pop("archive_keywords", None)
         shot["web_image_seen_urls"] = []
         shot["web_image_seen_hashes"] = []
         shot["web_image_seen_sources"] = []
         shot["search_attempts"] = 0
-        shot["visual_intent"] = ""
-        shot["visual_need"] = ""
+        shot.pop("visual_intent", None)
         shot["search_started_at"] = now
         shot["updated_at"] = now
 
@@ -257,12 +264,19 @@ def _clear_shot_web_assets(db: dict, project_id: str, shot_id: str) -> None:
     ]
 
 
-def _register_downloaded_image(db: dict, project_id: str, shot: dict, item: dict, index: int = 1) -> None:
+def _register_downloaded_image(db: dict, project_id: str, shot: dict, item: dict, index: int = 1) -> bool:
+    path = Path(item["local_path"])
+    if not path.exists():
+        logger.warning(
+            "[搜图] 镜头=%s 候选登记失败：本地文件不存在 path=%s",
+            shot.get("shot_index"),
+            path,
+        )
+        return False
     if _project_has_image(db, project_id, item, shot_id=shot["id"]):
-        return
+        return False
     now = _now()
     asset_id = new_id()
-    path = Path(item["local_path"])
     item["file_url"] = public_url(path)
     if not shot.get("selected_asset_id"):
         shot["selected_asset_id"] = asset_id
@@ -311,6 +325,7 @@ def _register_downloaded_image(db: dict, project_id: str, shot: dict, item: dict
         "is_selected": shot.get("selected_asset_id") == asset_id,
         "created_at": now,
     })
+    return True
 
 
 def _top_scored_downloads(shot: dict, downloaded: list[dict], *, limit: int = DEFAULT_CANDIDATE_LIMIT, visual_limit: int = FAST_VISUAL_SCORE_LIMIT) -> list[dict]:
@@ -338,7 +353,7 @@ def _reject_scored_image(item: dict | None) -> bool:
     if not item:
         return False
     score_result = item.get("score_result") or {}
-    return bool(score_result.get("non_photo_reasons")) or int(score_result.get("score") or 0) <= MIN_ACCEPT_SCORE
+    return bool(score_result.get("non_photo_reasons")) or int(score_result.get("score") or 0) < MIN_ACCEPT_SCORE
 
 
 def _cleanup_watermark(item: dict | None, shot: dict | None = None) -> None:
@@ -415,19 +430,22 @@ def _register_ai_asset(db: dict, project_id: str, shot: dict, item: dict) -> Non
 
 
 def _download_and_rank_shot(project_id: str, shot: dict) -> dict:
+    shot_started = time.monotonic()
     output_dir = project_dir(project_id) / "images" / f"shot_{shot['shot_index']:03d}"
     failures: list[dict] = []
+    diagnostics: list[dict] = []
     all_downloaded: list[dict] = []
     top_items: list[dict] = []
     seen_urls = set(shot.get("web_image_seen_urls") or []) | set(shot.get("_project_seen_urls") or [])
     seen_hashes = set(shot.get("web_image_seen_hashes") or []) | set(shot.get("_project_seen_hashes") or [])
     seen_sources = set(shot.get("web_image_seen_sources") or []) | set(shot.get("_project_seen_sources") or [])
+    provider_name = str(shot.get("_image_search_provider") or "so")
     search_rounds = [
         {
             "images_per_shot": FAST_IMAGES_PER_SHOT,
             "images_per_keyword": FAST_IMAGES_PER_KEYWORD,
-            "results_per_keyword": 12,
-            "timeout": 5,
+            "results_per_keyword": 10,
+            "timeout": 3,
             "visual_limit": FAST_VISUAL_SCORE_LIMIT,
             "keyword_start": 0,
             "keyword_limit": 1,
@@ -435,17 +453,30 @@ def _download_and_rank_shot(project_id: str, shot: dict) -> dict:
         {
             "images_per_shot": FULL_IMAGES_PER_SHOT,
             "images_per_keyword": FULL_IMAGES_PER_KEYWORD,
-            "results_per_keyword": 24,
-            "timeout": 6,
+            "results_per_keyword": 30,
+            "timeout": 3,
             "visual_limit": FULL_VISUAL_SCORE_LIMIT,
-            "keyword_start": 1,
-            "keyword_limit": 2,
+            "keyword_start": 0,
+            "keyword_limit": 1,
         },
     ][:MAX_SEARCH_ROUNDS]
     rounds = 0
+    logger.info(
+        "[搜图] 镜头=%s 开始 关键词=%s",
+        shot.get("shot_index"),
+        search_query_for_shot(shot) or "无",
+    )
     for round_index, round_config in enumerate(search_rounds, start=1):
         rounds = round_index
-        _, downloaded, round_failures = download_images_for_shot(
+        round_started = time.monotonic()
+        logger.info(
+            "[搜图] 镜头=%s 第%d轮开始 检查候选=%d 下载上限=%d",
+            shot.get("shot_index"),
+            round_index,
+            round_config["results_per_keyword"],
+            round_config["images_per_keyword"],
+        )
+        _, downloaded, round_failures, round_diagnostics = download_images_for_shot(
             shot,
             output_dir,
             images_per_shot=round_config["images_per_shot"],
@@ -458,18 +489,30 @@ def _download_and_rank_shot(project_id: str, shot: dict) -> dict:
             exclude_urls=seen_urls,
             exclude_hashes=seen_hashes,
             exclude_sources=seen_sources,
+            provider_name=provider_name,
         )
         failures.extend({**failure, "round": round_index} for failure in round_failures)
+        diagnostics.extend({**entry, "round": round_index} for entry in round_diagnostics)
         all_downloaded.extend(downloaded)
         seen_urls.update(item.get("image_url") for item in downloaded if item.get("image_url"))
         seen_hashes.update(item.get("hash") for item in downloaded if item.get("hash"))
         seen_sources.update(item.get("source_page") for item in downloaded if item.get("source_page"))
         top_items = _top_scored_downloads(shot, all_downloaded, limit=DEFAULT_CANDIDATE_LIMIT, visual_limit=round_config["visual_limit"])
-        if top_items:
+        logger.info(
+            "[搜图] 镜头=%s 第%d轮结束 新下载=%d 合格候选=%d 分数=%s 耗时=%.2fs",
+            shot.get("shot_index"),
+            round_index,
+            len(downloaded),
+            len(top_items),
+            [item.get("score_result", {}).get("score", 0) for item in top_items],
+            time.monotonic() - round_started,
+        )
+        if len(top_items) >= DEFAULT_CANDIDATE_LIMIT:
             for item in top_items:
                 _cleanup_watermark(item, shot)
             break
-        _cleanup_unselected(downloaded, None)
+        _cleanup_unselected(all_downloaded, top_items)
+        all_downloaded = list(top_items)
         if _project_stop_requested(project_id):
             _cleanup_unselected(all_downloaded, None)
             return {
@@ -481,6 +524,7 @@ def _download_and_rank_shot(project_id: str, shot: dict) -> dict:
                 "ai_asset": None,
                 "rounds": rounds,
                 "failures": failures,
+                "diagnostics": diagnostics,
                 "stopped": True,
             }
     if top_items:
@@ -496,9 +540,18 @@ def _download_and_rank_shot(project_id: str, shot: dict) -> dict:
             "ai_asset": None,
             "rounds": rounds,
             "failures": failures,
+            "diagnostics": diagnostics,
             "stopped": True,
         }
-    ai_asset = _generate_ai_asset(project_id, shot) if not top_items else None
+    ai_asset = None
+    logger.info(
+        "[搜图] 镜头=%s 完成 状态=%s 最终候选=%d 最佳分数=%s 总耗时=%.2fs",
+        shot.get("shot_index"),
+        "成功" if top_items else "无图片",
+        len(top_items),
+        top_items[0].get("score_result", {}).get("score", 0) if top_items else "-",
+        time.monotonic() - shot_started,
+    )
     return {
         "shot_id": shot["id"],
         "shot_index": shot["shot_index"],
@@ -508,6 +561,7 @@ def _download_and_rank_shot(project_id: str, shot: dict) -> dict:
         "ai_asset": ai_asset,
         "rounds": rounds,
         "failures": failures,
+        "diagnostics": diagnostics,
     }
 
 
@@ -521,17 +575,26 @@ def _apply_search_result(db: dict, project_id: str, result: dict) -> None:
     _remember_seen_images(shot, downloaded)
     top_items = _project_unique_items(db, project_id, shot["id"], top_items)
     _cleanup_unselected(downloaded, top_items)
+    registered_items = []
     if top_items:
         for index, item in enumerate(top_items[:DEFAULT_CANDIDATE_LIMIT], start=1):
-            _register_downloaded_image(db, project_id, shot, item, index)
-        shot["match_score"] = top_items[0]["score_result"]["score"]
-        shot["image_score"] = top_items[0]["score_result"]
-        shot["status"] = "web_downloaded"
+            if _register_downloaded_image(db, project_id, shot, item, index):
+                registered_items.append(item)
+        if registered_items:
+            shot["match_score"] = registered_items[0]["score_result"]["score"]
+            shot["image_score"] = registered_items[0]["score_result"]
+            shot["status"] = "web_downloaded"
+        else:
+            shot["selected_asset_id"] = None
+            shot["asset_source"] = None
+            shot["match_score"] = 0
+            shot["image_score"] = None
+            shot["status"] = "no_image"
     elif result.get("ai_asset"):
         _register_ai_asset(db, project_id, shot, result["ai_asset"])
     else:
         shot["status"] = "no_image"
-    shot["downloaded_image_count"] = len(top_items[:DEFAULT_CANDIDATE_LIMIT])
+    shot["downloaded_image_count"] = len(registered_items)
     shot["current_search_keyword"] = ""
     shot["search_attempts"] = int(shot.get("search_attempts") or 0) + int(result.get("rounds") or 1)
     shot["search_finished_at"] = _now()
@@ -545,6 +608,16 @@ def _apply_search_result(db: dict, project_id: str, result: dict) -> None:
             "created_at": _now(),
             **failure,
         } for failure in failures)
+    diagnostics = result.get("diagnostics") or []
+    if diagnostics:
+        db.setdefault("web_image_diagnostics", []).extend({
+            "project_id": project_id,
+            "shot_id": shot["id"],
+            "shot_index": shot["shot_index"],
+            "created_at": _now(),
+            **entry,
+        } for entry in diagnostics)
+        db["web_image_diagnostics"] = db.get("web_image_diagnostics", [])[-3000:]
 
 
 def _search_shots_batch(project_id: str, shots: list[dict], *, total: int) -> bool:
@@ -555,8 +628,10 @@ def _search_shots_batch(project_id: str, shots: list[dict], *, total: int) -> bo
         if shot.get("id") not in shot_ids:
             continue
         shot["status"] = "searching"
+        shot["search_keywords"] = search_keywords_for_shot(shot)
         shot["current_search_keyword"] = search_query_for_shot(shot)
         shot["_project_video_ratio"] = project.get("video_ratio", "1:1") if project else "1:1"
+        shot["_image_search_provider"] = project.get("image_search_provider", "so") if project else "so"
         project_seen = _project_seen_images(db, project_id, exclude_shot_id=shot.get("id"))
         shot["_project_seen_urls"] = list(project_seen["urls"])
         shot["_project_seen_hashes"] = list(project_seen["hashes"])
@@ -684,7 +759,7 @@ def run_project_web_image_search(project_id: str) -> None:
     project["search_error"] = ""
     project["intent_analysis_started_at"] = now
     project["intent_batch_size"] = INTENT_BATCH_SIZE
-    project["intent_keyword_estimate"] = f"{total * 3}-{total * 5}" if total else "0"
+    project["intent_keyword_estimate"] = str(total) if total else "0"
     project["current_search_keyword"] = f"正在按每批 {INTENT_BATCH_SIZE} 个分镜分析关键词，预计生成 {project['intent_keyword_estimate']} 个关键词"
     project["updated_at"] = now
     save_db(db)
@@ -807,8 +882,10 @@ def rerun_shot_web_image_search(project_id: str, shot_id: str) -> None:
     shot["image_score"] = None
     shot["status"] = "searching"
     shot["downloaded_image_count"] = 0
+    shot["search_keywords"] = search_keywords_for_shot(shot)
     shot["current_search_keyword"] = search_query_for_shot(shot)
     shot["_project_video_ratio"] = project.get("video_ratio", "1:1")
+    shot["_image_search_provider"] = project.get("image_search_provider", "so")
     shot["updated_at"] = now
     project["status"] = "searching_images"
     project["current_shot_index"] = shot.get("shot_index")

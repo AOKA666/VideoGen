@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 
 from services.store import load_db, save_db
 from services.web_image_pipeline import (
@@ -15,7 +15,11 @@ router = APIRouter(prefix="/api/projects", tags=["matching"])
 
 
 @router.post("/{project_id}/match-assets")
-def match_assets(project_id: str, background_tasks: BackgroundTasks):
+def match_assets(
+    project_id: str,
+    background_tasks: BackgroundTasks,
+    image_search_provider: str = Query("so", pattern="^(so|tencent)$"),
+):
     db = load_db()
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
@@ -24,6 +28,7 @@ def match_assets(project_id: str, background_tasks: BackgroundTasks):
     reset_project_web_images(db, project_id)
     mark_project_searching(db, project_id)
     project["status"] = "searching_images"
+    project["image_search_provider"] = image_search_provider
     save_db(db)
     background_tasks.add_task(run_project_web_image_search, project_id)
     return {"project_id": project_id, "status": "searching_images", "count": len(shots)}

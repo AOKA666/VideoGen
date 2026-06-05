@@ -7,70 +7,28 @@ import urllib.error
 import urllib.request
 
 
-ABSTRACT_WORDS = ["伟大", "震撼", "感人", "精神", "贡献", "意义", "重要", "传奇", "辉煌"]
-TEMPLATE_KEYWORDS = [
-    "无有效文本", "默认", "空镜头", "模糊背景", "产品", "介绍", "视觉", "场景", "描述", "背景", "素材", "图片",
-    "人物肖像", "正面照", "侧面照", "表情特写", "人物动作", "环境",
-]
-MIN_KEYWORDS_PER_SHOT = 3
-MAX_KEYWORDS_PER_SHOT = 3
-MAX_KEYWORD_CHARS = 10
-MAX_ARCHIVE_KEYWORDS_PER_SHOT = 3
-KNOWN_PEOPLE = [
-    "钱学森", "邓稼先", "于敏", "黄旭华", "郭永怀", "袁隆平", "王淦昌", "屠呦呦",
-    "孙家栋", "程开甲", "钱三强", "钱伟长", "竺可桢", "华罗庚", "李四光", "林俊德",
-    "焦裕禄", "雷锋", "张富清", "黄大年", "南仁东",
-]
-KNOWN_PEOPLE_EN = {
-    "钱学森": "Qian Xuesen",
-    "邓稼先": "Deng Jiaxian",
-    "于敏": "Yu Min",
-    "黄旭华": "Huang Xuhua",
-    "顾维钧": "Wellington Koo",
-    "杨洁篪": "Yang Jiechi",
-    "王伟": "Wang Wei",
-    "赵忠尧": "Zhao Zhongyao",
-    "汤飞凡": "Tang Feifan",
-    "爱迪生": "Thomas Edison",
+MIN_KEYWORD_CHARS = 2
+MAX_KEYWORD_CHARS = 12
+FORBIDDEN_KEYWORDS = {
+    "默认",
+    "空镜头",
+    "模糊背景",
+    "产品",
+    "介绍",
+    "视觉",
+    "场景",
+    "描述",
+    "背景",
+    "素材",
+    "图片",
+    "画面",
+    "现场",
+    "安全感",
+    "威严",
+    "强硬回击",
 }
-ARCHIVE_TERM_EN = {
-    "旧照": "photograph",
-    "资料照": "archival photograph",
-    "历史照片": "historical photograph",
-    "黑白旧照": "black and white photograph",
-    "导弹": "missile",
-    "战机": "fighter jet",
-    "轰炸机": "bomber aircraft",
-    "军舰": "warship",
-    "航母": "aircraft carrier",
-    "撤侨": "evacuation",
-    "大使馆": "embassy",
-    "北约": "NATO",
-    "南海": "South China Sea",
-    "塞尔维亚": "Serbia",
-    "科索沃": "Kosovo",
-    "原子弹": "atomic bomb",
-    "氢弹": "hydrogen bomb",
-    "蘑菇云": "mushroom cloud",
-    "两弹一星": "Two Bombs One Satellite",
-    "实验室": "laboratory",
-    "科学家": "scientist",
-    "回国": "return to China",
-    "留学": "study abroad",
-}
-GENERIC_VISUAL_KEYWORDS = ["历史档案", "黑白旧照", "纪实照片", "老照片", "档案照片"]
-KEYWORD_FILLER_WORDS = [
-    "画面", "展现", "表现", "体现", "突出", "呈现", "当前镜头", "特写画面", "历史纪实",
-    "的", "与", "和", "及",
-]
-VISUAL_TERMS = [
-    "老照片", "历史照片", "旧照", "档案", "黑白照片", "实验室", "科研人员", "会议",
-    "办公室", "手稿", "文件", "火箭", "导弹", "核试验", "基地", "戈壁", "中国科学院",
-    "留学生", "博士毕业", "颁奖", "火车站", "回国", "宿舍", "课堂", "工厂",
-    "绝密档案", "机密文件", "两弹元勋", "两弹一星", "勋章", "血迹", "嘴角", "手帕",
-    "白衬衫", "鲜花", "花束", "纪念碑", "日本国旗", "国旗", "轮船", "港口",
-    "登船", "撕国旗", "黑白照", "资料照",
-]
+FRAGMENT_PREFIXES = ("时", "或", "的", "方", "其", "这", "那")
+SENTENCE_MARKERS = ("为了", "体现", "展现", "展示", "表现", "强调", "画面")
 
 
 class SearchIntentBatchError(RuntimeError):
@@ -92,297 +50,143 @@ def _extract_json_object(text: str) -> str:
     return match.group(0)
 
 
-def _as_list(value) -> list[str]:
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    if isinstance(value, str):
-        return [item.strip() for item in re.split(r"[,，、\n]+", value) if item.strip()]
-    return []
+def _raw_core_keyword(result: dict) -> str:
+    value = result.get("core_keyword")
+    if value is None:
+        legacy = result.get("search_keywords")
+        if isinstance(legacy, list) and legacy:
+            value = legacy[0]
+        elif isinstance(legacy, str):
+            value = legacy
+    return str(value or "").strip()
 
 
-def _unique(items: list[str]) -> list[str]:
-    return list(dict.fromkeys([item for item in items if item]))
+def normalize_core_keyword(value: str) -> str:
+    keyword = re.sub(r"[\r\n\t]+", " ", str(value or "")).strip()
+    keyword = keyword.strip(" \"'“”‘’[]【】")
+    keyword = re.sub(r"\s+", "", keyword)
+    return keyword
 
 
-def _clean_text(value: str, *, max_chars: int) -> str:
-    cleaned = re.sub(r"[，。！？、；：,.!?;:\n\r]+", " ", str(value))
-    for word in [*ABSTRACT_WORDS, *TEMPLATE_KEYWORDS]:
-        cleaned = cleaned.replace(word, "")
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return " ".join(cleaned.split()[:4])[:max_chars]
+def validate_core_keyword(value: str) -> str:
+    keyword = normalize_core_keyword(value)
+    if not (MIN_KEYWORD_CHARS <= len(keyword) <= MAX_KEYWORD_CHARS):
+        raise ValueError(f"核心关键词长度必须为 {MIN_KEYWORD_CHARS}-{MAX_KEYWORD_CHARS} 个字符")
+    if re.search(r"[，。！？、；：,.!?;:]", keyword):
+        raise ValueError("核心关键词不能包含句子标点")
+    if keyword in FORBIDDEN_KEYWORDS:
+        raise ValueError("核心关键词过于抽象或缺少主体")
+    if keyword.startswith(FRAGMENT_PREFIXES):
+        raise ValueError("核心关键词疑似句子残片")
+    if any(marker in keyword for marker in SENTENCE_MARKERS):
+        raise ValueError("核心关键词不能是镜头描述或搜索意图")
+    if re.fullmatch(r"\d+", keyword):
+        raise ValueError("核心关键词不能只有编号")
+    if re.search(r"\d{3,}$", keyword):
+        raise ValueError("编号后必须包含人物或事件主体")
+    return keyword
 
 
-def _clean_keyword(keyword: str) -> str:
-    cleaned = _clean_text(keyword, max_chars=40)
-    for word in KEYWORD_FILLER_WORDS:
-        cleaned = cleaned.replace(word, "")
-    cleaned = cleaned.replace("历史照片", "旧照").replace("黑白照片", "黑白照")
-    cleaned = cleaned.replace("老照片", "旧照").replace("真实影像", "影像")
-    cleaned = re.sub(r"\s+", "", cleaned).strip()
-    return cleaned[:MAX_KEYWORD_CHARS]
-
-
-def _clean_visual_intent(visual_intent: str) -> str:
-    return _clean_text(visual_intent, max_chars=32)
-
-
-def _keyword_variants(person: str, term: str) -> list[str]:
-    term = _clean_keyword(term)
-    if not term:
-        return []
-    variants = [term, f"{term}旧照"]
-    if person:
-        variants = [f"{person}{term}", f"{person}旧照", *variants]
-    if term.endswith(("档案", "文件", "手稿", "勋章", "鲜花", "轮船", "火箭", "导弹")):
-        variants.append(f"{term}特写")
-    return variants
-
-
-def _intent_terms(visual_intent: str) -> list[str]:
-    text = str(visual_intent or "")
-    for word in [*ABSTRACT_WORDS, *KEYWORD_FILLER_WORDS, "历史纪实画面"]:
-        text = text.replace(word, " ")
-    return re.findall(r"[\u4e00-\u9fff]{2,10}", text)
-
-
-def _finalize_keywords(candidates: list[str]) -> list[str]:
-    keywords = [_clean_keyword(item) for item in candidates]
-    keywords = [item for item in _unique(keywords) if item and item not in [*ABSTRACT_WORDS, *TEMPLATE_KEYWORDS]]
-    for fallback in GENERIC_VISUAL_KEYWORDS:
-        if len(keywords) >= MIN_KEYWORDS_PER_SHOT:
-            break
-        cleaned = _clean_keyword(fallback)
-        if cleaned not in keywords:
-            keywords.append(cleaned)
-    return keywords[:MAX_KEYWORDS_PER_SHOT]
-
-
-def _clean_archive_keyword(keyword: str) -> str:
-    cleaned = re.sub(r"[^\w\s\-'.,]", " ", str(keyword or ""), flags=re.U)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    cleaned = re.sub(r"\bphotograph\s+photograph\b", "photograph", cleaned, flags=re.I)
-    cleaned = re.sub(r"\barchive\s+archival\b", "archival", cleaned, flags=re.I)
-    if not cleaned:
-        return ""
-    if "photo" not in cleaned.lower() and "archive" not in cleaned.lower():
-        cleaned = f"{cleaned} photograph"
-    return cleaned[:80]
-
-
-def _archive_keywords_from_terms(people: list[str], visual_terms: list[str], keywords: list[str], shot_text: str) -> list[str]:
-    candidates: list[str] = []
-    for person in people:
-        english = KNOWN_PEOPLE_EN.get(person)
-        if english:
-            candidates.extend([f"{english} photograph", f"{english} archival photograph"])
-    combined = " ".join([shot_text, *visual_terms, *keywords])
-    for cn, en in ARCHIVE_TERM_EN.items():
-        if cn in combined:
-            candidates.append(f"China {en} photograph")
-            candidates.append(f"{en} archival photograph")
-    if "中国" in combined:
-        candidates.append("China historical photograph")
-    if "军事" in combined or "军" in combined:
-        candidates.append("Chinese military photograph")
-    if not candidates:
-        for keyword in keywords[:MAX_ARCHIVE_KEYWORDS_PER_SHOT]:
-            candidates.append(f"China {keyword} photograph")
-    cleaned = [_clean_archive_keyword(item) for item in candidates]
-    return _unique([item for item in cleaned if item])[:MAX_ARCHIVE_KEYWORDS_PER_SHOT]
-
-
-def _finalize_archive_keywords(candidates: list[str], people: list[str], visual_terms: list[str], keywords: list[str], shot_text: str) -> list[str]:
-    cleaned = [_clean_archive_keyword(item) for item in candidates]
-    cleaned = _unique([item for item in cleaned if item])
-    if len(cleaned) < MAX_ARCHIVE_KEYWORDS_PER_SHOT:
-        cleaned.extend(_archive_keywords_from_terms(people, visual_terms, keywords, shot_text))
-    return _unique(cleaned)[:MAX_ARCHIVE_KEYWORDS_PER_SHOT]
-
-
-def find_people(text: str) -> list[str]:
-    return [name for name in KNOWN_PEOPLE if name in text]
-
-
-def extract_visual_terms(text: str) -> list[str]:
-    explicit_terms = sorted([term for term in VISUAL_TERMS if term in text], key=lambda term: -len(term))
-    derived_terms: list[str] = []
-    if "撕" in text and "国旗" in text:
-        derived_terms.append("撕国旗")
-    if "血" in text and "嘴角" in text:
-        derived_terms.append("嘴角血迹")
-    if "踏上" in text and "轮船" in text:
-        derived_terms.append("登船")
-    if ("美国" in text or "赴美" in text) and ("求学" in text or "留学" in text):
-        derived_terms.append("留学生")
-    if "回国" in text:
-        derived_terms.append("回国")
-    if "大漠" in text or "戈壁" in text:
-        derived_terms.append("戈壁基地")
-    regex_terms = re.findall(r"\d{4}年|\d{2}岁|上世纪\d{2}年代|20世纪\d{2}年代|19\d{2}年代", text)
-    regex_terms.extend(re.findall(r"[\u4e00-\u9fff]{2,8}(?:实验室|办公室|宿舍|基地|火车站|会议|照片|档案|手稿|文件|导弹|火箭|工厂|课堂)", text))
-    if "博士" in text:
-        derived_terms.append("博士毕业")
-    return _unique(explicit_terms + derived_terms + regex_terms)
-
-
-def intent_based_keywords(people: list[str], visual_terms: list[str], visual_intent: str) -> list[str]:
-    person = people[0] if people else ""
-    concrete = [term for term in _unique(visual_terms) if term not in {"老照片", "历史照片", "旧照", "黑白照片"}]
-    concrete = sorted(concrete, key=lambda term: bool(re.fullmatch(r"\d{2}岁|\d{4}年", term)))
-    keywords: list[str] = []
-    for term in concrete[:3]:
-        keywords.extend(_keyword_variants(person, term))
-    if person:
-        keywords.extend([f"{person}旧照", f"{person}资料照"])
-    keywords.extend(_intent_terms(visual_intent)[:3])
-    keywords.extend(GENERIC_VISUAL_KEYWORDS)
-    return _finalize_keywords(keywords)
-
-
-def sanitize_intent(result: dict, shot_text: str) -> dict:
-    people = _unique(_as_list(result.get("people")) + find_people(shot_text))
-    visual_intent = str(result.get("visual_intent") or "").strip()
-    visual_terms = extract_visual_terms(f"{shot_text} {visual_intent}")
-    if not visual_intent:
-        visual_intent = " ".join([*(people[:1]), *visual_terms[:3], "历史纪实画面"]).strip() or "历史纪实画面"
-
-    ai_keywords = _as_list(result.get("search_keywords"))
-    keywords = _finalize_keywords(intent_based_keywords(people[:1], visual_terms, visual_intent) + ai_keywords)
-    archive_keywords = _finalize_archive_keywords(_as_list(result.get("archive_keywords")), people[:1], visual_terms, keywords, shot_text)
+def sanitize_intent(result: dict, _shot_text: str = "") -> dict:
+    keyword = validate_core_keyword(_raw_core_keyword(result))
     return {
-        "visual_intent": _clean_visual_intent(visual_intent) or "历史纪实画面",
-        "search_keywords": keywords,
-        "archive_keywords": archive_keywords,
-        "people": people[:3],
+        "core_keyword": keyword,
+        "search_keywords": [keyword],
         "provider": result.get("provider") or "ai",
         "error": "",
     }
 
 
-def fallback_search_intent(shot_text: str, _full_text: str = "") -> dict:
-    people = find_people(shot_text)
-    visual_terms = extract_visual_terms(shot_text)
-    visual_intent = " ".join([*(people[:1]), *visual_terms[:3], "历史纪实画面"]).strip() or "历史纪实画面"
-    keywords = intent_based_keywords(people[:1], visual_terms, visual_intent)
-    return {
-        "visual_intent": _clean_visual_intent(visual_intent),
-        "search_keywords": keywords,
-        "archive_keywords": _archive_keywords_from_terms(people[:1], visual_terms, keywords, shot_text),
-        "people": people[:3],
-        "provider": "local_fallback",
-        "error": "",
-    }
-
-
-def ai_search_intent(shot_text: str, full_text: str) -> dict:
+def _request_glm(payload: dict, timeout: int) -> dict:
     api_key = os.getenv("BIGMODEL_API_KEY", "").strip()
     if not api_key:
-        return fallback_search_intent(shot_text, full_text)
-
-    prompt = f"""
-你是短视频分镜素材搜索助手。请读取“当前镜头”的具体文字，生成适合图片搜索的真实画面关键词。
-
-要求：
-1. 只输出严格 JSON，不要 Markdown。
-2. visual_intent 是当前镜头的画面意图。
-3. search_keywords 输出 3-5 个简短中文关键词，每个不超过 10 个汉字。
-4. archive_keywords 输出 2-3 个英文关键词，适合 Historical Photographs of China、NARA 等英文档案库搜索；必须包含具体人物、事件、地点、物件，优先使用英文名称。
-5. 关键词必须具体、可搜索、偏视觉化，适合百度图片。
-6. 关键词参考“精准人物/事件、替代场景、氛围细节”的组合，例如：邓稼先旧照、嘴角血迹特写、科学家病重旧照、手帕血迹、档案照片。
-7. 禁止把“伟大、震撼、感人、精神、贡献、意义”等抽象词作为关键词。
-8. 当前镜头有人物名时，1-2 个关键词可以包含人物名；不要让所有关键词都变成人物通用照。
-9. 禁止输出“默认、空镜头、模糊背景、产品、介绍、视觉、场景、描述、背景、素材、图片”这类模板词。
-
-示例：
-当前镜头：邓稼先在美国求学时，常常泡在物理实验室里。
-输出关键词：["邓稼先留学", "物理实验室", "黑板公式"]
-
-当前镜头：回国后，他隐姓埋名奔赴大漠深处。
-输出关键词：["邓稼先回国", "戈壁基地", "科研旧照"]
-
-全文仅供理解背景，不要强行从全文补人物：
-{full_text}
-
-当前镜头：
-{shot_text}
-
-返回格式：
-{{
-  "visual_intent": "画面意图",
-  "people": ["当前镜头出现的人物名"],
-  "search_keywords": ["短关键词1", "短关键词2", "短关键词3", "短关键词4", "短关键词5"],
-  "archive_keywords": ["English archive keyword 1", "English archive keyword 2", "English archive keyword 3"]
-}}
-""".strip()
-    payload = {
-        "model": bigmodel_model(),
-        "messages": [
-            {"role": "system", "content": "你只输出可解析 JSON。"},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.25,
-        "top_p": 0.7,
-        "max_tokens": 1000,
-        "stream": False,
-        "thinking": {"type": "disabled"},
-        "response_format": {"type": "json_object"},
-    }
+        raise SearchIntentBatchError("BIGMODEL_API_KEY 未配置，无法使用 GLM 生成核心关键词")
     req = urllib.request.Request(
         f"{bigmodel_endpoint().rstrip('/')}/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         method="POST",
     )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        body = json.loads(response.read().decode("utf-8"))
+    content = body["choices"][0]["message"]["content"]
+    if isinstance(content, list):
+        content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+    return json.loads(_extract_json_object(str(content)))
+
+
+def ai_search_intent(shot_text: str, full_text: str = "") -> dict:
+    prompt = f"""
+你是短视频分镜图片搜索关键词专家。
+请直接根据镜头旁白和镜头描述，选择一个最适合中文图片搜索的核心关键词。
+
+规则：
+1. 只输出严格 JSON，不要 Markdown。
+2. 只返回 core_keyword，不要输出搜索意图、画面意图、人物列表或英文关键词。
+3. core_keyword 必须是完整、自然、可以直接复制到图片搜索框里的词组，长度 2-12 个字符。
+4. 优先选择明确人物、历史事件、地点、载具或动作画面，例如“中美阿拉斯加会谈”“王伟81192事件”“撤侨专机”“导弹命中爆炸”。
+5. 禁止从镜头描述中机械截取连续几个字，禁止输出“方强硬回击”“时侨民登”这类残片。
+6. 禁止输出只有编号的关键词，编号必须和人物或事件主体组合。
+7. 禁止输出“安全感、威严、强硬回击、现场、画面”等抽象词。
+8. 不要为了缩短而删除人物或事件主体。
+
+全文背景仅用于消除歧义：
+{full_text}
+
+镜头旁白及描述：
+{shot_text}
+
+返回格式：
+{{"core_keyword": "一个完整核心关键词"}}
+""".strip()
+    payload = {
+        "model": bigmodel_model(),
+        "messages": [
+            {"role": "system", "content": "你只输出可解析 JSON，并直接选择图片搜索核心关键词。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.15,
+        "top_p": 0.6,
+        "max_tokens": 300,
+        "stream": False,
+        "thinking": {"type": "disabled"},
+        "response_format": {"type": "json_object"},
+    }
     try:
-        with urllib.request.urlopen(req, timeout=90) as response:
-            body = json.loads(response.read().decode("utf-8"))
-        content = body["choices"][0]["message"]["content"]
-        if isinstance(content, list):
-            content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
-        result = json.loads(_extract_json_object(str(content)))
+        result = _request_glm(payload, timeout=60)
         result["provider"] = bigmodel_model()
         return sanitize_intent(result, shot_text)
     except (urllib.error.URLError, TimeoutError, KeyError, ValueError, json.JSONDecodeError) as exc:
-        fallback = fallback_search_intent(shot_text, full_text)
-        fallback["error"] = str(exc)[:300]
-        return fallback
+        raise SearchIntentBatchError(f"GLM 核心关键词生成失败：{str(exc)[:300]}") from exc
 
 
 def ai_search_intents(shots: list[dict], full_text: str, *, timeout: int = 90, retries: int = 1) -> dict[str, dict]:
-    api_key = os.getenv("BIGMODEL_API_KEY", "").strip()
-    if not api_key:
-        raise SearchIntentBatchError("BIGMODEL_API_KEY 未配置，无法使用 GLM 分析分镜关键词")
-
     shot_items = [
         {
             "id": str(shot.get("id") or shot.get("shot_index")),
             "shot_index": shot.get("shot_index"),
             "voice_text": str(shot.get("voice_text") or ""),
+            "shot_description": str(shot.get("visual_need") or ""),
         }
         for shot in shots
     ]
     prompt = f"""
-你是短视频分镜素材搜索助手。请读取分镜列表中每个对象的 voice_text 字段，分别生成适合图片搜索的真实画面关键词。
+你是短视频分镜图片搜索关键词专家。
+请直接根据每个分镜的 voice_text 和 shot_description，分别选择一个最适合中文图片搜索的核心关键词。
 
-要求：
+规则：
 1. 只输出严格 JSON，不要 Markdown。
-2. 当前批次里的每个分镜都必须返回 visual_intent、people、search_keywords、archive_keywords。
-3. search_keywords 输出 3-5 个简短中文关键词，每个不超过 10 个汉字。
-4. archive_keywords 输出 2-3 个英文关键词，适合 Historical Photographs of China、NARA 等英文档案库搜索；必须包含具体人物、事件、地点、物件，优先使用英文名称。
-5. 关键词必须具体、可搜索、偏视觉化，适合百度图片。
-6. 关键词参考“精准人物/事件、替代场景、氛围细节”的组合，例如：邓稼先旧照、嘴角血迹特写、科学家病重旧照、手帕血迹、档案照片。
-7. 禁止把“伟大、震撼、感人、精神、贡献、意义”等抽象词作为关键词。
-8. 当前分镜有人物名时，1-2 个关键词可以包含人物名；不要让所有关键词都变成人物通用照。
-9. 全文仅供理解背景，不要强行从全文给每个分镜补人物。
-10. voice_text 都是有效文本，禁止输出“无有效文本、默认、空镜头、模糊背景、产品、介绍、视觉、场景、描述、背景、素材、图片”这类模板词。
-11. 必须从 voice_text 中抽取人物、动作、地点、年代、物件或情绪细节来组成关键词。
-
-示例：
-voice_text：邓稼先在美国求学时，常常泡在物理实验室里。
-search_keywords：["邓稼先留学", "物理实验室", "黑板公式"]
-
-voice_text：回国后，他隐姓埋名奔赴大漠深处。
-search_keywords：["邓稼先回国", "戈壁基地", "科研旧照"]
+2. 每个分镜只返回 id 和 core_keyword，不要输出搜索意图、画面意图、人物列表或英文关键词。
+3. core_keyword 必须是完整、自然、可以直接复制到图片搜索框里的词组，长度 2-12 个字符。
+4. 优先选择明确人物、历史事件、地点、载具或动作画面，例如：
+   - “你们没有资格从实力地位出发同中国谈话” -> “中美阿拉斯加会谈”
+   - “王伟烈士为守海疆壮烈牺牲” -> “王伟81192事件”
+   - “接同胞回国的专机” -> “撤侨专机”
+5. 禁止从 shot_description 中机械截取连续几个字，禁止输出“方强硬回击”“王伟81192”“时侨民登”这类残片。
+6. 编号必须和人物或事件主体组合；态度和情绪必须还原为对应的具体事件。
+7. 禁止输出“安全感、威严、强硬回击、现场、画面”等抽象词。
+8. 不要为了缩短而删除人物或事件主体。
+9. 全文背景仅用于消除人物、事件和代词歧义。
 
 全文背景：
 {full_text}
@@ -393,78 +197,55 @@ search_keywords：["邓稼先回国", "戈壁基地", "科研旧照"]
 返回格式：
 {{
   "shots": [
-    {{
-      "id": "分镜 id",
-      "visual_intent": "画面意图",
-      "people": ["当前分镜出现的人物名"],
-      "search_keywords": ["短关键词1", "短关键词2", "短关键词3", "短关键词4", "短关键词5"],
-      "archive_keywords": ["English archive keyword 1", "English archive keyword 2", "English archive keyword 3"]
-    }}
+    {{"id": "分镜 id", "core_keyword": "一个完整核心关键词"}}
   ]
 }}
 """.strip()
     payload = {
         "model": bigmodel_model(),
         "messages": [
-            {"role": "system", "content": "你只输出可解析 JSON。"},
+            {"role": "system", "content": "你只输出可解析 JSON，并直接选择每个分镜的图片搜索核心关键词。"},
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.25,
-        "top_p": 0.7,
-        "max_tokens": max(1200, min(8000, len(shots) * 350)),
+        "temperature": 0.15,
+        "top_p": 0.6,
+        "max_tokens": max(800, min(4000, len(shots) * 120)),
         "stream": False,
         "thinking": {"type": "disabled"},
         "response_format": {"type": "json_object"},
     }
+
     last_error: Exception | None = None
-    for attempt in range(max(1, retries + 1)):
-        req = urllib.request.Request(
-            f"{bigmodel_endpoint().rstrip('/')}/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            method="POST",
-        )
+    for _attempt in range(max(1, retries + 1)):
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as response:
-                body = json.loads(response.read().decode("utf-8"))
-            content = body["choices"][0]["message"]["content"]
-            if isinstance(content, list):
-                content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
-            result = json.loads(_extract_json_object(str(content)))
+            result = _request_glm(payload, timeout=timeout)
             raw_items = result.get("shots") if isinstance(result, dict) else []
             intents: dict[str, dict] = {}
-            shot_text_by_id = {str(item["id"]): item["voice_text"] for item in shot_items}
+            valid_ids = {str(item["id"]) for item in shot_items}
             for item in raw_items or []:
                 if not isinstance(item, dict):
                     continue
                 shot_id = str(item.get("id") or "")
-                if shot_id not in shot_text_by_id:
+                if shot_id not in valid_ids:
                     continue
                 item["provider"] = bigmodel_model()
-                intents[shot_id] = sanitize_intent(item, shot_text_by_id[shot_id])
+                intents[shot_id] = sanitize_intent(item)
             missing_ids = [shot["id"] for shot in shot_items if shot["id"] not in intents]
             if missing_ids:
-                raise SearchIntentBatchError(f"GLM 返回缺少 {len(missing_ids)} 个分镜关键词")
+                raise SearchIntentBatchError(f"GLM 返回缺少 {len(missing_ids)} 个分镜核心关键词")
             return intents
         except SearchIntentBatchError as exc:
             last_error = exc
         except (urllib.error.URLError, TimeoutError, KeyError, ValueError, json.JSONDecodeError) as exc:
             last_error = exc
-    raise SearchIntentBatchError(f"GLM 分镜关键词分析失败：{str(last_error)[:300]}")
+    raise SearchIntentBatchError(f"GLM 核心关键词生成失败：{str(last_error)[:300]}")
 
 
 def apply_intent_to_shot(shot: dict, intent: dict) -> dict:
-    shot["visual_intent"] = intent["visual_intent"]
-    shot["visual_need"] = intent["visual_intent"]
-    shot["search_keywords"] = intent["search_keywords"]
-    shot["archive_keywords"] = intent.get("archive_keywords") or _archive_keywords_from_terms(
-        intent.get("people", []),
-        extract_visual_terms(str(shot.get("voice_text") or "")),
-        intent.get("search_keywords") or [],
-        str(shot.get("voice_text") or ""),
-    )
+    keyword = validate_core_keyword(intent.get("core_keyword") or (intent.get("search_keywords") or [""])[0])
+    shot["search_keywords"] = [keyword]
+    shot.pop("archive_keywords", None)
+    shot.pop("visual_intent", None)
     shot["search_intent_provider"] = intent.get("provider", "")
     shot["search_intent_error"] = intent.get("error", "")
-    shot["required_object"] = intent.get("people", [])
-    shot["required_scene"] = extract_visual_terms(str(shot.get("voice_text") or ""))[:3] or ["历史照片"]
     return shot

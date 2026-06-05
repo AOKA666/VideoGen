@@ -38,7 +38,7 @@ NON_PHOTO_WORDS = [
 TEXT_HEAVY_WORDS = [
     "文字", "书页", "书本", "文章", "帖子", "评论", "微博", "知乎", "公众号", "网页", "页面",
     "聊天记录", "截图文字", "长文", "段落", "排版", "标题", "正文",
-    "text", "book page", "article", "post", "comment", "forum", "webpage", "page",
+    "text", "book page", "comment", "forum", "webpage",
     "paragraph", "document", "novel", "ebook",
 ]
 DESIGN_HEAVY_WORDS = [
@@ -47,6 +47,10 @@ DESIGN_HEAVY_WORDS = [
     "chart", "list", "directory",
     "封面", "标题", "大字", "海报", "标志", "图标", "徽章", "警示牌", "警告牌",
     "表格", "名单", "目录", "信息图", "宣传图",
+]
+CHART_META_WORDS = [
+    "调查", "受访", "数据来源", "占比", "比例", "百分比", "统计图", "饼图", "柱状图",
+    "问卷", "花费多少", "chart", "survey", "percentage", "statistics",
 ]
 
 
@@ -429,9 +433,89 @@ def _icon_or_logo_reason(item: dict) -> str:
     return ""
 
 
+def _social_screenshot_reason(item: dict) -> str:
+    if Image is None or np is None:
+        return ""
+    path = Path(item.get("local_path") or "")
+    if not path.exists():
+        return ""
+    try:
+        image = Image.open(path).convert("RGB")
+        image.thumbnail((360, 360))
+        arr = np.asarray(image, dtype=np.float32) / 255.0
+    except Exception:
+        return ""
+    if arr.size == 0:
+        return ""
+
+    gray = arr.mean(axis=2)
+    height, _ = gray.shape
+    top = gray[:max(1, int(height * 0.38)), :]
+    bottom = gray[int(height * 0.38):, :]
+    top_gx = np.abs(np.diff(top, axis=1, append=top[:, -1:]))
+    top_gy = np.abs(np.diff(top, axis=0, append=top[-1:, :]))
+    bottom_gx = np.abs(np.diff(bottom, axis=1, append=bottom[:, -1:]))
+    bottom_gy = np.abs(np.diff(bottom, axis=0, append=bottom[-1:, :]))
+
+    top_dark = float((top < 0.25).mean())
+    top_bright = float((top > 0.72).mean())
+    top_edges = float(((top_gx + top_gy) > 0.15).mean())
+    bottom_edges = float(((bottom_gx + bottom_gy) > 0.15).mean())
+    if top_dark > 0.68 and top_bright > 0.012 and top_edges > 0.085 and bottom_edges > 0.10:
+        return "social media screenshot / text overlay"
+    return ""
+
+
+def _chart_or_infographic_reason(item: dict) -> str:
+    if Image is None or np is None:
+        return ""
+    path = Path(item.get("local_path") or "")
+    if not path.exists():
+        return ""
+    try:
+        image = Image.open(path).convert("RGB")
+        image.thumbnail((320, 320))
+        arr = np.asarray(image, dtype=np.float32) / 255.0
+    except Exception:
+        return ""
+    if arr.size == 0:
+        return ""
+
+    maxc = arr.max(axis=2)
+    minc = arr.min(axis=2)
+    saturation = (maxc - minc) / np.maximum(maxc, 0.001)
+    gray = arr.mean(axis=2)
+    light_bg = float((gray > 0.78).mean())
+    saturated = float((saturation > 0.30).mean())
+
+    quantized = (arr * 10).astype(np.int16)
+    _, counts = np.unique(quantized.reshape(-1, 3), axis=0, return_counts=True)
+    top_cover = float(np.sort(counts)[-18:].sum() / max(counts.sum(), 1)) if len(counts) else 0.0
+
+    colorful_mask = (saturation > 0.34) & (maxc > 0.42)
+    colorful_boxes = [
+        box for box in _component_boxes_bool(colorful_mask, max_components=900)
+        if box[4] > colorful_mask.size * 0.012
+    ]
+    meta_text = _text_parts(item.get("title"), item.get("source_page"), item.get("image_url"))
+    meta_hits = _contains_any(meta_text, CHART_META_WORDS)
+
+    if light_bg > 0.48 and saturated > 0.14 and top_cover > 0.66 and len(colorful_boxes) >= 3:
+        return "chart/infographic"
+    if meta_hits and light_bg > 0.42 and saturated > 0.08 and top_cover > 0.58:
+        return f"chart/infographic metadata: {meta_hits[0]}"
+    return ""
+
+
 def _local_design_reasons(item: dict) -> list[str]:
     reasons = []
-    for detector in (_table_or_document_reason, _large_title_card_reason, _icon_or_logo_reason):
+    for detector in (
+        _table_or_document_reason,
+        _large_title_card_reason,
+        _icon_or_logo_reason,
+        _social_screenshot_reason,
+        _chart_or_infographic_reason,
+    ):
         reason = detector(item)
         if reason:
             reasons.append(reason)
@@ -499,11 +583,7 @@ def _score_from_evidence(shot: dict, item: dict, visual_text: str, tags: dict | 
     }
     score = sum(details.values())
     aspect_score = details["aspect_1_1"]
-    if aspect_score == 0:
-        score = min(score, 40)
-    elif aspect_score < 5:
-        score = min(score, 55)
-    elif aspect_score >= 8:
+    if aspect_score >= 8:
         score = min(score + 5, 100)
     non_photo_reasons = _non_photo_reasons(item, tags, all_text, visual=visual)
     if non_photo_reasons:

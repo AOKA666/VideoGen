@@ -49,6 +49,7 @@ function App() {
   const [shots, setShots] = useState([]);
   const [assets, setAssets] = useState([]);
   const [generatedAssets, setGeneratedAssets] = useState([]);
+  const [webImageDiagnostics, setWebImageDiagnostics] = useState([]);
   const [library, setLibrary] = useState(null);
   const [editingAsset, setEditingAsset] = useState(null);
   const [pendingUpload, setPendingUpload] = useState(null);
@@ -57,7 +58,7 @@ function App() {
   const [voiceType, setVoiceType] = useState(VOICE_OPTIONS[0].value);
   const [previewAsset, setPreviewAsset] = useState(null);
   const [consoleOpen, setConsoleOpen] = useState(false);
-  const [consoleStream, setConsoleStream] = useState('stderr');
+  const [consoleStream, setConsoleStream] = useState('image_search');
   const [consoleLog, setConsoleLog] = useState('');
   const [consoleMeta, setConsoleMeta] = useState(null);
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
@@ -106,6 +107,16 @@ function App() {
     const percent = total ? Math.min(100, Math.round((completed / total) * 100)) : 0;
     return { total, completed, percent };
   }, [project, shots]);
+  const diagnosticsByShot = useMemo(() => {
+    const map = new Map();
+    webImageDiagnostics.forEach((item) => {
+      const list = map.get(item.shot_id) || [];
+      list.push(item);
+      map.set(item.shot_id, list);
+    });
+    map.forEach((list) => list.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || ''))));
+    return map;
+  }, [webImageDiagnostics]);
 
   async function run(label, fn) {
     setBusy(true);
@@ -135,11 +146,13 @@ function App() {
       setProject(data.project);
       setShots(data.shots);
       setGeneratedAssets(data.generated_assets || []);
+      setWebImageDiagnostics(data.web_image_diagnostics || []);
       setProjectId(id);
     } else {
       setProject(null);
       setShots([]);
       setGeneratedAssets([]);
+      setWebImageDiagnostics([]);
       setProjectId('');
     }
   }
@@ -250,7 +263,7 @@ function App() {
     await refreshAll(projectId);
   }
 
-  async function generateShots() {
+  async function generateShots(imageSearchProvider = 'so') {
     setTab('storyboard');
     setBusy(true);
     setMessage('生成分镜中...');
@@ -260,7 +273,7 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ rewritten_script: project.rewritten_script }),
       });
-      await request(`/api/projects/${projectId}/shots`, { method: 'POST' });
+      await request(`/api/projects/${projectId}/shots?image_search_provider=${imageSearchProvider}`, { method: 'POST' });
       await refreshAll(projectId);
       setMessage('分镜已生成，正在分析关键词和搜索图片...');
     } catch (err) {
@@ -517,7 +530,17 @@ function App() {
                 </p>
               )}
               <textarea value={project.rewritten_script || ''} rows="22" onChange={(e) => setProject({ ...project, rewritten_script: e.target.value })} />
-              <div className="actions"><button onClick={saveScript}><Save size={18} /> 保存</button><button className="primary" onClick={generateShots}><Archive size={18} /> 生成分镜</button></div>
+              <div className="actions">
+                <button onClick={saveScript}><Save size={18} /> 保存</button>
+                <button className="primary" onClick={() => generateShots('so')}><Archive size={18} /> 生成分镜</button>
+                <button
+                  className="tencent-storyboard"
+                  title="生成分镜并使用腾讯云联网图像搜索"
+                  onClick={() => generateShots('tencent')}
+                >
+                  <Search size={18} /> 生成分镜
+                </button>
+              </div>
             </div>
           </section>
         )}
@@ -532,6 +555,9 @@ function App() {
                   shot={shot}
                   assets={generatedAssetsByShot.get(shot.id) || []}
                   selectedAssetId={shot.selected_asset_id}
+                  searchProgress={searchProgress}
+                  project={project}
+                  diagnostics={diagnosticsByShot.get(shot.id) || []}
                   onSelect={(assetId) => selectAsset(shot.id, assetId, 'web_search')}
                   onPreview={setPreviewAsset}
                   onGenerate={() => generateImage(shot.id)}
@@ -555,6 +581,9 @@ function App() {
                     shot={shot}
                     assets={generatedAssetsByShot.get(shot.id) || []}
                     selectedAssetId={shot.selected_asset_id}
+                    searchProgress={searchProgress}
+                    project={project}
+                    diagnostics={diagnosticsByShot.get(shot.id) || []}
                     onSelect={(assetId) => selectAsset(shot.id, assetId, 'web_search')}
                     onPreview={setPreviewAsset}
                     onGenerate={() => generateImage(shot.id)}
@@ -667,23 +696,30 @@ function SafeImage({ src, alt }) {
 }
 
 function BackendConsole({ stream, content, meta, onStreamChange, onRefresh, onClose }) {
+  const logRef = useRef(null);
+  useEffect(() => {
+    const node = logRef.current;
+    if (node) node.scrollTop = node.scrollHeight;
+  }, [content]);
   return (
     <div className="console-panel">
       <div className="console-head">
         <strong><Terminal size={18} /> 后端控制台</strong>
         <div className="console-tools">
           <select value={stream} onChange={(e) => onStreamChange(e.target.value)}>
-            <option value="stderr">运行日志</option>
-            <option value="stdout">标准输出</option>
-            <option value="legacy_stderr">历史错误日志</option>
-            <option value="legacy_stdout">历史输出日志</option>
+            <option value="image_search">图片搜索日志</option>
+            <option value="runtime">服务运行日志</option>
+            <option value="errors">错误输出</option>
           </select>
           <button type="button" onClick={onRefresh}><RefreshCw size={16} /> 刷新</button>
           <button type="button" onClick={onClose}>关闭</button>
         </div>
       </div>
-      <small>{meta?.exists ? meta.path : '日志文件还没有生成'}</small>
-      <pre>{content || '暂无日志输出'}</pre>
+      <small>
+        <span className={meta?.exists ? 'console-status online' : 'console-status'} />
+        {meta?.exists ? '每 2 秒自动刷新' : '日志文件还没有生成'}
+      </small>
+      <pre ref={logRef}>{content || '暂无日志输出'}</pre>
     </div>
   );
 }
@@ -697,6 +733,28 @@ function VoiceSelect({ value, onChange }) {
       </select>
     </label>
   );
+}
+
+function diagnosticSummary(diagnostics) {
+  const recent = (diagnostics || []).slice(0, 40);
+  if (!recent.length) return '';
+  const keywordRows = recent.filter((item) => item.type === 'keyword');
+  const sourceRows = recent.filter((item) => item.type === 'source');
+  const returned = sourceRows.reduce((sum, item) => sum + Number(item.returned || 0), 0);
+  const attempts = keywordRows.reduce((sum, item) => sum + Number(item.attempted_downloads || 0), 0);
+  const downloaded = keywordRows.reduce((sum, item) => sum + Number(item.downloaded || 0), 0);
+  const rejected = {};
+  keywordRows.forEach((row) => {
+    Object.entries(row.rejected || {}).forEach(([reason, count]) => {
+      rejected[reason] = (rejected[reason] || 0) + Number(count || 0);
+    });
+  });
+  const rejectText = Object.entries(rejected)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 2)
+    .map(([reason, count]) => `${reason}${count}`)
+    .join(' / ');
+  return `诊断：渠道返回 ${returned}，尝试下载 ${attempts}，成功 ${downloaded}${rejectText ? `，过滤 ${rejectText}` : ''}`;
 }
 
 function formatElapsed(seconds) {
@@ -715,13 +773,16 @@ function SearchProgress({ progress, project, onStop }) {
   const analyzingIntent = project?.status === 'searching_images' && stage === 'analyzing_intent';
   const startedAt = project?.intent_analysis_started_at ? new Date(project.intent_analysis_started_at).getTime() : 0;
   const elapsed = startedAt ? Math.floor((Date.now() - startedAt) / 1000) : 0;
-  const keywordEstimate = project?.intent_keyword_estimate || (progress.total ? `${progress.total * 3}-${progress.total * 5}` : '');
+  const keywordEstimate = project?.intent_keyword_estimate || (progress.total ? `${progress.total}` : '');
   const batchInfo = project?.intent_batches_total
     ? `批次 ${project.intent_batches_completed || 0}/${project.intent_batches_total}`
     : `预计 ${keywordEstimate} 个关键词`;
   const statusText = analyzingIntent
     ? `${project?.current_search_keyword || `正在分析 ${progress.total || project?.search_total || '-'} 个分镜关键词`} · ${batchInfo} · 已运行 ${formatElapsed(elapsed)}`
     : `正在处理镜头 ${project?.current_shot_index || '-'} ${project?.current_search_keyword ? `· ${project.current_search_keyword}` : ''}`;
+  const simpleProgressText = progress.total
+    ? `已完成 ${progress.completed}/${progress.total} · ${stage === 'downloading' ? '正在下载候选图' : analyzingIntent ? '正在生成关键词' : '处理中'}`
+    : '';
   const helperText = analyzingIntent
     ? 'GLM 正在按 10 个镜头一批生成关键词；每批完成后会立即保存，全部完成后自动进入逐镜头搜图。'
     : '';
@@ -738,7 +799,12 @@ function SearchProgress({ progress, project, onStop }) {
   return (
     <div className="progress-panel">
       <div className="progress-row">
-        <strong>分镜图片进度</strong>
+        <strong>
+          分镜图片进度
+          <span className={project?.image_search_provider === 'tencent' ? 'provider-badge tencent' : 'provider-badge'}>
+            {project?.image_search_provider === 'tencent' ? '腾讯云联网搜图' : '360 图片'}
+          </span>
+        </strong>
         <div className="progress-actions">
           <span>{label}</span>
           {searching && (
@@ -762,6 +828,7 @@ function SearchProgress({ progress, project, onStop }) {
       {project?.status === 'searching_images' && (
         <div className="progress-detail">
           <small>{statusText}</small>
+          {simpleProgressText && <small>{simpleProgressText}</small>}
           {helperText && <small>{helperText}</small>}
         </div>
       )}
@@ -889,19 +956,32 @@ function AssetEditor({ asset, onClose, onSave, onDelete }) {
   );
 }
 
-function ShotCard({ shot, assets = [], selectedAssetId, onSelect, onPreview, onGenerate, onRetry }) {
+function ShotCard({ shot, assets = [], selectedAssetId, searchProgress, project, diagnostics = [], onSelect, onPreview, onGenerate, onRetry }) {
   const visibleAssets = [...assets]
     .sort((a, b) => (b.id === selectedAssetId ? 1 : 0) - (a.id === selectedAssetId ? 1 : 0))
     .slice(0, 2);
   const placeholders = Math.max(0, 2 - visibleAssets.length);
   const canRetry = (shot.search_attempts || 0) < 2 && !['pending_search', 'analyzing_intent', 'searching'].includes(shot.status);
+  const isSearchingShot = shot.status === 'searching';
+  const isWaitingShot = ['pending_search', 'analyzing_intent'].includes(shot.status);
+  const progressText = searchProgress?.total
+    ? `${searchProgress.completed}/${searchProgress.total}`
+    : '';
+  const placeholderText = isSearchingShot ? '搜索中' : isWaitingShot ? '等待中' : '暂无图片';
+  const placeholderHint = isSearchingShot
+    ? `${progressText ? `进度 ${progressText}` : '正在拉取候选图'}${shot.current_search_keyword ? ` · ${shot.current_search_keyword}` : ''}`
+    : isWaitingShot
+      ? '等待关键词或前序镜头'
+      : '可重新搜索或生成占位图';
+  const diagnosticText = diagnosticSummary(diagnostics);
   return (
     <article className="shot-card">
       <div className="shot-main">
         <span className={`pill ${shot.status}`}>镜头 {shot.shot_index} · {shot.status}</span>
         <h3>{shot.voice_text}</h3>
-        <p>画面意图：{shot.visual_intent || shot.visual_need || '识别中'}</p>
-        <p>搜索关键词：{(shot.search_keywords || []).join(' / ') || shot.current_search_keyword || '生成中'}</p>
+        <p>画面描述：{shot.visual_need || '暂无描述'}</p>
+        <p>核心关键词：{(shot.search_keywords || []).join(' / ') || shot.current_search_keyword || '生成中'}</p>
+        {diagnosticText && <p className="shot-diagnostic">{diagnosticText}</p>}
       </div>
       <div className="shot-side">
         <button onClick={onRetry} disabled={!canRetry}><RefreshCw size={18} /> 重新搜索</button>
@@ -921,8 +1001,9 @@ function ShotCard({ shot, assets = [], selectedAssetId, onSelect, onPreview, onG
             </button>
           ))}
           {Array.from({ length: placeholders }).map((_, index) => (
-            <div className="search-placeholder" key={`placeholder-${index}`}>
-              {['pending_search', 'analyzing_intent', 'searching'].includes(shot.status) ? '搜索中' : '暂无图片'}
+            <div className={isSearchingShot ? 'search-placeholder active' : 'search-placeholder'} key={`placeholder-${index}`}>
+              <strong>{placeholderText}</strong>
+              <small>{placeholderHint}</small>
             </div>
           ))}
         </div>

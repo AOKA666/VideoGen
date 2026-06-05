@@ -92,17 +92,49 @@ def detect_blocking_watermark_from_image(image: Image.Image, meta_text: str = ""
     red_text = (r > 120) & (r > g * 1.18) & (r > b * 1.18) & ((r - np.maximum(g, b)) > 24)
     red_text &= lower_zone | center_zone | right_bottom_zone
     red_ratio = float(red_text.mean())
+    corner_height = max(1, int(height * 0.22))
+    corner_width = max(1, int(width * 0.36))
+    edge_height = max(1, int(height * 0.12))
+    bottom_left_red = float(red_text[-corner_height:, :corner_width].mean())
+    bottom_right_red = float(red_text[-corner_height:, -corner_width:].mean())
+    edge_left_red = float(red_text[-edge_height:, :corner_width].mean())
+    edge_right_red = float(red_text[-edge_height:, -corner_width:].mean())
+    if max(bottom_left_red, bottom_right_red) > 0.10 or max(edge_left_red, edge_right_red) > 0.08:
+        return {"rejected": True, "reason": "底部角落大红色 Logo/水印", "regions": []}
     red_regions = []
+    red_text_like_boxes = []
+    red_elongated_boxes = []
     for x1, y1, x2, y2, area in _component_boxes(red_text):
         box_w = x2 - x1
         box_h = y2 - y1
-        if area > width * height * 0.0015 or (box_w > width * 0.11 and box_h > height * 0.025):
+        area_ratio = area / max(width * height, 1)
+        fill_ratio = area / max(box_w * box_h, 1)
+        if (
+            0.0003 <= area_ratio <= 0.04
+            and box_h <= height * 0.14
+            and box_w >= width * 0.16
+            and box_w / max(box_h, 1) >= 2.4
+        ):
+            red_elongated_boxes.append((x1, y1, x2, y2, area))
             red_regions.append([x1, y1, x2, y2])
-    if red_ratio > 0.008:
-        ys, xs = np.where(red_text)
-        region = [[int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1]] if len(xs) else []
-        return {"rejected": True, "reason": "大面积红色文字 Logo/水印", "regions": region}
-    if red_ratio > 0.004 and red_regions:
+        text_like = (
+            0.00015 <= area_ratio <= 0.035
+            and box_h <= height * 0.18
+            and box_w <= width * 0.72
+            and 0.06 <= fill_ratio <= 0.88
+        )
+        if text_like:
+            red_text_like_boxes.append((x1, y1, x2, y2, area))
+            red_regions.append([x1, y1, x2, y2])
+
+    aligned_text = False
+    if len(red_text_like_boxes) >= 2:
+        centers = [((box[1] + box[3]) / 2) for box in red_text_like_boxes]
+        span_x = max(box[2] for box in red_text_like_boxes) - min(box[0] for box in red_text_like_boxes)
+        span_y = max(centers) - min(centers)
+        aligned_text = span_x >= width * 0.18 and span_y <= height * 0.16
+
+    if red_ratio > 0.004 and (red_elongated_boxes or aligned_text):
         return {"rejected": True, "reason": "明显红色文字 Logo/水印", "regions": red_regions[:6]}
 
     gray = np.asarray(probe.convert("L"), dtype=np.float32) / 255.0

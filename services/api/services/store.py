@@ -20,6 +20,7 @@ DEFAULT_DB: dict[str, Any] = {
     "generated_assets": [],
     "asset_library": None,
     "web_image_failures": [],
+    "web_image_diagnostics": [],
 }
 _DB_LOCK = threading.RLock()
 
@@ -37,6 +38,36 @@ def ensure_storage() -> None:
             if key not in data:
                 data[key] = default
                 changed = True
+        stale_asset_ids = {
+            item.get("id")
+            for item in data.get("generated_assets", [])
+            if item.get("local_path") and not Path(str(item["local_path"])).exists()
+        }
+        if stale_asset_ids:
+            data["generated_assets"] = [
+                item for item in data.get("generated_assets", [])
+                if item.get("id") not in stale_asset_ids
+            ]
+            data["project_assets"] = [
+                item for item in data.get("project_assets", [])
+                if item.get("asset_id") not in stale_asset_ids
+            ]
+            remaining_by_shot = {
+                item.get("shot_id")
+                for item in data.get("generated_assets", [])
+                if item.get("shot_id")
+            }
+            for shot in data.get("shots", []):
+                if shot.get("status") != "web_downloaded" or shot.get("id") in remaining_by_shot:
+                    continue
+                shot["status"] = "no_image"
+                shot["selected_asset_id"] = None
+                shot["asset_source"] = None
+                shot["downloaded_image_count"] = 0
+                shot["match_score"] = 0
+                shot["image_score"] = None
+                shot["search_attempts"] = 0
+            changed = True
         if changed:
             save_db(data)
 

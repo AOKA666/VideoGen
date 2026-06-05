@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import uuid4
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 
 from services.store import load_db, save_db
 from services.text_service import generate_shots
@@ -13,7 +13,11 @@ router = APIRouter(prefix="/api/projects", tags=["shots"])
 
 
 @router.post("/{project_id}/shots")
-def create_shots(project_id: str, background_tasks: BackgroundTasks):
+def create_shots(
+    project_id: str,
+    background_tasks: BackgroundTasks,
+    image_search_provider: str = Query("so", pattern="^(so|tencent)$"),
+):
     db = load_db()
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
@@ -29,6 +33,7 @@ def create_shots(project_id: str, background_tasks: BackgroundTasks):
     db["shots"].extend(shots)
     mark_project_searching(db, project_id)
     project["status"] = "searching_images"
+    project["image_search_provider"] = image_search_provider
     project["updated_at"] = now
     save_db(db)
     background_tasks.add_task(run_project_web_image_search, project_id)
@@ -41,7 +46,7 @@ def update_shot(project_id: str, shot_id: str, patch: dict):
     shot = next((s for s in db["shots"] if s["project_id"] == project_id and s["id"] == shot_id), None)
     if not shot:
         raise HTTPException(404, "Shot not found")
-    allowed = {"voice_text", "duration_sec", "visual_need", "visual_intent", "required_object", "required_scene", "search_keywords", "archive_keywords"}
+    allowed = {"voice_text", "duration_sec", "visual_need", "required_object", "required_scene", "search_keywords"}
     for key, value in patch.items():
         if key in allowed:
             shot[key] = value
