@@ -17,12 +17,20 @@ def create_shots(
     project_id: str,
     background_tasks: BackgroundTasks,
     image_search_provider: str = Query("so", pattern="^(so|tencent)$"),
+    material_source_strategy: str = Query(
+        "library_first",
+        pattern="^(library_first|library_only|web_only)$",
+    ),
 ):
     db = load_db()
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
         raise HTTPException(404, "Project not found")
     db["shots"] = [s for s in db["shots"] if s["project_id"] != project_id]
+    db["project_assets"] = [
+        item for item in db.get("project_assets", [])
+        if item.get("project_id") != project_id
+    ]
     reset_project_web_images(db, project_id)
     now = datetime.now().isoformat(timespec="seconds")
     shots = []
@@ -34,6 +42,7 @@ def create_shots(
     mark_project_searching(db, project_id)
     project["status"] = "searching_images"
     project["image_search_provider"] = image_search_provider
+    project["material_source_strategy"] = material_source_strategy
     project["updated_at"] = now
     save_db(db)
     background_tasks.add_task(run_project_web_image_search, project_id)

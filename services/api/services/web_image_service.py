@@ -290,6 +290,13 @@ class WebImageSearchProvider:
 
 
 def search_keywords_for_shot(shot: dict) -> list[str]:
+    override_queries = [
+        str(value).strip()
+        for value in shot.get("_search_query_overrides") or []
+        if str(value).strip()
+    ]
+    if override_queries:
+        return override_queries
     explicit_keywords = [str(x).strip() for x in shot.get("search_keywords") or [] if str(x).strip()]
     if not explicit_keywords:
         return []

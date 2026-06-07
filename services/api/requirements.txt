@@ -4,3 +4,5 @@ python-multipart==0.0.20
 pydantic==2.10.4
 pillow==12.1.0
 numpy==2.4.1
+pyJianYingDraft==0.2.6
+jieba==0.42.1

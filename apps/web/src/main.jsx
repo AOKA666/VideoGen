@@ -1,11 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Archive, Download, Film, FolderOpen, ImagePlus, Library, Mic, RefreshCw, Save, Scissors, Search, Tags, Terminal, Trash2, Wand2 } from 'lucide-react';
+import { Archive, Crop, Download, Eraser, Film, FolderOpen, ImagePlus, Library, Mic, RefreshCw, Save, Scissors, Search, Tags, Terminal, Trash2, Wand2 } from 'lucide-react';
 import './styles.css';
 
 const API = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
 const VOICE_OPTIONS = [
   { value: 'zh_male_m191_uranus_bigtts', label: '男声 · 沉稳叙事' },
+  { value: 'zh_male_dongfanghaoran_uranus_bigtts', label: '男声 · 东方浩然' },
   { value: 'zh_female_vv_uranus_bigtts', label: '女声 · 清晰自然' },
 ];
 
@@ -41,6 +42,21 @@ function emptyTagForm() {
   };
 }
 
+function suggestedCoverSubtitle(project) {
+  const script = String(project?.rewritten_script || project?.raw_script || '');
+  return script
+    .split(/[。！？!?，,\n]+/)
+    .map((item) => item.trim())
+    .find((item) => item && item !== project?.name)
+    ?.slice(0, 28) || '';
+}
+
+function assetImageUrl(asset) {
+  if (!asset?.file_url) return '';
+  const version = asset.updated_at || asset.created_at || '';
+  return `${API}${asset.file_url}${version ? `?v=${encodeURIComponent(version)}` : ''}`;
+}
+
 function App() {
   const [tab, setTab] = useState('create');
   const [projects, setProjects] = useState([]);
@@ -55,13 +71,19 @@ function App() {
   const [pendingUpload, setPendingUpload] = useState(null);
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
+  const [processingImage, setProcessingImage] = useState('');
+  const [generatingShotId, setGeneratingShotId] = useState('');
+  const [materialSourceStrategy, setMaterialSourceStrategy] = useState('library_first');
   const [voiceType, setVoiceType] = useState(VOICE_OPTIONS[0].value);
+  const [coverTitle, setCoverTitle] = useState('');
+  const [coverSubtitle, setCoverSubtitle] = useState('');
   const [previewAsset, setPreviewAsset] = useState(null);
   const [consoleOpen, setConsoleOpen] = useState(false);
   const [consoleStream, setConsoleStream] = useState('image_search');
   const [consoleLog, setConsoleLog] = useState('');
   const [consoleMeta, setConsoleMeta] = useState(null);
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
+  const [exportResult, setExportResult] = useState(null);
   const folderFallbackRef = useRef(null);
   const uploadInputRef = useRef(null);
   const lastProjectStatusRef = useRef('');
@@ -97,15 +119,27 @@ function App() {
       });
       map.set(asset.shot_id, list);
     });
+    shots.forEach((shot) => {
+      const selected = assets.find((asset) => asset.id === shot.selected_asset_id);
+      if (!selected) return;
+      const list = map.get(shot.id) || [];
+      if (!list.some((asset) => asset.id === selected.id)) {
+        list.unshift({ ...selected, shot_id: shot.id, asset_source: 'local' });
+      }
+      map.set(shot.id, list);
+    });
     map.forEach((list) => list.sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || ''))));
     return map;
-  }, [generatedAssets]);
+  }, [assets, generatedAssets, shots]);
   const searchProgress = useMemo(() => {
     const total = shots.length || project?.search_total || 0;
-    const completedByShots = shots.filter((shot) => ['web_downloaded', 'no_image', 'ai_generated'].includes(shot.status)).length;
-    const completed = Math.min(total || project?.search_total || 0, Math.max(completedByShots, project?.search_completed || 0));
+    const success = shots.filter((shot) => ['web_downloaded', 'ai_generated', 'matched'].includes(shot.status)).length;
+    const failed = shots.filter((shot) => ['no_image', 'intent_failed'].includes(shot.status)).length;
+    const completed = shots.length
+      ? success + failed
+      : Math.min(total, project?.search_completed || 0);
     const percent = total ? Math.min(100, Math.round((completed / total) * 100)) : 0;
-    return { total, completed, percent };
+    return { total, completed, success, failed, percent };
   }, [project, shots]);
   const diagnosticsByShot = useMemo(() => {
     const map = new Map();
@@ -175,6 +209,12 @@ function App() {
   useEffect(() => {
     refreshAll();
   }, []);
+
+  useEffect(() => {
+    if (!project) return;
+    setCoverTitle(project.cover_title || project.name || '');
+    setCoverSubtitle(project.cover_subtitle || suggestedCoverSubtitle(project));
+  }, [project?.id, project?.cover_title, project?.cover_subtitle]);
 
   useEffect(() => {
     if (!assets.some((asset) => asset.analysis_status === 'analyzing')) return undefined;
@@ -273,7 +313,10 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ rewritten_script: project.rewritten_script }),
       });
-      await request(`/api/projects/${projectId}/shots?image_search_provider=${imageSearchProvider}`, { method: 'POST' });
+      await request(
+        `/api/projects/${projectId}/shots?image_search_provider=${imageSearchProvider}&material_source_strategy=${materialSourceStrategy}`,
+        { method: 'POST' },
+      );
       await refreshAll(projectId);
       setMessage('分镜已生成，正在分析关键词和搜索图片...');
     } catch (err) {
@@ -354,12 +397,66 @@ function App() {
   }
 
   async function generateImage(shotId) {
-    await run('生成占位图', () => request(`/api/projects/${projectId}/shots/${shotId}/generate-image`, { method: 'POST' }));
+    setGeneratingShotId(shotId);
+    try {
+      await run('生成占位图', () => request(`/api/projects/${projectId}/shots/${shotId}/generate-image`, { method: 'POST' }));
+      await refreshAll(projectId);
+    } finally {
+      setGeneratingShotId('');
+    }
+  }
+
+  async function retryImageSearch(shotId, imageSearchProvider = 'so') {
+    const label = imageSearchProvider === 'tencent' ? '腾讯重新搜索图片' : '重新搜索图片';
+    await run(label, () => request(
+      `/api/projects/${projectId}/shots/${shotId}/retry-image-search?image_search_provider=${imageSearchProvider}`,
+      { method: 'POST' },
+    ));
     await refreshAll(projectId);
   }
 
-  async function retryImageSearch(shotId) {
-    await run('重新搜索图片', () => request(`/api/projects/${projectId}/shots/${shotId}/retry-image-search`, { method: 'POST' }));
+  async function processGeneratedImage(assetId, operation) {
+    const processingKey = `${assetId}:${operation}`;
+    const label = operation === 'crop-square' ? '裁剪图片' : 'Seedream 去水印';
+    setProcessingImage(processingKey);
+    try {
+      await run(label, () => request(
+        `/api/projects/${projectId}/generated-assets/${assetId}/${operation}`,
+        { method: 'POST' },
+      ));
+      await refreshAll(projectId);
+    } finally {
+      setProcessingImage('');
+    }
+  }
+
+  async function uploadManualShotImage(shotId, file) {
+    const data = new FormData();
+    data.append('file', file, file.name);
+    await run('上传镜头图片', () => request(
+      `/api/projects/${projectId}/shots/${shotId}/manual-image`,
+      { method: 'POST', body: data },
+    ));
+    await refreshAll(projectId);
+  }
+
+  async function archiveSelectedImages() {
+    const result = await run('批量存入素材库', () => request(
+      `/api/projects/${projectId}/archive-selected-images`,
+      { method: 'POST' },
+    ));
+    if (!result) return;
+    setMessage(`素材入库：新增 ${result.created}，跳过重复 ${result.skipped_duplicates}，无图片 ${result.missing}`);
+    await refreshAll(projectId);
+  }
+
+  async function cropSelectedImages() {
+    const result = await run('一键裁剪', () => request(
+      `/api/projects/${projectId}/crop-selected-images`,
+      { method: 'POST' },
+    ));
+    if (!result) return;
+    setMessage(`一键裁剪完成：成功 ${result.cropped}，跳过 ${result.skipped}，失败 ${result.failed.length}`);
     await refreshAll(projectId);
   }
 
@@ -382,17 +479,57 @@ function App() {
     const subtitleResult = await run('生成字幕', () => request(`/api/projects/${projectId}/generate-subtitles`, { method: 'POST' }));
     if (!subtitleResult) return false;
     await refreshAll(projectId);
-    setTab('export');
+    setTab('cover');
     return true;
   }
 
-  async function exportPackage() {
-    if (!project?.audio_url) {
+  async function generateCover() {
+    const result = await run('生成视频封面', () => request(`/api/projects/${projectId}/generate-cover`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: coverTitle.trim(),
+        subtitle: coverSubtitle.trim(),
+      }),
+    }));
+    if (!result) return;
+    await refreshAll(projectId);
+    setMessage('9:16 视频封面生成完成');
+  }
+
+  async function exportPackage(output) {
+    if (!project?.audio_url || !project?.voice_timeline_url) {
       const generated = await generateVoiceAndSubtitles();
       if (!generated) return;
     }
-    const data = await run('导出素材包', () => request(`/api/projects/${projectId}/export/assets`, { method: 'POST' }));
-    if (data?.download_url) window.open(`${API}${data.download_url}`, '_blank');
+    const label = output === 'mp4' ? '导出 MP4' : '导出剪映草稿';
+    const data = await run(label, () => request(
+      `/api/projects/${projectId}/export/assets?output=${output}`,
+      { method: 'POST' },
+    ));
+    if (!data) return;
+    setExportResult(data);
+    if (output === 'mp4') {
+      setMessage(`MP4 导出完成：${data.verification?.mp4?.passed ? '验证通过' : '验证失败'}`);
+    } else {
+      setMessage(`剪映草稿导出完成：${data.verification?.jianying?.draft_name || ''}`);
+    }
+  }
+
+  async function openExportFolder() {
+    const data = await run('打开导出文件夹', () => request(
+      `/api/projects/${projectId}/export/open-folder`,
+      { method: 'POST' },
+    ));
+    if (data?.path) setMessage(`已打开导出文件夹：${data.path}`);
+  }
+
+  async function openDraftFolder() {
+    const data = await run('打开剪映草稿文件夹', () => request(
+      `/api/projects/${projectId}/export/open-draft-folder`,
+      { method: 'POST' },
+    ));
+    if (data?.path) setMessage(`已打开剪映草稿文件夹：${data.path}`);
   }
 
   const workflowBusy = busy || project?.status === 'searching_images';
@@ -426,6 +563,7 @@ function App() {
           <button className={tab === 'script' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('script')}><Wand2 size={18} /> 文案</button>
           <button className={tab === 'storyboard' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('storyboard')}><Archive size={18} /> 分镜</button>
           <button className={tab === 'match' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('match')}><Search size={18} /> 匹配</button>
+          <button className={tab === 'cover' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('cover')}><ImagePlus size={18} /> 封面</button>
           <button className={tab === 'export' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('export')}><Download size={18} /> 导出</button>
         </nav>
         <div className="project-picker">
@@ -530,6 +668,14 @@ function App() {
                 </p>
               )}
               <textarea value={project.rewritten_script || ''} rows="22" onChange={(e) => setProject({ ...project, rewritten_script: e.target.value })} />
+              <label className="source-strategy">
+                素材来源策略
+                <select value={materialSourceStrategy} onChange={(event) => setMaterialSourceStrategy(event.target.value)}>
+                  <option value="library_first">优先素材库，缺失时联网搜索</option>
+                  <option value="library_only">仅使用素材库</option>
+                  <option value="web_only">仅联网搜索</option>
+                </select>
+              </label>
               <div className="actions">
                 <button onClick={saveScript}><Save size={18} /> 保存</button>
                 <button className="primary" onClick={() => generateShots('so')}><Archive size={18} /> 生成分镜</button>
@@ -547,6 +693,27 @@ function App() {
 
         {tab === 'storyboard' && (
           <section className="band">
+            <div className="storyboard-actions">
+              <div className="storyboard-action-buttons">
+                <button
+                  type="button"
+                  disabled={busy || !shots.some((shot) => shot.selected_asset_id)}
+                  onClick={cropSelectedImages}
+                >
+                  <Crop size={18} /> 一键裁剪选中图片
+                </button>
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={!activeLibrary}
+                  title={activeLibrary ? '保存当前分镜选图到素材库' : '请先在素材库页面选择文件夹'}
+                  onClick={archiveSelectedImages}
+                >
+                  <Archive size={18} /> 批量存入素材库并打标签
+                </button>
+              </div>
+              <small>优先保存已选图片；未选择时保存该镜头第一张，重复图片自动跳过。</small>
+            </div>
             <SearchProgress progress={searchProgress} project={project} onStop={stopImageSearch} />
             <div className="shot-list">
               {shots.map((shot) => (
@@ -558,10 +725,16 @@ function App() {
                   searchProgress={searchProgress}
                   project={project}
                   diagnostics={diagnosticsByShot.get(shot.id) || []}
-                  onSelect={(assetId) => selectAsset(shot.id, assetId, 'web_search')}
+                  onSelect={(assetId, assetSource) => selectAsset(shot.id, assetId, assetSource)}
                   onPreview={setPreviewAsset}
                   onGenerate={() => generateImage(shot.id)}
-                  onRetry={() => retryImageSearch(shot.id)}
+                  onRetry={() => retryImageSearch(shot.id, 'so')}
+                  onTencentRetry={() => retryImageSearch(shot.id, 'tencent')}
+                  processingImage={processingImage}
+                  generatingShotId={generatingShotId}
+                  onCrop={(assetId) => processGeneratedImage(assetId, 'crop-square')}
+                  onRemoveWatermark={(assetId) => processGeneratedImage(assetId, 'remove-watermark')}
+                  onManualUpload={(file) => uploadManualShotImage(shot.id, file)}
                 />
               ))}
             </div>
@@ -584,10 +757,16 @@ function App() {
                     searchProgress={searchProgress}
                     project={project}
                     diagnostics={diagnosticsByShot.get(shot.id) || []}
-                    onSelect={(assetId) => selectAsset(shot.id, assetId, 'web_search')}
+                    onSelect={(assetId, assetSource) => selectAsset(shot.id, assetId, assetSource)}
                     onPreview={setPreviewAsset}
                     onGenerate={() => generateImage(shot.id)}
-                    onRetry={() => retryImageSearch(shot.id)}
+                    onRetry={() => retryImageSearch(shot.id, 'so')}
+                    onTencentRetry={() => retryImageSearch(shot.id, 'tencent')}
+                    processingImage={processingImage}
+                    generatingShotId={generatingShotId}
+                    onCrop={(assetId) => processGeneratedImage(assetId, 'crop-square')}
+                    onRemoveWatermark={(assetId) => processGeneratedImage(assetId, 'remove-watermark')}
+                    onManualUpload={(file) => uploadManualShotImage(shot.id, file)}
                   />
                   <select value={shot.selected_asset_id || ''} onChange={(e) => {
                     const options = selectableAssets.filter((item) => !item.shot_id || item.shot_id === shot.id);
@@ -603,16 +782,117 @@ function App() {
           </section>
         )}
 
+        {tab === 'cover' && project && (
+          <section className="band cover-workspace">
+            <div className="panel cover-editor">
+              <div>
+                <h2>设计视频封面</h2>
+                <p>Seedream 会根据完整文案生成 9:16 竖版封面，并在画面中排版下面的文字。</p>
+              </div>
+              <label>
+                封面主标题
+                <input
+                  value={coverTitle}
+                  maxLength={18}
+                  onChange={(event) => setCoverTitle(event.target.value)}
+                  placeholder="输入醒目的封面标题"
+                />
+              </label>
+              <label>
+                封面副标题
+                <input
+                  value={coverSubtitle}
+                  maxLength={28}
+                  onChange={(event) => setCoverSubtitle(event.target.value)}
+                  placeholder="可选，用一句短文案补充主题"
+                />
+              </label>
+              <div className="actions">
+                <button
+                  className="primary"
+                  disabled={busy || !coverTitle.trim()}
+                  onClick={generateCover}
+                >
+                  <Wand2 size={18} /> {project.cover_url ? '重新生成封面' : '生成 9:16 封面'}
+                </button>
+                <button disabled={!project.cover_url} onClick={() => setTab('export')}>
+                  <Download size={18} /> 下一步：导出
+                </button>
+              </div>
+              {project.cover_model && <small>生成模型：{project.cover_model}</small>}
+            </div>
+            <div className="cover-preview">
+              {project.cover_url ? (
+                <button
+                  type="button"
+                  className="cover-image-button"
+                  onClick={() => setPreviewAsset({
+                    file_url: project.cover_url,
+                    updated_at: project.cover_updated_at,
+                    file_name: '视频封面',
+                  })}
+                >
+                  <img
+                    src={`${API}${project.cover_url}?v=${encodeURIComponent(project.cover_updated_at || '')}`}
+                    alt="视频封面"
+                  />
+                </button>
+              ) : (
+                <div className="cover-placeholder">
+                  <ImagePlus size={42} />
+                  <strong>尚未生成封面</strong>
+                  <span>配音字幕完成后，在这里生成竖版主题封面</span>
+                </div>
+              )}
+            </div>
+          </section>
+        )}
+
         {tab === 'export' && (
           <section className="band result">
             <h2>结果导出</h2>
-            <p>素材包包含 raw_script、rewritten_script、storyboard.json/csv、subtitles.srt、timeline.json、asset_match_report.json、已选真实素材、AI 占位图和 main_voice.mp3。</p>
+            <p>一次导出会同时生成 9:16 完整 MP4、按镜头编号的方形 PNG、配音字幕素材包和剪映草稿。方图居中显示，短字幕位于图片下方留白区。</p>
             {project.audio_url && <audio controls src={`${API}${project.audio_url}`} />}
-            <div className="actions">
+            <div className="export-actions">
               <VoiceSelect value={voiceType} onChange={setVoiceType} />
-              <button onClick={generateVoiceAndSubtitles}><Mic size={18} /> 重新生成音频字幕</button>
-              <button className="primary" onClick={exportPackage}><Download size={18} /> 导出 ZIP</button>
+              <button onClick={generateVoiceAndSubtitles}><Mic size={18} /> 重新生成配音字幕</button>
+              <button onClick={() => setTab('cover')}><ImagePlus size={18} /> 查看或生成封面</button>
+              <button onClick={openExportFolder}><FolderOpen size={18} /> 打开导出文件夹</button>
+              <button className="primary" onClick={() => exportPackage('mp4')}><Film size={18} /> 导出 MP4</button>
+              <button className="primary" onClick={() => exportPackage('draft')}><Archive size={18} /> 导出剪映草稿</button>
             </div>
+            {exportResult && (
+              <div className="export-result-card">
+                <div>
+                  <strong>{exportResult.output === 'mp4' ? 'MP4 导出完成' : '剪映草稿导出完成'}</strong>
+                  {exportResult.zip_file_name && <span>{exportResult.zip_file_name}</span>}
+                  <small>保存位置：{exportResult.export_folder}</small>
+                  {exportResult.verification?.jianying?.draft_path && (
+                    <small>剪映草稿：{exportResult.verification.jianying.draft_path}</small>
+                  )}
+                </div>
+                <div className="export-result-actions">
+                  {exportResult.video_url && (
+                    <button onClick={() => window.open(`${API}${exportResult.video_url}`, '_blank')}>
+                      <Film size={18} /> 播放或下载 MP4
+                    </button>
+                  )}
+                  {exportResult.download_url && (
+                    <button onClick={() => window.open(`${API}${exportResult.download_url}`, '_blank')}>
+                      <Download size={18} /> 下载草稿 ZIP
+                    </button>
+                  )}
+                  {exportResult.verification?.jianying && (
+                    <button onClick={openDraftFolder}>
+                      <FolderOpen size={18} /> 打开剪映草稿
+                    </button>
+                  )}
+                  <button className="primary" onClick={openExportFolder}>
+                    <FolderOpen size={18} /> 打开导出文件夹
+                  </button>
+                </div>
+              </div>
+            )}
           </section>
         )}
       </main>
@@ -662,13 +942,16 @@ function ProjectSelect({ projects, projectId, open, onOpenChange, onSelect }) {
   );
 }
 
-function AssetCard({ asset, onEdit, onDelete }) {
+function AssetCard({ asset, onEdit, onDelete, imageTools }) {
   const imageScore = asset.score_result?.score ?? asset.match_score;
   const imageReason = asset.score_result?.reason;
-  const src = asset.file_url ? `${API}${asset.file_url}` : '';
+  const src = assetImageUrl(asset);
   return (
     <article className={asset.analysis_status === 'analyzing' ? 'asset-card analyzing' : 'asset-card'}>
-      <div className="preview">{asset.file_type === 'image' ? <SafeImage src={src} alt={asset.file_name} /> : <video src={src} controls />}</div>
+      <div className="preview">
+        {asset.file_type === 'image' ? <SafeImage src={src} alt={asset.file_name} /> : <video src={src} controls />}
+        {imageTools}
+      </div>
       <h3>{asset.file_name}</h3>
       {imageScore !== undefined && imageScore !== null && <p>图片评分：{imageScore}</p>}
       <p>{asset.analysis_status === 'analyzing' ? '识别中' : [...(asset.object || asset.people || []), ...(asset.scene || []), ...(asset.keywords || [])].slice(0, 6).join(' / ') || '待补充标签'}</p>
@@ -807,6 +1090,8 @@ function SearchProgress({ progress, project, onStop }) {
         </strong>
         <div className="progress-actions">
           <span>{label}</span>
+          <span className="progress-count success">成功 {progress.success}</span>
+          <span className="progress-count failed">失败 {progress.failed}</span>
           {searching && (
             <button type="button" className="danger compact-button" disabled={stopping} onClick={onStop}>
               <RefreshCw size={16} /> {stopping ? '停止中' : '停止搜索'}
@@ -849,7 +1134,7 @@ function SearchProgress({ progress, project, onStop }) {
 }
 
 function ImagePreview({ asset, onClose }) {
-  const src = asset.file_url ? `${API}${asset.file_url}` : '';
+  const src = assetImageUrl(asset);
   return (
     <div className="image-preview-backdrop" onClick={onClose}>
       <div className="image-preview" onClick={(e) => e.stopPropagation()}>
@@ -956,12 +1241,31 @@ function AssetEditor({ asset, onClose, onSave, onDelete }) {
   );
 }
 
-function ShotCard({ shot, assets = [], selectedAssetId, searchProgress, project, diagnostics = [], onSelect, onPreview, onGenerate, onRetry }) {
+function ShotCard({
+  shot,
+  assets = [],
+  selectedAssetId,
+  searchProgress,
+  project,
+  diagnostics = [],
+  onSelect,
+  onPreview,
+  onGenerate,
+  onRetry,
+  onTencentRetry,
+  processingImage,
+  generatingShotId,
+  onCrop,
+  onRemoveWatermark,
+  onManualUpload,
+}) {
+  const manualUploadRef = useRef(null);
+  const isGeneratingImage = generatingShotId === shot.id;
   const visibleAssets = [...assets]
     .sort((a, b) => (b.id === selectedAssetId ? 1 : 0) - (a.id === selectedAssetId ? 1 : 0))
     .slice(0, 2);
   const placeholders = Math.max(0, 2 - visibleAssets.length);
-  const canRetry = (shot.search_attempts || 0) < 2 && !['pending_search', 'analyzing_intent', 'searching'].includes(shot.status);
+  const canRetry = !['pending_search', 'analyzing_intent', 'searching'].includes(shot.status);
   const isSearchingShot = shot.status === 'searching';
   const isWaitingShot = ['pending_search', 'analyzing_intent'].includes(shot.status);
   const progressText = searchProgress?.total
@@ -981,33 +1285,146 @@ function ShotCard({ shot, assets = [], selectedAssetId, searchProgress, project,
         <h3>{shot.voice_text}</h3>
         <p>画面描述：{shot.visual_need || '暂无描述'}</p>
         <p>核心关键词：{(shot.search_keywords || []).join(' / ') || shot.current_search_keyword || '生成中'}</p>
+        <p>素材匹配词：{(shot.material_keywords || []).join(' / ') || '生成中'}</p>
         {diagnosticText && <p className="shot-diagnostic">{diagnosticText}</p>}
       </div>
       <div className="shot-side">
-        <button onClick={onRetry} disabled={!canRetry}><RefreshCw size={18} /> 重新搜索</button>
+        <div className="shot-search-actions">
+          <button onClick={onRetry} disabled={!canRetry}><RefreshCw size={18} /> 重新搜索</button>
+          <button
+            className="tencent-storyboard"
+            title="使用腾讯云联网图像搜索重新搜索"
+            onClick={onTencentRetry}
+            disabled={!canRetry}
+          >
+            <Search size={18} /> 重新搜索
+          </button>
+        </div>
         <div className="shot-images">
+          {isGeneratingImage && (
+            <div className="ai-generating-overlay">
+              <Wand2 size={26} />
+              <strong>AI 图片生成中</strong>
+              <small>Seedream 正在绘制 1:1 图片，请稍候</small>
+            </div>
+          )}
           {visibleAssets.map((item) => (
-            <button
-              type="button"
-              className={item.id === selectedAssetId ? 'image-choice selected' : 'image-choice'}
-              key={item.id}
-              onClick={() => {
-                onSelect?.(item.id);
-                onPreview?.(item);
-              }}
-              title="选择并预览这张图"
-            >
-              <AssetCard asset={item} />
-            </button>
+            <div className={item.id === selectedAssetId ? 'image-choice selected' : 'image-choice'} key={item.id}>
+              <div
+                className="image-choice-main"
+                role="button"
+                tabIndex={0}
+                onClick={() => {
+                  onSelect?.(item.id, item.asset_source || 'web_search');
+                  onPreview?.(item);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    onSelect?.(item.id, item.asset_source || 'web_search');
+                    onPreview?.(item);
+                  }
+                }}
+                title="选择并预览这张图"
+              >
+                <AssetCard
+                  asset={item}
+                  imageTools={(
+                    <div className="image-tools">
+                      {item.asset_source !== 'local' && (
+                        <>
+                      <button
+                        type="button"
+                        title="居中裁剪为 1:1"
+                        aria-label="裁剪为 1:1"
+                        disabled={Boolean(processingImage)}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          onCrop?.(item.id);
+                        }}
+                      >
+                        <Crop size={16} />
+                      </button>
+                      <button
+                        type="button"
+                        title="使用 Seedream 去除水印"
+                        aria-label="Seedream 去水印"
+                        disabled={Boolean(processingImage)}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          onRemoveWatermark?.(item.id);
+                        }}
+                      >
+                        <Eraser size={16} />
+                      </button>
+                        </>
+                      )}
+                      <button
+                        type="button"
+                        className="baidu-image-button"
+                        title={`打开百度图片搜索：${(shot.search_keywords || [shot.current_search_keyword]).filter(Boolean)[0] || ''}`}
+                        aria-label="打开百度图片搜索"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          const keyword = (shot.search_keywords || [shot.current_search_keyword]).filter(Boolean)[0] || '';
+                          window.open(
+                            `https://image.baidu.com/search/index?tn=baiduimage&word=${encodeURIComponent(keyword)}`,
+                            '_blank',
+                            'noopener,noreferrer',
+                          );
+                        }}
+                      >
+                        <span className="baidu-mark">百</span>
+                      </button>
+                    </div>
+                  )}
+                />
+              </div>
+            </div>
           ))}
           {Array.from({ length: placeholders }).map((_, index) => (
             <div className={isSearchingShot ? 'search-placeholder active' : 'search-placeholder'} key={`placeholder-${index}`}>
               <strong>{placeholderText}</strong>
               <small>{placeholderHint}</small>
+              {!isSearchingShot && !isWaitingShot && (
+                <button
+                  type="button"
+                  className="placeholder-baidu-button"
+                  title="使用核心关键词打开百度图片搜索"
+                  onClick={() => {
+                    const keyword = (shot.search_keywords || [shot.current_search_keyword]).filter(Boolean)[0] || '';
+                    window.open(
+                      `https://image.baidu.com/search/index?tn=baiduimage&word=${encodeURIComponent(keyword)}`,
+                      '_blank',
+                      'noopener,noreferrer',
+                    );
+                  }}
+                >
+                  <span className="baidu-mark">百</span> 百度搜图
+                </button>
+              )}
             </div>
           ))}
         </div>
-        <button onClick={onGenerate}><Wand2 size={18} /> AI 占位图</button>
+        <div className="shot-bottom-actions">
+          <button className={isGeneratingImage ? 'ai-generate-button active' : 'ai-generate-button'} onClick={onGenerate} disabled={isGeneratingImage}>
+            <Wand2 size={18} /> {isGeneratingImage ? 'AI 生成中' : 'AI 占位图'}
+          </button>
+          <button type="button" onClick={() => manualUploadRef.current?.click()}>
+            <ImagePlus size={18} /> 上传下载图片
+          </button>
+          <input
+            ref={manualUploadRef}
+            className="hidden-input"
+            type="file"
+            accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (file) onManualUpload?.(file);
+              event.target.value = '';
+            }}
+          />
+        </div>
       </div>
     </article>
   );

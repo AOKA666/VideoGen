@@ -9,8 +9,8 @@ from datetime import datetime
 from pathlib import Path
 
 from services.asset_service import new_id
-from services.generation_service import generate_doubao_image, generate_svg_placeholder
 from services.image_scoring_service import rank_images_for_shot
+from services.material_library_service import apply_library_match, apply_material_intent
 from services.search_intent_service import SearchIntentBatchError, ai_search_intents, apply_intent_to_shot
 from services.store import load_db, project_dir, public_url, save_db
 from services.web_image_service import _url_key, download_images_for_shot, search_keywords_for_shot, search_query_for_shot
@@ -23,7 +23,7 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-DONE_STATUSES = {"web_downloaded", "no_image", "ai_generated"}
+DONE_STATUSES = {"web_downloaded", "no_image", "ai_generated", "matched"}
 ACTIVE_SEARCH_STATUSES = {"pending_search", "analyzing_intent", "searching"}
 MIN_ACCEPT_SCORE = 30
 MAX_SEARCH_ROUNDS = 2
@@ -35,6 +35,20 @@ FULL_IMAGES_PER_SHOT = 8
 FULL_IMAGES_PER_KEYWORD = 4
 FAST_VISUAL_SCORE_LIMIT = 0
 FULL_VISUAL_SCORE_LIMIT = 0
+TENCENT_RETRY_SUFFIXES = [
+    "现场照片",
+    "新闻图片",
+    "历史照片",
+    "纪实影像",
+    "事件现场",
+    "资料图片",
+    "高清照片",
+    "媒体报道",
+    "真实场景",
+    "档案图片",
+    "现场纪实",
+    "新闻现场",
+]
 
 
 def web_image_concurrency() -> int:
@@ -42,6 +56,19 @@ def web_image_concurrency() -> int:
         return max(1, min(8, int(os.getenv("WEB_IMAGE_CONCURRENCY", "6"))))
     except ValueError:
         return 6
+
+
+def _tencent_retry_queries(shot: dict) -> list[str]:
+    core = str((shot.get("search_keywords") or [""])[0]).strip()
+    if not core:
+        return []
+    completed_searches = max(0, int(shot.get("search_attempts") or 0) // MAX_SEARCH_ROUNDS)
+    retry_index = max(0, completed_searches - 1)
+    start = (retry_index * MAX_SEARCH_ROUNDS) % len(TENCENT_RETRY_SUFFIXES)
+    return [
+        f"{core} {TENCENT_RETRY_SUFFIXES[(start + offset) % len(TENCENT_RETRY_SUFFIXES)]}"
+        for offset in range(MAX_SEARCH_ROUNDS)
+    ]
 
 
 def _intent_batches(shots: list[dict], batch_size: int = INTENT_BATCH_SIZE) -> list[list[dict]]:
@@ -166,6 +193,17 @@ def _remember_seen_images(shot: dict, items: list[dict]) -> None:
         *(shot.get("web_image_seen_sources") or []),
         *[item.get("source_page") for item in items if item.get("source_page")],
     ]))
+
+
+def _search_result_history(items: list) -> list[dict]:
+    return [
+        {
+            "image_url": getattr(item, "image_url", "") or getattr(item, "thumb_url", ""),
+            "source_page": getattr(item, "source_page", ""),
+        }
+        for item in items
+        if getattr(item, "image_url", "") or getattr(item, "thumb_url", "")
+    ]
 
 
 def _project_seen_images(db: dict, project_id: str, *, exclude_shot_id: str | None = None) -> dict[str, set[str]]:
@@ -366,75 +404,13 @@ def _cleanup_watermark(item: dict | None, shot: dict | None = None) -> None:
     }
 
 
-def _generate_ai_asset(project_id: str, shot: dict) -> dict:
-    output_dir = project_dir(project_id) / "images" / f"shot_{shot['shot_index']:03d}"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    video_ratio = shot.get("_project_video_ratio") or "1:1"
-    out = output_dir / f"shot_{shot['shot_index']:03d}_ai.png"
-    try:
-        result = generate_doubao_image(out, shot, video_ratio)
-    except Exception as exc:
-        out = output_dir / f"shot_{shot['shot_index']:03d}_ai.svg"
-        prompt = generate_svg_placeholder(out, shot)
-        result = {
-            "prompt": prompt,
-            "provider": "local_svg_placeholder",
-            "model": "svg_placeholder",
-            "image_size": "1080x1920",
-            "remote_url": "",
-            "error": str(exc)[:300],
-        }
-    return {
-        "local_path": str(out),
-        "file_url": "",
-        "file_name": out.name,
-        "prompt": result.get("prompt", ""),
-        "provider": result.get("provider", ""),
-        "model": result.get("model", ""),
-        "image_size": result.get("image_size", ""),
-        "remote_url": result.get("remote_url", ""),
-        "seed": result.get("seed"),
-        "generation_error": result.get("error", ""),
-    }
-
-
-def _register_ai_asset(db: dict, project_id: str, shot: dict, item: dict) -> None:
-    now = _now()
-    asset_id = new_id()
-    path = Path(item["local_path"])
-    db.setdefault("generated_assets", []).append({
-        "id": asset_id,
-        "project_id": project_id,
-        "shot_id": shot["id"],
-        "type": "image",
-        "file_type": "image",
-        "file_name": item["file_name"],
-        "asset_source": "ai_generated",
-        "prompt": item.get("prompt", ""),
-        "provider": item.get("provider", ""),
-        "model": item.get("model", ""),
-        "image_size": item.get("image_size", ""),
-        "remote_url": item.get("remote_url", ""),
-        "seed": item.get("seed"),
-        "file_url": public_url(path),
-        "local_path": item["local_path"],
-        "status": "success",
-        "generation_error": item.get("generation_error", ""),
-        "created_at": now,
-    })
-    shot["selected_asset_id"] = asset_id
-    shot["asset_source"] = "ai_generated"
-    shot["status"] = "ai_generated"
-    shot["match_score"] = 0
-    shot["updated_at"] = now
-
-
 def _download_and_rank_shot(project_id: str, shot: dict) -> dict:
     shot_started = time.monotonic()
     output_dir = project_dir(project_id) / "images" / f"shot_{shot['shot_index']:03d}"
     failures: list[dict] = []
     diagnostics: list[dict] = []
     all_downloaded: list[dict] = []
+    searched_items: list[dict] = []
     top_items: list[dict] = []
     seen_urls = set(shot.get("web_image_seen_urls") or []) | set(shot.get("_project_seen_urls") or [])
     seen_hashes = set(shot.get("web_image_seen_hashes") or []) | set(shot.get("_project_seen_hashes") or [])
@@ -476,13 +452,15 @@ def _download_and_rank_shot(project_id: str, shot: dict) -> dict:
             round_config["results_per_keyword"],
             round_config["images_per_keyword"],
         )
-        _, downloaded, round_failures, round_diagnostics = download_images_for_shot(
+        search_queries = search_keywords_for_shot(shot)
+        keyword_start = round_index - 1 if provider_name == "tencent" and len(search_queries) > 1 else round_config["keyword_start"]
+        search_results, downloaded, round_failures, round_diagnostics = download_images_for_shot(
             shot,
             output_dir,
             images_per_shot=round_config["images_per_shot"],
             images_per_keyword=round_config["images_per_keyword"],
             results_per_keyword=round_config["results_per_keyword"],
-            keyword_start=round_config["keyword_start"],
+            keyword_start=keyword_start,
             keyword_limit=round_config["keyword_limit"],
             delay=0,
             timeout=round_config["timeout"],
@@ -493,9 +471,13 @@ def _download_and_rank_shot(project_id: str, shot: dict) -> dict:
         )
         failures.extend({**failure, "round": round_index} for failure in round_failures)
         diagnostics.extend({**entry, "round": round_index} for entry in round_diagnostics)
+        round_history = _search_result_history(search_results)
+        searched_items.extend(round_history)
         all_downloaded.extend(downloaded)
+        seen_urls.update(item.get("image_url") for item in round_history if item.get("image_url"))
         seen_urls.update(item.get("image_url") for item in downloaded if item.get("image_url"))
         seen_hashes.update(item.get("hash") for item in downloaded if item.get("hash"))
+        seen_sources.update(item.get("source_page") for item in round_history if item.get("source_page"))
         seen_sources.update(item.get("source_page") for item in downloaded if item.get("source_page"))
         top_items = _top_scored_downloads(shot, all_downloaded, limit=DEFAULT_CANDIDATE_LIMIT, visual_limit=round_config["visual_limit"])
         logger.info(
@@ -521,10 +503,10 @@ def _download_and_rank_shot(project_id: str, shot: dict) -> dict:
                 "downloaded": [],
                 "top_items": [],
                 "best": None,
-                "ai_asset": None,
                 "rounds": rounds,
                 "failures": failures,
                 "diagnostics": diagnostics,
+                "searched_items": searched_items,
                 "stopped": True,
             }
     if top_items:
@@ -537,13 +519,12 @@ def _download_and_rank_shot(project_id: str, shot: dict) -> dict:
             "downloaded": top_items,
             "top_items": top_items,
             "best": top_items[0] if top_items else None,
-            "ai_asset": None,
             "rounds": rounds,
             "failures": failures,
             "diagnostics": diagnostics,
+            "searched_items": searched_items,
             "stopped": True,
         }
-    ai_asset = None
     logger.info(
         "[搜图] 镜头=%s 完成 状态=%s 最终候选=%d 最佳分数=%s 总耗时=%.2fs",
         shot.get("shot_index"),
@@ -558,10 +539,10 @@ def _download_and_rank_shot(project_id: str, shot: dict) -> dict:
         "downloaded": all_downloaded,
         "top_items": top_items,
         "best": top_items[0] if top_items else None,
-        "ai_asset": ai_asset,
         "rounds": rounds,
         "failures": failures,
         "diagnostics": diagnostics,
+        "searched_items": searched_items,
     }
 
 
@@ -572,6 +553,7 @@ def _apply_search_result(db: dict, project_id: str, result: dict) -> None:
         return
     downloaded = result.get("downloaded") or []
     top_items = result.get("top_items") or ([result["best"]] if result.get("best") else [])
+    _remember_seen_images(shot, result.get("searched_items") or [])
     _remember_seen_images(shot, downloaded)
     top_items = _project_unique_items(db, project_id, shot["id"], top_items)
     _cleanup_unselected(downloaded, top_items)
@@ -590,8 +572,6 @@ def _apply_search_result(db: dict, project_id: str, result: dict) -> None:
             shot["match_score"] = 0
             shot["image_score"] = None
             shot["status"] = "no_image"
-    elif result.get("ai_asset"):
-        _register_ai_asset(db, project_id, shot, result["ai_asset"])
     else:
         shot["status"] = "no_image"
     shot["downloaded_image_count"] = len(registered_items)
@@ -676,7 +656,6 @@ def _search_shots_batch(project_id: str, shots: list[dict], *, total: int) -> bo
                     "shot_index": source_shot["shot_index"],
                     "downloaded": [],
                     "best": None,
-                    "ai_asset": None,
                     "failures": [{"keyword": search_query_for_shot(source_shot), "stage": "worker", "error": str(exc)[:300]}],
                 }
             db = load_db()
@@ -835,6 +814,7 @@ def run_project_web_image_search(project_id: str) -> None:
             if not intent:
                 continue
             apply_intent_to_shot(shot, intent)
+            apply_material_intent(shot)
             shot["status"] = "pending_search"
             shot["updated_at"] = _now()
         analyzed_count += len(batch)
@@ -846,10 +826,25 @@ def run_project_web_image_search(project_id: str) -> None:
             project["intent_batches_completed"] = batch_index
             project["intent_shots_completed"] = analyzed_count
             project["updated_at"] = _now()
+        strategy = (project or {}).get("material_source_strategy", "library_first")
+        batch_db_shots = [
+            shot for shot in db_shots
+            if str(shot.get("id") or shot.get("shot_index")) in batch_ids
+        ]
+        if strategy != "web_only":
+            for shot in batch_db_shots:
+                if apply_library_match(db, project_id, shot):
+                    continue
+                if strategy == "library_only":
+                    shot["status"] = "no_image"
+                    shot["selected_asset_id"] = None
+                    shot["asset_source"] = None
+                    shot["match_score"] = 0
+                    shot["updated_at"] = _now()
         save_db(db)
 
-        batch_db_shots = [shot for shot in db_shots if str(shot.get("id") or shot.get("shot_index")) in batch_ids]
-        if not _search_shots_batch(project_id, batch_db_shots, total=total):
+        web_search_shots = [shot for shot in batch_db_shots if shot.get("status") == "pending_search"]
+        if web_search_shots and not _search_shots_batch(project_id, web_search_shots, total=total):
             return
 
     db = load_db()
@@ -865,15 +860,12 @@ def run_project_web_image_search(project_id: str) -> None:
         save_db(db)
 
 
-def rerun_shot_web_image_search(project_id: str, shot_id: str) -> None:
+def rerun_shot_web_image_search(project_id: str, shot_id: str, image_search_provider: str = "so") -> None:
     db = load_db()
     project = next((p for p in db.get("projects", []) if p.get("id") == project_id), None)
     shot = next((s for s in db.get("shots", []) if s.get("project_id") == project_id and s.get("id") == shot_id), None)
     if not project or not shot:
         return
-    if int(shot.get("search_attempts") or 0) >= 2:
-        return
-
     now = _now()
     _clear_shot_web_assets(db, project_id, shot_id)
     shot["selected_asset_id"] = None
@@ -882,12 +874,18 @@ def rerun_shot_web_image_search(project_id: str, shot_id: str) -> None:
     shot["image_score"] = None
     shot["status"] = "searching"
     shot["downloaded_image_count"] = 0
+    shot.pop("_search_query_overrides", None)
     shot["search_keywords"] = search_keywords_for_shot(shot)
+    if image_search_provider == "tencent":
+        shot["_search_query_overrides"] = _tencent_retry_queries(shot)
+    else:
+        shot.pop("_search_query_overrides", None)
     shot["current_search_keyword"] = search_query_for_shot(shot)
     shot["_project_video_ratio"] = project.get("video_ratio", "1:1")
-    shot["_image_search_provider"] = project.get("image_search_provider", "so")
+    shot["_image_search_provider"] = image_search_provider
     shot["updated_at"] = now
     project["status"] = "searching_images"
+    project["image_search_provider"] = image_search_provider
     project["current_shot_index"] = shot.get("shot_index")
     project["current_search_keyword"] = shot["current_search_keyword"]
     project["updated_at"] = now
@@ -903,6 +901,8 @@ def rerun_shot_web_image_search(project_id: str, shot_id: str) -> None:
     _apply_search_result(db, project_id, result)
     shot = next((s for s in db.get("shots", []) if s.get("project_id") == project_id and s.get("id") == shot_id), None)
     project = next((p for p in db.get("projects", []) if p.get("id") == project_id), None)
+    if shot:
+        shot.pop("_search_query_overrides", None)
     if project:
         project["status"] = "shots_ready"
         project["current_shot_index"] = None

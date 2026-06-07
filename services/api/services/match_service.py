@@ -9,46 +9,34 @@ def _as_list(value) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
-def _overlap(a: list[str], b: list[str]) -> float:
-    left = {x.lower() for x in a if x}
-    right = {x.lower() for x in b if x}
-    if not left or not right:
-        return 0.0
-    return len(left & right) / max(len(left), 1)
-
-
 def _tag_score(required: list[str], asset_tags: list[str]) -> float:
-    if not required:
-        return 0.0
     required_lower = [item.lower() for item in required if item]
-    asset_lower = [item.lower() for item in asset_tags if item]
+    asset_lower = [str(item).lower() for item in asset_tags if item]
     if not required_lower or not asset_lower:
         return 0.0
-    if any(req in tag or tag in req for req in required_lower for tag in asset_lower):
-        return 1.0
-    return _overlap(required_lower, asset_lower)
+    matched = sum(
+        1 for req in required_lower
+        if any(req in tag or tag in req for tag in asset_lower)
+    )
+    return matched / len(required_lower)
 
 
 def score_asset(shot: dict, asset: dict) -> tuple[int, str]:
-    required_object = _as_list(shot.get("required_object"))
-    required_scene = _as_list(shot.get("required_scene"))
-    object_tags = asset.get("object") or asset.get("people") or []
-    object_score = _tag_score(required_object, object_tags)
-    scene_score = _tag_score(required_scene, asset.get("scene", []))
-
-    object_weight = 60 if required_object else 0
-    scene_weight = 40 if required_scene else 0
-    total_weight = object_weight + scene_weight
-    if not total_weight:
-        return 0, "分镜缺少主体和场景"
-
-    score = (object_score * object_weight + scene_score * scene_weight) / total_weight * 100
-    reason = []
-    if object_score:
-        reason.append("主体标签匹配")
-    if scene_score:
-        reason.append("场景标签匹配")
-    return round(score), "、".join(reason) or "主体/场景未匹配"
+    intent = shot.get("material_intent") or {}
+    fields = [
+        ("主体", _as_list(intent.get("objects") or shot.get("required_object")), asset.get("object") or asset.get("people") or [], 40),
+        ("场景", _as_list(intent.get("scenes") or shot.get("required_scene")), asset.get("scene") or [], 30),
+        ("事件/年代", _as_list(intent.get("keywords")) + _as_list(intent.get("era")), asset.get("keywords") or [], 20),
+        ("风格", _as_list(intent.get("style")), [asset.get("visual_style", "")], 10),
+    ]
+    active = [(name, required, tags, weight) for name, required, tags, weight in fields if required]
+    if not active:
+        return 0, "分镜缺少素材匹配意图"
+    total_weight = sum(weight for _, _, _, weight in active)
+    scores = [(name, _tag_score(required, tags), weight) for name, required, tags, weight in active]
+    score = round(sum(value * weight for _, value, weight in scores) / total_weight * 100)
+    reasons = [f"{name}匹配" for name, value, _ in scores if value > 0]
+    return score, "、".join(reasons) or "素材标签未匹配"
 
 
 def status_from_score(score: int) -> str:
