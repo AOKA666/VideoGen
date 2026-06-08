@@ -341,7 +341,7 @@ def create_jianying_native_draft(
         ),
         border=draft.TextBorder(
             color=(0.0, 0.0, 0.0),
-            width=8.0,
+            width=20.0,
         ),
         clip_settings=draft.ClipSettings(transform_y=-0.43),
     )
