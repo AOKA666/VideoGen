@@ -340,6 +340,12 @@ h3 { font-size: 16px; line-height: 1.48; }
 }
 .actions { justify-content: flex-end; margin-top: 12px; }
 .source-strategy { margin-top: 14px; }
+.raw-script-actions { margin-top: 14px; }
+.raw-script-hint {
+  display: block;
+  color: var(--muted);
+  margin-top: 6px;
+}
 .storyboard-actions {
   display: flex;
   align-items: center;

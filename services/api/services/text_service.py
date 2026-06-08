@@ -391,6 +391,100 @@ def is_meaningful_shot_text(text: str) -> bool:
     return bool(cleaned)
 
 
+SHOT_VISUALS_BATCH_SIZE = 10
+
+
+def _build_shot_visuals_prompt(shot_items: list[dict], full_script: str) -> str:
+    return f"""你是短视频分镜画面设计专家。请根据每个分镜的旁白文字，生成准确的画面描述和图片搜索关键词。
+
+规则：
+1. 画面描述（visual_need）应描述这个镜头应该出现什么画面，指导图片搜索方向，不要复述旁白内容。
+2. 搜索关键词（search_keywords）应是可以直接用于中文图片搜索的词组，2-3个关键词，每个2-8个字。
+3. 如果旁白明确描述某个具体人物、事件或场景，画面和关键词应聚焦该内容。
+4. 如果旁白是抒情、议论、铺垫、转折，而不是直接描述主角时，应考虑空镜头或氛围画面：
+   - 感动流泪 → 画面"观众席上感动落泪的特写"，关键词"感动落泪""观众热泪盈眶"
+   - 沉默无言 → 画面"人物沉默凝视远方的特写"，关键词"沉默凝视""安静沉思"
+   - 历史回顾 → 画面"泛黄老照片的特写"，关键词"老照片特写""历史档案资料"
+   - 气氛烘托 → 画面"逆光下的人物剪影"，关键词"逆光剪影""黄昏天空"
+   - 敬仰追思 → 画面"纪念碑前献花的庄重画面"，关键词"纪念碑献花""庄严肃穆"
+5. 不要把旁白文字直接当画面描述或搜索关键词。例如"没有豪言壮语，只有简简单单的一句话，让无数人红了眼眶"，画面应描述为"观众席上感动落泪的特写"，关键词应为"感动落泪""观众热泪盈眶"，而不是"豪言壮语"或"感人语录"。
+6. 画面描述要具体、可搜索，避免"相关画面""历史画面""纪实画面"等泛化描述。
+7. 只输出严格 JSON，不要 Markdown。
+
+全文背景（仅用于消除歧义）：
+{full_script}
+
+分镜列表：
+{json.dumps(shot_items, ensure_ascii=False)}
+
+返回格式：
+{{
+  "shots": [
+    {{
+      "id": "分镜编号",
+      "visual_need": "画面描述：描述这个镜头应该展示什么具体画面",
+      "search_keywords": ["搜索关键词1", "搜索关键词2"]
+    }}
+  ]
+}}""".strip()
+
+
+def ai_generate_shot_visuals(shots: list[dict], full_script: str) -> dict[str, dict]:
+    """Use GLM to generate visual_need and search_keywords for each shot."""
+    api_key = os.getenv("BIGMODEL_API_KEY", "").strip()
+    if not api_key:
+        return {}
+
+    all_visuals: dict[str, dict] = {}
+    for batch_start in range(0, len(shots), SHOT_VISUALS_BATCH_SIZE):
+        batch = shots[batch_start:batch_start + SHOT_VISUALS_BATCH_SIZE]
+        shot_items = [
+            {"id": str(shot["shot_index"]), "shot_index": shot["shot_index"], "voice_text": shot["voice_text"]}
+            for shot in batch
+        ]
+        prompt = _build_shot_visuals_prompt(shot_items, full_script)
+        payload = {
+            "model": bigmodel_model(),
+            "messages": [
+                {"role": "system", "content": "你只输出可解析 JSON。"},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.3,
+            "top_p": 0.7,
+            "max_tokens": max(1500, min(6000, len(batch) * 200)),
+            "stream": False,
+            "thinking": {"type": "disabled"},
+            "response_format": {"type": "json_object"},
+        }
+        try:
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                f"{bigmodel_endpoint().rstrip('/')}/chat/completions",
+                data=data,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=90) as response:
+                body = json.loads(response.read().decode("utf-8"))
+            content = body["choices"][0]["message"]["content"]
+            if isinstance(content, list):
+                content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+            result = json.loads(extract_json(str(content)))
+            for item in result.get("shots", []):
+                shot_id = str(item.get("id") or item.get("shot_index") or "")
+                visual_need = str(item.get("visual_need") or "").strip()
+                search_keywords = [str(k).strip() for k in (item.get("search_keywords") or []) if str(k).strip()]
+                if visual_need or search_keywords:
+                    all_visuals[shot_id] = {
+                        "visual_need": visual_need,
+                        "search_keywords": search_keywords,
+                    }
+        except Exception:
+            continue
+
+    return all_visuals
+
+
 def generate_shots(script: str) -> list[dict]:
     lines = [line.strip() for line in script.splitlines() if is_meaningful_shot_text(line)]
     chunks: list[str] = lines if len(lines) > 1 else []
@@ -435,10 +529,22 @@ def generate_shots(script: str) -> list[dict]:
             "visual_need": visual_need,
             "required_object": required_object,
             "required_scene": required_scene,
+            "search_keywords": tags["keywords"][:4],
             "selected_asset_id": None,
             "asset_source": None,
             "match_score": 0,
             "status": "no_match",
         })
         cursor += duration
+
+    # Use GLM to generate more accurate visual descriptions and search keywords
+    visuals = ai_generate_shot_visuals(shots, script)
+    for shot in shots:
+        visual = visuals.get(str(shot["shot_index"]))
+        if visual:
+            if visual.get("visual_need"):
+                shot["visual_need"] = visual["visual_need"]
+            if visual.get("search_keywords"):
+                shot["search_keywords"] = visual["search_keywords"]
+
     return shots

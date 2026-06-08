@@ -326,6 +326,29 @@ function App() {
     }
   }
 
+  async function skipToStoryboard(imageSearchProvider = 'so') {
+    setTab('storyboard');
+    setBusy(true);
+    setMessage('使用原始文案生成分镜...');
+    try {
+      await request(`/api/projects/${projectId}/script`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rewritten_script: project.raw_script }),
+      });
+      await request(
+        `/api/projects/${projectId}/shots?image_search_provider=${imageSearchProvider}&material_source_strategy=${materialSourceStrategy}`,
+        { method: 'POST' },
+      );
+      await refreshAll(projectId);
+      setMessage('分镜已生成，正在分析关键词和搜索图片...');
+    } catch (err) {
+      setMessage(`生成分镜失败：${err.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function handleUploadPick(ev) {
     const files = Array.from(ev.target.files || []);
     if (!files.length) return;
@@ -654,6 +677,17 @@ function App() {
             <div className="panel">
               <h2>原始文案</h2>
               <textarea readOnly value={project.raw_script} rows="22" />
+              <div className="actions raw-script-actions">
+                <button className="primary" onClick={() => skipToStoryboard('so')}><Archive size={18} /> 直接生成分镜</button>
+                <button
+                  className="tencent-storyboard"
+                  title="使用原始文案生成分镜，并使用腾讯云联网图像搜索"
+                  onClick={() => skipToStoryboard('tencent')}
+                >
+                  <Search size={18} /> 直接生成分镜
+                </button>
+              </div>
+              <small className="raw-script-hint">跳过二创，使用原始文案直接拆分镜头</small>
             </div>
             <div className="panel">
               <div className="row">
@@ -667,7 +701,7 @@ function App() {
                   {' · '}语义相似度：{project.rewrite_comparison.semantic_similarity ?? '-'}%
                 </p>
               )}
-              <textarea value={project.rewritten_script || ''} rows="22" onChange={(e) => setProject({ ...project, rewritten_script: e.target.value })} />
+              <textarea value={project.rewritten_script || ''} rows="18" onChange={(e) => setProject({ ...project, rewritten_script: e.target.value })} />
               <label className="source-strategy">
                 素材来源策略
                 <select value={materialSourceStrategy} onChange={(event) => setMaterialSourceStrategy(event.target.value)}>
