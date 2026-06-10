@@ -16,31 +16,47 @@ def now_iso() -> str:
 
 
 def build_material_intent(shot: dict) -> dict:
-    tags = keywords_from_text(f"{shot.get('voice_text', '')} {shot.get('visual_need', '')}")
+    # Prefer AI-generated structured tags (object_tags, scene_tags, keywords)
+    # over the legacy keywords_from_text() approach
+    ai_objects = [str(x).strip() for x in shot.get("object_tags") or [] if str(x).strip()]
+    ai_scenes = [str(x).strip() for x in shot.get("scene_tags") or [] if str(x).strip()]
+    ai_keywords = [str(x).strip() for x in shot.get("keywords") or [] if str(x).strip()]
+
+    if ai_objects or ai_scenes or ai_keywords:
+        return {
+            "objects": ai_objects[:4],
+            "scenes": ai_scenes[:3],
+            "keywords": ai_keywords[:5],
+        }
+
+    # Fallback: use required_object / required_scene if AI tags are not yet available
     objects = list(dict.fromkeys([
         *[str(x).strip() for x in shot.get("required_object") or [] if str(x).strip()],
-        *[str(x).strip() for x in tags.get("people") or [] if str(x).strip()],
-    ]))[:6]
+    ]))[:4]
     scenes = list(dict.fromkeys([
         *[str(x).strip() for x in shot.get("required_scene") or [] if str(x).strip()],
-        *[str(x).strip() for x in tags.get("scene") or [] if str(x).strip()],
-    ]))[:6]
-    excluded = set(objects + scenes + list(tags.get("era") or []) + list(tags.get("emotion") or []))
-    keywords = [str(x).strip() for x in tags.get("keywords") or [] if str(x).strip() not in excluded][:8]
+    ]))[:3]
+    keywords: list[str] = []
+
+    if not objects and not scenes:
+        # Last resort: use keywords_from_text (no more "老照片"/"历史档案" defaults)
+        tags = keywords_from_text(f"{shot.get('voice_text', '')} {shot.get('visual_need', '')}")
+        objects = [str(x).strip() for x in tags.get("people") or [] if str(x).strip()][:4]
+        scenes = [str(x).strip() for x in tags.get("scene") or [] if str(x).strip()][:3]
+
     return {
         "objects": objects,
         "scenes": scenes,
         "keywords": keywords,
-        "era": list(tags.get("era") or [])[:4],
-        "style": ["真实照片", "新闻纪实"],
     }
 
 
 def apply_material_intent(shot: dict) -> dict:
     intent = build_material_intent(shot)
     shot["material_intent"] = intent
+    # Only 3 categories: objects (主体), scenes (场景), keywords (关键词)
     shot["material_keywords"] = list(dict.fromkeys([
-        *intent["objects"], *intent["scenes"], *intent["keywords"], *intent["era"], *intent["style"],
+        *intent["objects"], *intent["scenes"], *intent["keywords"],
     ]))
     return intent
 
@@ -157,7 +173,7 @@ def archive_project_images(db: dict, project_id: str) -> dict:
             "object": list(intent.get("objects") or []),
             "scene": list(intent.get("scenes") or []),
             "keywords": list(dict.fromkeys([
-                *(intent.get("keywords") or []), *(intent.get("era") or []), *(intent.get("style") or []),
+                *(intent.get("keywords") or []),
             ])),
             "visual_style": "新闻纪实",
             "analysis_status": "analyzing",
