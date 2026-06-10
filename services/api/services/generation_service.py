@@ -75,28 +75,6 @@ def image_size_for_ratio(video_ratio: str | None) -> str:
     return "1440x2560"
 
 
-def _multipart_form_data(fields: dict[str, str], files: list[tuple[str, str, str, bytes]]) -> tuple[bytes, str]:
-    boundary = f"----VideoGenArkBoundary{uuid4().hex}"
-    chunks: list[bytes] = []
-    for name, value in fields.items():
-        chunks.extend([
-            f"--{boundary}\r\n".encode("ascii"),
-            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("ascii"),
-            str(value).encode("utf-8"),
-            b"\r\n",
-        ])
-    for name, filename, mime, data in files:
-        chunks.extend([
-            f"--{boundary}\r\n".encode("ascii"),
-            f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'.encode("utf-8"),
-            f"Content-Type: {mime}\r\n\r\n".encode("ascii"),
-            data,
-            b"\r\n",
-        ])
-    chunks.append(f"--{boundary}--\r\n".encode("ascii"))
-    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
-
-
 def remove_watermark_with_seedream(path: Path, shot: dict | None = None) -> dict:
     api_key = os.getenv("ARK_API_KEY", "").strip()
     if not api_key:
@@ -110,22 +88,26 @@ def remove_watermark_with_seedream(path: Path, shot: dict | None = None) -> dict
     )
     if shot:
         prompt += f" 分镜画面语境：{shot.get('visual_need') or shot.get('voice_text') or ''}"
+
+    image_b64 = base64.b64encode(path.read_bytes()).decode("ascii")
     mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
-    body, content_type = _multipart_form_data(
-        {
-            "model": ark_image_edit_model(),
-            "prompt": prompt,
-            "response_format": "url",
-            "watermark": "false",
-        },
-        [("image", path.name, mime, path.read_bytes())],
-    )
+    image_data_uri = f"data:{mime};base64,{image_b64}"
+
+    payload = {
+        "model": ark_image_edit_model(),
+        "prompt": prompt,
+        "image": image_data_uri,
+        "strength": 0.65,
+        "n": 1,
+        "size": "1024x1024",
+        "response_format": "url",
+    }
     req = urllib.request.Request(
-        f"{ark_endpoint().rstrip('/')}/images/edits",
-        data=body,
+        f"{ark_endpoint().rstrip('/')}/images/generations",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {api_key}",
-            "Content-Type": content_type,
+            "Content-Type": "application/json",
         },
         method="POST",
     )

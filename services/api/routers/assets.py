@@ -255,3 +255,40 @@ def delete_asset(asset_id: str):
 
     save_db(db)
     return {"status": "deleted", "asset_id": asset_id, "deleted_file": deleted_file}
+
+
+class BatchDeletePayload(BaseModel):
+    asset_ids: list[str]
+
+
+@router.post("/batch-delete")
+def batch_delete_assets(payload: BatchDeletePayload):
+    db = load_db()
+    ids_to_delete = set(payload.asset_ids)
+    if not ids_to_delete:
+        raise HTTPException(400, "No asset IDs provided")
+
+    deleted_ids = []
+    deleted_files = 0
+    for asset in db["assets"]:
+        if asset["id"] not in ids_to_delete:
+            continue
+        local_path = Path(asset.get("local_path", ""))
+        if local_path.exists() and ASSETS_DIR.resolve() in local_path.resolve().parents:
+            local_path.unlink()
+            deleted_files += 1
+        deleted_ids.append(asset["id"])
+
+    db["assets"] = [a for a in db["assets"] if a["id"] not in ids_to_delete]
+    db["project_assets"] = [pa for pa in db.get("project_assets", []) if pa.get("asset_id") not in ids_to_delete]
+    now = datetime.now().isoformat(timespec="seconds")
+    for shot in db.get("shots", []):
+        if shot.get("selected_asset_id") in ids_to_delete:
+            shot["selected_asset_id"] = None
+            shot["asset_source"] = None
+            shot["match_score"] = 0
+            shot["status"] = "no_match"
+            shot["updated_at"] = now
+
+    save_db(db)
+    return {"status": "deleted", "deleted_count": len(deleted_ids), "deleted_files": deleted_files}

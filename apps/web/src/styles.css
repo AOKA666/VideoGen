@@ -307,7 +307,7 @@ h3 { font-size: 16px; line-height: 1.48; }
 }
 
 .band { padding: 30px 34px; animation: riseIn .36s ease both; }
-.two-col { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(320px, .8fr); gap: 22px; }
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
 .panel, .notes, .result,
 .progress-panel, .library-gate, .library-bar, .shot-card, .asset-card {
   border: 1px solid var(--line);
@@ -345,6 +345,45 @@ h3 { font-size: 16px; line-height: 1.48; }
   display: block;
   color: var(--muted);
   margin-top: 6px;
+}
+.batch-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .52);
+}
+.batch-bar .compact { gap: 6px; }
+.batch-count {
+  color: var(--brand);
+  font-size: 13px;
+  font-weight: 600;
+}
+.asset-card.selected {
+  border-color: var(--brand);
+  box-shadow: 0 0 0 3px rgba(36, 103, 91, .14), var(--shadow-sm);
+}
+.asset-checkbox {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 5;
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, .88);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .12);
+  cursor: pointer;
+}
+.asset-checkbox input {
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
 }
 .storyboard-actions {
   display: flex;
@@ -585,6 +624,7 @@ h3 { font-size: 16px; line-height: 1.48; }
   gap: 16px;
 }
 .asset-card {
+  position: relative;
   overflow: hidden;
   transition: transform .2s ease, box-shadow .2s ease, border-color .2s ease;
 }

@@ -84,6 +84,7 @@ function App() {
   const [consoleMeta, setConsoleMeta] = useState(null);
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [exportResult, setExportResult] = useState(null);
+  const [selectedAssetIds, setSelectedAssetIds] = useState(new Set());
   const folderFallbackRef = useRef(null);
   const uploadInputRef = useRef(null);
   const lastProjectStatusRef = useRef('');
@@ -393,7 +394,41 @@ function App() {
     if (!window.confirm(`确认删除素材「${asset.file_name}」吗？`)) return;
     await run('删除素材', () => request(`/api/assets/${asset.id}`, { method: 'DELETE' }));
     if (editingAsset?.id === asset.id) setEditingAsset(null);
+    setSelectedAssetIds((prev) => { const next = new Set(prev); next.delete(asset.id); return next; });
     await refreshAll(projectId);
+  }
+
+  async function batchDeleteAssets() {
+    const ids = [...selectedAssetIds];
+    if (!ids.length) return;
+    if (!window.confirm(`确认批量删除 ${ids.length} 个素材吗？`)) return;
+    const result = await run('批量删除', () => request('/api/assets/batch-delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ asset_ids: ids }),
+    }));
+    if (!result) return;
+    setSelectedAssetIds(new Set());
+    if (editingAsset && ids.includes(editingAsset.id)) setEditingAsset(null);
+    await refreshAll(projectId);
+    setMessage(`已删除 ${result.deleted_count} 个素材（${result.deleted_files} 个文件）`);
+  }
+
+  function toggleAssetSelect(assetId) {
+    setSelectedAssetIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(assetId)) next.delete(assetId);
+      else next.add(assetId);
+      return next;
+    });
+  }
+
+  function toggleSelectAllAssets() {
+    if (selectedAssetIds.size === assets.length) {
+      setSelectedAssetIds(new Set());
+    } else {
+      setSelectedAssetIds(new Set(assets.map((a) => a.id)));
+    }
   }
 
   async function deleteProject() {
@@ -657,11 +692,28 @@ function App() {
                   <span>{pendingUpload ? `已选择 ${pendingUpload.files.length} 个文件` : '选择图片或视频后先设置标签'}</span>
                   <button className="primary" type="button" onClick={() => uploadInputRef.current?.click()}><ImagePlus size={18} /> 选择素材</button>
                 </div>
+                {assets.length > 0 && (
+                  <div className="batch-bar">
+                    <label className="check-row compact">
+                      <input type="checkbox" checked={selectedAssetIds.size === assets.length && assets.length > 0} onChange={toggleSelectAllAssets} />
+                      全选 ({assets.length})
+                    </label>
+                    {selectedAssetIds.size > 0 && (
+                      <>
+                        <span className="batch-count">已选 {selectedAssetIds.size} 项</span>
+                        <button className="danger compact-button" onClick={batchDeleteAssets}><Trash2 size={16} /> 批量删除</button>
+                        <button className="compact-button" onClick={() => setSelectedAssetIds(new Set())}>取消选择</button>
+                      </>
+                    )}
+                  </div>
+                )}
                 <div className="asset-grid">
                   {assets.map((asset) => (
                     <AssetCard
                       key={asset.id}
                       asset={asset}
+                      selected={selectedAssetIds.has(asset.id)}
+                      onSelect={() => toggleAssetSelect(asset.id)}
                       onEdit={() => setEditingAsset(asset)}
                       onDelete={() => deleteAsset(asset)}
                     />
@@ -676,7 +728,15 @@ function App() {
           <section className="band two-col script-grid">
             <div className="panel">
               <h2>原始文案</h2>
-              <textarea readOnly value={project.raw_script} rows="22" />
+              <textarea readOnly value={project.raw_script} rows="18" />
+              <label className="source-strategy">
+                素材来源策略
+                <select value={materialSourceStrategy} onChange={(event) => setMaterialSourceStrategy(event.target.value)}>
+                  <option value="library_first">优先素材库，缺失时联网搜索</option>
+                  <option value="library_only">仅使用素材库</option>
+                  <option value="web_only">仅联网搜索</option>
+                </select>
+              </label>
               <div className="actions raw-script-actions">
                 <button className="primary" onClick={() => skipToStoryboard('so')}><Archive size={18} /> 直接生成分镜</button>
                 <button
@@ -976,12 +1036,17 @@ function ProjectSelect({ projects, projectId, open, onOpenChange, onSelect }) {
   );
 }
 
-function AssetCard({ asset, onEdit, onDelete, imageTools }) {
+function AssetCard({ asset, selected, onSelect, onEdit, onDelete, imageTools }) {
   const imageScore = asset.score_result?.score ?? asset.match_score;
   const imageReason = asset.score_result?.reason;
   const src = assetImageUrl(asset);
   return (
-    <article className={asset.analysis_status === 'analyzing' ? 'asset-card analyzing' : 'asset-card'}>
+    <article className={`${asset.analysis_status === 'analyzing' ? 'asset-card analyzing' : 'asset-card'}${selected ? ' selected' : ''}`}>
+      {onSelect && (
+        <label className="asset-checkbox" onClick={(e) => e.stopPropagation()}>
+          <input type="checkbox" checked={!!selected} onChange={onSelect} />
+        </label>
+      )}
       <div className="preview">
         {asset.file_type === 'image' ? <SafeImage src={src} alt={asset.file_name} /> : <video src={src} controls />}
         {imageTools}
