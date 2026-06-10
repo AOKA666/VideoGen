@@ -24,10 +24,9 @@ def _tag_score(required: list[str], asset_tags: list[str]) -> float:
 def score_asset(shot: dict, asset: dict) -> tuple[int, str]:
     intent = shot.get("material_intent") or {}
     fields = [
-        ("主体", _as_list(intent.get("objects") or shot.get("required_object")), asset.get("object") or asset.get("people") or [], 40),
-        ("场景", _as_list(intent.get("scenes") or shot.get("required_scene")), asset.get("scene") or [], 30),
-        ("事件/年代", _as_list(intent.get("keywords")) + _as_list(intent.get("era")), asset.get("keywords") or [], 20),
-        ("风格", _as_list(intent.get("style")), [asset.get("visual_style", "")], 10),
+        ("主体", _as_list(intent.get("objects") or shot.get("required_object") or shot.get("object_tags")), asset.get("object") or asset.get("people") or [], 50),
+        ("场景", _as_list(intent.get("scenes") or shot.get("required_scene") or shot.get("scene_tags")), asset.get("scene") or [], 30),
+        ("关键词", _as_list(intent.get("keywords") or shot.get("keywords")), asset.get("keywords") or [], 20),
     ]
     active = [(name, required, tags, weight) for name, required, tags, weight in fields if required]
     if not active:

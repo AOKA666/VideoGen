@@ -47,9 +47,6 @@ def safe_storage_name(filename: str) -> str:
 def fallback_analyze_asset(filename: str, file_type: str = "image") -> dict[str, Any]:
     stem = Path(filename).stem.replace("_", " ").replace("-", " ")
     tags = keywords_from_text(stem)
-    lower = stem.lower()
-    if "老照片" in stem or "photo" in lower or "archive" in lower:
-        tags["scene"] = list(dict.fromkeys(tags["scene"] + ["老照片", "历史档案"]))
     tags.update({
         "media_type": "photo" if file_type == "image" else "video",
         "analysis_provider": "local_fallback",
@@ -101,12 +98,17 @@ def analyze_image_with_glm(filename: str, file_path: Path, api_key: str) -> dict
     mime = mimetypes.guess_type(filename)[0] or "image/jpeg"
     image_b64 = base64.b64encode(file_path.read_bytes()).decode("ascii")
     prompt = (
-        "你是历史纪实短视频素材库的图片打标助手。请根据图片内容和文件名生成标签。"
-        "object 表示图片主体，可以是人物、动物、物品、建筑、标志物或其他核心对象，不要只识别人。"
-        "只返回 JSON，不要 Markdown。字段必须包含："
-        "object, scene, keywords。"
-        "object/scene/keywords 都是中文字符串数组；"
-        f"文件名：{filename}"
+        '你是短视频素材库的图片打标助手。请根据图片内容和文件名生成精确标签。'
+        '规则：'
+        '1. object（主体标签）：图片中可识别的人、物、建筑、标志物等核心对象，1-3个词，每个2-6字。必须是具体可识别的对象，如【钱学森】【核潜艇】【纪念碑】。'
+        '2. scene（场景标签）：图片发生的地点、环境，1-2个词，每个2-6字。如【实验室】【戈壁滩】【会议室】。无法判断则留空数组。'
+        '3. keywords（关键词）：独立描述这张图体现的内容，1-3个词，每个2-8字。站在图片搜索角度，想想搜什么词能找到这张图。禁止使用【老照片】【历史档案】【历史画面】【纪实画面】等泛化词。'
+        '4. 人物识别规则：如果图片主体是独立人物，必须尽量给出该人物的真名（如【钱学森】【邓稼先】），严禁使用【女科学家】【男教授】【老妇人】【中年男人】等泛化描述代替人名。只有确实无法确认身份的群像或路人角色才可用泛化词。'
+        '词不在多，在精确。不要凑数，每个标签都必须有区分度。'
+        '只返回 JSON，不要 Markdown。字段必须包含：'
+        'object, scene, keywords。'
+        'object/scene/keywords 都是中文字符串数组；'
+        f'文件名：{filename}'
     )
     prompt += (
         "\n\n重要补充规则：必须判断图片是否真实照片。"

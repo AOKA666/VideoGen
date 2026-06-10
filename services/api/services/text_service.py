@@ -377,13 +377,9 @@ def keywords_from_text(text: str) -> dict[str, list[str]]:
     people = [p for p in PERSON_HINTS if p in text]
     scenes = [s for s in SCENE_HINTS if s in text]
     eras = [e for e in ERA_HINTS if e in text]
-    if not scenes:
-        scenes = ["老照片", "历史档案"]
-    if not eras:
-        eras = ["历史年代"]
-    emotion = ["庄重"] if any(w in text for w in ["国家", "保护", "牺牲", "秘密", "困难"]) else ["纪实"]
-    keywords = list(dict.fromkeys(people + scenes + eras + emotion + re.findall(r"[\u4e00-\u9fff]{2,6}", text)[:6]))
-    return {"people": people, "scene": scenes, "era": eras, "emotion": emotion, "keywords": keywords}
+    # No more "老照片"/"历史档案" fallbacks — only use tags that are actually found in text
+    keywords = list(dict.fromkeys(people + scenes + eras + re.findall(r"[一-鿿]{2,6}", text)[:6]))
+    return {"people": people, "scene": scenes, "era": eras, "keywords": keywords}
 
 
 def is_meaningful_shot_text(text: str) -> bool:
@@ -395,21 +391,19 @@ SHOT_VISUALS_BATCH_SIZE = 10
 
 
 def _build_shot_visuals_prompt(shot_items: list[dict], full_script: str) -> str:
-    return f"""你是短视频分镜画面设计专家。请根据每个分镜的旁白文字，生成准确的画面描述和图片搜索关键词。
+    return f"""你是短视频分镜画面设计专家。请根据每个分镜的旁白文字，生成画面描述、搜索关键词和素材匹配标签。
 
 规则：
 1. 画面描述（visual_need）应描述这个镜头应该出现什么画面，指导图片搜索方向，不要复述旁白内容。
 2. 搜索关键词（search_keywords）应是可以直接用于中文图片搜索的词组，2-3个关键词，每个2-8个字。
-3. 如果旁白明确描述某个具体人物、事件或场景，画面和关键词应聚焦该内容。
-4. 如果旁白是抒情、议论、铺垫、转折，而不是直接描述主角时，应考虑空镜头或氛围画面：
-   - 感动流泪 → 画面"观众席上感动落泪的特写"，关键词"感动落泪""观众热泪盈眶"
-   - 沉默无言 → 画面"人物沉默凝视远方的特写"，关键词"沉默凝视""安静沉思"
-   - 历史回顾 → 画面"泛黄老照片的特写"，关键词"老照片特写""历史档案资料"
-   - 气氛烘托 → 画面"逆光下的人物剪影"，关键词"逆光剪影""黄昏天空"
-   - 敬仰追思 → 画面"纪念碑前献花的庄重画面"，关键词"纪念碑献花""庄严肃穆"
-5. 不要把旁白文字直接当画面描述或搜索关键词。例如"没有豪言壮语，只有简简单单的一句话，让无数人红了眼眶"，画面应描述为"观众席上感动落泪的特写"，关键词应为"感动落泪""观众热泪盈眶"，而不是"豪言壮语"或"感人语录"。
-6. 画面描述要具体、可搜索，避免"相关画面""历史画面""纪实画面"等泛化描述。
-7. 只输出严格 JSON，不要 Markdown。
+3. 主体标签（object_tags）：画面中应该出现的人、物、建筑、标志物等核心主体，1-3个词，每个2-6字。必须是具体可识别的对象，如"钱学森""核潜艇""火车""纪念碑"。
+4. 场景标签（scene_tags）：画面发生的地点、环境或氛围，1-2个词，每个2-6字。必须是具体场景，如"实验室""会议室""戈壁滩""码头"。如果无法确定具体场景，留空数组。
+5. 关键词（keywords）：独立判断这个画面应该体现什么，1-3个词，每个2-8字。不要从旁白中提取或改写词汇，要站在图片搜索的角度，想想搜什么词能找到这张图。例如旁白说"他毅然放弃国外的优厚待遇回到祖国"，画面可能是"归国科学家走下飞机"，关键词应该是"归国科学家""留学回国"，而不是"优厚待遇""毅然放弃"。
+6. 如果旁白明确描述某个具体人物、事件或场景，标签应聚焦该内容。
+7. 禁止使用"老照片""历史档案""历史画面""纪实画面""相关画面"等泛化无意义词。
+8. 画面描述要具体、可搜索，避免"相关画面""历史画面""纪实画面"等泛化描述。
+9. 人物识别规则：如果画面主体是独立人物，必须尽量给出该人物的真名（如"钱学森""邓稼先"），严禁使用"女科学家""男教授""老妇人""中年男人"等泛化描述代替人名。只有确实无法确认身份的群像或路人角色才可用泛化词。
+10. 只输出严格 JSON，不要 Markdown。
 
 全文背景（仅用于消除歧义）：
 {full_script}
@@ -423,7 +417,10 @@ def _build_shot_visuals_prompt(shot_items: list[dict], full_script: str) -> str:
     {{
       "id": "分镜编号",
       "visual_need": "画面描述：描述这个镜头应该展示什么具体画面",
-      "search_keywords": ["搜索关键词1", "搜索关键词2"]
+      "search_keywords": ["搜索关键词1", "搜索关键词2"],
+      "object_tags": ["主体1", "主体2"],
+      "scene_tags": ["场景1"],
+      "keywords": ["关键词1", "关键词2"]
     }}
   ]
 }}""".strip()
@@ -451,7 +448,7 @@ def ai_generate_shot_visuals(shots: list[dict], full_script: str) -> dict[str, d
             ],
             "temperature": 0.3,
             "top_p": 0.7,
-            "max_tokens": max(1500, min(6000, len(batch) * 200)),
+            "max_tokens": max(2000, min(8000, len(batch) * 300)),
             "stream": False,
             "thinking": {"type": "disabled"},
             "response_format": {"type": "json_object"},
@@ -474,10 +471,16 @@ def ai_generate_shot_visuals(shots: list[dict], full_script: str) -> dict[str, d
                 shot_id = str(item.get("id") or item.get("shot_index") or "")
                 visual_need = str(item.get("visual_need") or "").strip()
                 search_keywords = [str(k).strip() for k in (item.get("search_keywords") or []) if str(k).strip()]
-                if visual_need or search_keywords:
+                object_tags = [str(k).strip() for k in (item.get("object_tags") or []) if str(k).strip()]
+                scene_tags = [str(k).strip() for k in (item.get("scene_tags") or []) if str(k).strip()]
+                keywords = [str(k).strip() for k in (item.get("keywords") or []) if str(k).strip()]
+                if visual_need or search_keywords or object_tags or scene_tags or keywords:
                     all_visuals[shot_id] = {
                         "visual_need": visual_need,
                         "search_keywords": search_keywords,
+                        "object_tags": object_tags,
+                        "scene_tags": scene_tags,
+                        "keywords": keywords,
                     }
         except Exception:
             continue
@@ -516,10 +519,10 @@ def generate_shots(script: str) -> list[dict]:
         duration = max(3.0, min(6.0, round(len(text) / 7, 1)))
         required_object = tags["people"] or [
             item for item in tags["keywords"]
-            if item not in tags["scene"] and item not in tags["era"] and item not in tags["emotion"]
+            if item not in tags["scene"] and item not in tags["era"]
         ][:2]
-        required_scene = tags["scene"][:2] or ["历史档案"]
-        visual_need = "、".join(required_object + required_scene) or "历史纪实画面"
+        required_scene = tags["scene"][:2]
+        visual_need = "、".join(required_object + required_scene) or "待AI生成画面描述"
         shots.append({
             "shot_index": idx,
             "voice_text": text,
@@ -529,6 +532,9 @@ def generate_shots(script: str) -> list[dict]:
             "visual_need": visual_need,
             "required_object": required_object,
             "required_scene": required_scene,
+            "object_tags": required_object,
+            "scene_tags": required_scene,
+            "keywords": [],
             "search_keywords": tags["keywords"][:4],
             "selected_asset_id": None,
             "asset_source": None,
@@ -546,5 +552,13 @@ def generate_shots(script: str) -> list[dict]:
                 shot["visual_need"] = visual["visual_need"]
             if visual.get("search_keywords"):
                 shot["search_keywords"] = visual["search_keywords"]
+            if visual.get("object_tags"):
+                shot["object_tags"] = visual["object_tags"]
+                shot["required_object"] = visual["object_tags"]
+            if visual.get("scene_tags"):
+                shot["scene_tags"] = visual["scene_tags"]
+                shot["required_scene"] = visual["scene_tags"]
+            if visual.get("keywords"):
+                shot["keywords"] = visual["keywords"]
 
     return shots

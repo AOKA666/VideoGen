@@ -1254,9 +1254,9 @@ function TagFields({ form, update }) {
   return (
     <>
       <div className="grid">
-        <label>主体标签<input value={form.object} onChange={(e) => update('object', e.target.value)} placeholder="钱学森，火车，纪念碑，动物" /></label>
-        <label>场景标签<input value={form.scene} onChange={(e) => update('scene', e.target.value)} placeholder="实验室，会议，老照片" /></label>
-        <label>关键词<input value={form.keywords} onChange={(e) => update('keywords', e.target.value)} placeholder="中国科学家，历史照片" /></label>
+        <label>主体标签<input value={form.object} onChange={(e) => update('object', e.target.value)} placeholder="钱学森，火车，纪念碑" /></label>
+        <label>场景标签<input value={form.scene} onChange={(e) => update('scene', e.target.value)} placeholder="实验室，会议室，戈壁滩" /></label>
+        <label>关键词<input value={form.keywords} onChange={(e) => update('keywords', e.target.value)} placeholder="归国科学家，留学回国" /></label>
       </div>
       <label>来源备注<input value={form.source_note} onChange={(e) => update('source_note', e.target.value)} /></label>
       <label>版权备注<input value={form.copyright_note} onChange={(e) => update('copyright_note', e.target.value)} /></label>
@@ -1383,8 +1383,10 @@ function ShotCard({
         <span className={`pill ${shot.status}`}>镜头 {shot.shot_index} · {shot.status}</span>
         <h3>{shot.voice_text}</h3>
         <p>画面描述：{shot.visual_need || '暂无描述'}</p>
-        <p>核心关键词：{(shot.search_keywords || []).join(' / ') || shot.current_search_keyword || '生成中'}</p>
-        <p>素材匹配词：{(shot.material_keywords || []).join(' / ') || '生成中'}</p>
+        <p>主体标签：{((shot.material_intent && shot.material_intent.objects) || []).join(' / ') || '—'}</p>
+        <p>场景标签：{((shot.material_intent && shot.material_intent.scenes) || []).join(' / ') || '—'}</p>
+        <p>关键词：{((shot.material_intent && shot.material_intent.keywords) || []).join(' / ') || '—'}</p>
+        <p>搜索关键词：{(shot.search_keywords || []).join(' / ') || shot.current_search_keyword || '—'}</p>
         {diagnosticText && <p className="shot-diagnostic">{diagnosticText}</p>}
       </div>
       <div className="shot-side">
@@ -1489,7 +1491,7 @@ function ShotCard({
                 <button
                   type="button"
                   className="placeholder-baidu-button"
-                  title="使用核心关键词打开百度图片搜索"
+                  title="使用搜索关键词打开百度图片搜索"
                   onClick={() => {
                     const keyword = (shot.search_keywords || [shot.current_search_keyword]).filter(Boolean)[0] || '';
                     window.open(
