@@ -42,15 +42,6 @@ function emptyTagForm() {
   };
 }
 
-function suggestedCoverSubtitle(project) {
-  const script = String(project?.rewritten_script || project?.raw_script || '');
-  return script
-    .split(/[。！？!?，,\n]+/)
-    .map((item) => item.trim())
-    .find((item) => item && item !== project?.name)
-    ?.slice(0, 28) || '';
-}
-
 function assetImageUrl(asset) {
   if (!asset?.file_url) return '';
   const version = asset.updated_at || asset.created_at || '';
@@ -76,17 +67,17 @@ function App() {
   const [materialSourceStrategy, setMaterialSourceStrategy] = useState('library_first');
   const [voiceType, setVoiceType] = useState(VOICE_OPTIONS[0].value);
   const [speechRate, setSpeechRate] = useState(0);
-  const [coverTitle, setCoverTitle] = useState('');
-  const [coverSubtitle, setCoverSubtitle] = useState('');
   const [titleLine1, setTitleLine1] = useState('');
   const [titleLine2, setTitleLine2] = useState('');
   const [titleConfirmed, setTitleConfirmed] = useState(false);
+  const [coverImage, setCoverImage] = useState(null);
   const [previewAsset, setPreviewAsset] = useState(null);
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [exportResult, setExportResult] = useState(null);
   const [selectedAssetIds, setSelectedAssetIds] = useState(new Set());
   const folderFallbackRef = useRef(null);
   const uploadInputRef = useRef(null);
+  const coverInputRef = useRef(null);
   const lastProjectStatusRef = useRef('');
 
   const activeLibrary = validLibrary(library) ? library : null;
@@ -199,12 +190,11 @@ function App() {
 
   useEffect(() => {
     if (!project) return;
-    setCoverTitle(project.cover_title || project.name || '');
-    setCoverSubtitle(project.cover_subtitle || suggestedCoverSubtitle(project));
     setTitleLine1(project.title_line1 || '');
     setTitleLine2(project.title_line2 || '');
     setTitleConfirmed(Boolean(project.title_line1 && project.title_line2) || Boolean(project.cover_url));
-  }, [project?.id, project?.cover_title, project?.cover_subtitle, project?.title_line1, project?.title_line2, project?.cover_url]);
+    setCoverImage(null);
+  }, [project?.id, project?.title_line1, project?.title_line2, project?.cover_url]);
 
   useEffect(() => {
     if (!assets.some((asset) => asset.analysis_status === 'analyzing')) return undefined;
@@ -546,17 +536,40 @@ function App() {
   }
 
   async function generateCover() {
+    if (!coverImage) {
+      setMessage('请先上传一张人物图片');
+      return;
+    }
+    const data = new FormData();
+    data.append('file', coverImage, coverImage.name);
     const result = await run('生成视频封面', () => request(`/api/projects/${projectId}/generate-cover`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        title: coverTitle.trim(),
-        subtitle: coverSubtitle.trim(),
-      }),
+      body: data,
     }));
     if (!result) return;
     await refreshAll(projectId);
     setMessage('9:16 视频封面生成完成');
+  }
+
+  async function downloadCover() {
+    if (!project?.cover_url) return;
+    try {
+      const version = encodeURIComponent(project.cover_updated_at || '');
+      const response = await fetch(`${API}${project.cover_url}?v=${version}`);
+      if (!response.ok) throw new Error('封面文件读取失败');
+      const blob = await response.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = '视频封面.png';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(blobUrl);
+      setMessage('封面下载完成');
+    } catch (err) {
+      setMessage(`下载失败：${err.message}`);
+    }
   }
 
   async function generateTitle() {
@@ -585,8 +598,6 @@ function App() {
       }),
     }));
     setTitleConfirmed(true);
-    // Auto-populate cover title with the full title
-    setCoverTitle(`${titleLine1.trim()} ${titleLine2.trim()}`);
     setMessage('标题已确认，可以生成封面');
   }
 
@@ -943,18 +954,18 @@ function App() {
                     标题第一行
                     <input
                       value={titleLine1}
-                      maxLength={12}
+                      maxLength={9}
                       onChange={(event) => { setTitleLine1(event.target.value); setTitleConfirmed(false); }}
-                      placeholder="5-12字，制造悬念"
+                      placeholder="5-9字，制造悬念"
                     />
                   </label>
                   <label>
                     标题第二行
                     <input
                       value={titleLine2}
-                      maxLength={12}
+                      maxLength={9}
                       onChange={(event) => { setTitleLine2(event.target.value); setTitleConfirmed(false); }}
-                      placeholder="5-12字，揭示反差"
+                      placeholder="5-9字，揭示反差"
                     />
                   </label>
                 </div>
@@ -978,31 +989,29 @@ function App() {
               {/* Step 2: Cover Generation (only after title is confirmed) */}
               <div className="cover-section">
                 <h3>第二步 · 生成封面</h3>
-                <label>
-                  封面标题
-                  <input
-                    value={coverTitle}
-                    maxLength={18}
-                    onChange={(event) => setCoverTitle(event.target.value)}
-                    placeholder="标题确认后自动填入"
-                  />
-                </label>
-                <label>
-                  封面副标题
-                  <input
-                    value={coverSubtitle}
-                    maxLength={28}
-                    onChange={(event) => setCoverSubtitle(event.target.value)}
-                    placeholder="可选，用一句短文案补充主题"
-                  />
-                </label>
+                <p className="cover-layout-note">上传人物图片后，系统会将图片居中裁剪为 1:1 并添加圆角。图片和两行标题会完整排在 9:16 画布正中的 1080×1440 区域内。</p>
+                <input
+                  ref={coverInputRef}
+                  className="hidden-input"
+                  type="file"
+                  accept="image/*"
+                  onChange={(event) => setCoverImage(event.target.files?.[0] || null)}
+                />
+                <button type="button" onClick={() => {
+                  if (!coverInputRef.current) return;
+                  coverInputRef.current.value = '';
+                  coverInputRef.current.click();
+                }}>
+                  <ImagePlus size={18} /> {coverImage ? '更换人物图片' : '上传人物图片'}
+                </button>
+                {coverImage && <small className="cover-file-name">{coverImage.name}</small>}
                 <div className="actions">
                   <button
                     className="primary"
-                    disabled={busy || !titleConfirmed || !coverTitle.trim()}
+                    disabled={busy || !titleConfirmed || !coverImage}
                     onClick={generateCover}
                   >
-                    <ImagePlus size={18} /> {project.cover_url ? '重新生成封面' : '生成 9:16 封面'}
+                    <ImagePlus size={18} /> {project.cover_url ? '重新合成封面' : '生成 9:16 封面'}
                   </button>
                   <button disabled={!project.cover_url} onClick={() => setTab('export')}>
                     <Download size={18} /> 下一步：导出
@@ -1010,29 +1019,34 @@ function App() {
                 </div>
               </div>
 
-              {project.cover_model && <small>生成模型：{project.cover_model}</small>}
+              {project.cover_model && <small>封面处理：{project.cover_model}</small>}
             </div>
             <div className="cover-preview">
               {project.cover_url ? (
-                <button
-                  type="button"
-                  className="cover-image-button"
-                  onClick={() => setPreviewAsset({
-                    file_url: project.cover_url,
-                    updated_at: project.cover_updated_at,
-                    file_name: '视频封面',
-                  })}
-                >
-                  <img
-                    src={`${API}${project.cover_url}?v=${encodeURIComponent(project.cover_updated_at || '')}`}
-                    alt="视频封面"
-                  />
-                </button>
+                <>
+                  <button
+                    type="button"
+                    className="cover-image-button"
+                    onClick={() => setPreviewAsset({
+                      file_url: project.cover_url,
+                      updated_at: project.cover_updated_at,
+                      file_name: '视频封面',
+                    })}
+                  >
+                    <img
+                      src={`${API}${project.cover_url}?v=${encodeURIComponent(project.cover_updated_at || '')}`}
+                      alt="视频封面"
+                    />
+                  </button>
+                  <button type="button" className="cover-download-button" onClick={downloadCover}>
+                    <Download size={18} /> 下载封面
+                  </button>
+                </>
               ) : (
                 <div className="cover-placeholder">
                   <ImagePlus size={42} />
                   <strong>尚未生成封面</strong>
-                  <span>确认标题后，在这里生成竖版主题封面</span>
+                  <span>确认标题并上传人物图片后，在这里生成竖版封面</span>
                 </div>
               )}
             </div>

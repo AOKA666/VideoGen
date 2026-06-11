@@ -568,11 +568,30 @@ h3 { font-size: 16px; line-height: 1.48; }
 .title-inputs { display: grid; gap: 10px; }
 .title-inputs input { font-weight: 600; font-size: 15px; }
 .cover-section { opacity: 1; transition: opacity .2s; }
-.cover-section:has(button:disabled:first-of-type) { opacity: .55; }
+.cover-section:has(.actions .primary:disabled) { opacity: .55; }
+.cover-layout-note {
+  margin: 0;
+  padding: 12px;
+  border-radius: 8px;
+  background: #f4f6f2;
+  font-size: 13px;
+}
+.cover-file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
 .cover-preview {
   display: flex;
+  flex-direction: column;
+  align-items: center;
   justify-content: center;
+  gap: 12px;
   min-height: 640px;
+}
+.cover-download-button {
+  width: min(100%, 405px);
 }
 .cover-image-button,
 .cover-placeholder {

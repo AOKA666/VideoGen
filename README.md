@@ -1,13 +1,13 @@
 # VideoGen 短视频草稿生成器
 
-面向纪实解说、历史人物和知识类短视频的本地工作台。系统可以完成文案改写、分镜拆分、图片搜索与管理、配音字幕、Seedream 封面、MP4 和剪映草稿导出。
+面向纪实解说、历史人物和知识类短视频的本地工作台。系统可以完成文案改写、分镜拆分、图片搜索与管理、配音字幕、上传图片合成封面、MP4 和剪映草稿导出。
 
 ## 主要功能
 
 - AI 改写口播文案并自动拆分分镜
 - 使用腾讯云或 360 图片搜索分镜素材
 - 手动上传、裁剪、去水印和管理素材库
-- 使用 Seedream 生成 1:1 分镜占位图和 9:16 视频封面
+- 使用 Seedream 生成 1:1 分镜占位图，使用上传图片合成 9:16 视频封面
 - 使用豆包语音合成模型 2.0 一次性生成完整配音
 - 读取字词级时间戳，生成每条不超过 9 个汉字的字幕
 - 导出 9:16 MP4、PNG 分镜、字幕、时间线和剪映草稿
@@ -40,7 +40,7 @@ BIGMODEL_API_KEY=your_bigmodel_api_key
 BIGMODEL_ENDPOINT=https://open.bigmodel.cn/api/paas/v4
 BIGMODEL_MODEL=glm-5.1
 
-# 火山方舟 / Seedream：AI 分镜图、去水印和视频封面
+# 火山方舟 / Seedream：AI 分镜图和去水印
 ARK_API_KEY=your_ark_api_key
 ARK_ENDPOINT=https://ark.cn-beijing.volces.com/api/v3
 ARK_IMAGE_MODEL=doubao-seedream-4-5-251128
@@ -81,7 +81,7 @@ JIANYING_DRAFTS_DIR=E:\JianyingPro Drafts
 | 功能 | 必填变量 |
 | --- | --- |
 | 文案改写和标签 | `BIGMODEL_API_KEY` |
-| Seedream 图片与封面 | `ARK_API_KEY` |
+| Seedream 分镜图片与去水印 | `ARK_API_KEY` |
 | 腾讯图片搜索 | `TENCENT_CLOUD_SECRET_ID`、`TENCENT_CLOUD_SECRET_KEY` |
 | 豆包配音与时间戳 | `VOLC_TTS_APP_ID`、`VOLC_TTS_ACCESS_KEY` |
 

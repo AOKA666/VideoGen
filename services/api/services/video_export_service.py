@@ -15,6 +15,46 @@ from PIL import Image, ImageOps
 CREATE_NO_WINDOW = 0x08000000
 
 
+def _escape_ffmpeg_filter_path(path: str | Path) -> str:
+    """Escape a filesystem path embedded in an FFmpeg filter graph."""
+    return str(path).replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
+
+
+def _find_preferred_font() -> tuple[str, str]:
+    """Find the preferred font file and name.
+
+    Prioritizes 文源圆体 (WenYuan Rounded), falling back to
+    Microsoft YaHei / SimHei if not available.
+
+    Returns:
+        (font_file_path, font_name) — font_file_path uses forward slashes
+        for FFmpeg compatibility; font_name is for the subtitles force_style
+        FontName parameter.
+    """
+    # 1. Look for 文源圆体 bundled in the project root
+    project_root = Path(__file__).resolve().parent.parent.parent.parent
+    wenyuan_candidates = [
+        project_root / "WenYuanRoundedSCVF.ttf",
+        Path("C:/Windows/Fonts/WenYuanRoundedSCVF.ttf"),
+    ]
+    for candidate in wenyuan_candidates:
+        if candidate.exists():
+            return (str(candidate).replace("\\", "/"), "文源圆体")
+
+    # 2. Fall back to Microsoft YaHei / SimHei
+    fallback_candidates = [
+        ("C:/Windows/Fonts/msyhbd.ttc", "Microsoft YaHei"),
+        ("C:/Windows/Fonts/msyh.ttc", "Microsoft YaHei"),
+        ("C:/Windows/Fonts/simhei.ttf", "SimHei"),
+    ]
+    for font_path, font_name in fallback_candidates:
+        if os.path.exists(font_path):
+            return (font_path.replace("\\", "/"), font_name)
+
+    # 3. Last resort
+    return ("C:/Windows/Fonts/msyhbd.ttc", "Microsoft YaHei")
+
+
 def _run(command: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
@@ -115,49 +155,36 @@ def render_project_video(
     total_duration = audio_probe["duration_sec"]
     display_ranges = _shot_display_ranges(shots, total_duration)
     durations = [duration for _, duration in display_ranges]
-    transitions = [
-        min(transition_sec, durations[index] / 2, durations[index + 1] / 2)
-        for index in range(len(shots) - 1)
+    concat_script = output_path.parent / "ffmpeg_scenes.txt"
+    concat_lines = ["ffconcat version 1.0"]
+    for scene_path, duration in zip(scene_paths, durations):
+        escaped_path = str(scene_path.resolve()).replace("\\", "/").replace("'", r"'\''")
+        concat_lines.append(f"file '{escaped_path}'")
+        concat_lines.append(f"duration {duration:.6f}")
+    last_path = str(scene_paths[-1].resolve()).replace("\\", "/").replace("'", r"'\''")
+    concat_lines.append(f"file '{last_path}'")
+    concat_script.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
+
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "concat", "-safe", "0", "-i", str(concat_script.resolve()),
+        "-i", str(audio_path.resolve()),
     ]
-    command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
-    for index, scene_path in enumerate(scene_paths):
-        input_duration = durations[index] + (transitions[index] if index < len(transitions) else 0)
-        command.extend([
-            "-loop",
-            "1",
-            "-framerate",
-            "30",
-            "-t",
-            f"{input_duration:.3f}",
-            "-i",
-            str(scene_path),
-        ])
-    command.extend(["-i", str(audio_path)])
 
-    filters = []
-    for index, input_duration in enumerate(durations):
-        extended = input_duration + (transitions[index] if index < len(transitions) else 0)
-        filters.append(
-            f"[{index}:v]scale=1080:1080:force_original_aspect_ratio=increase,"
-            f"crop=1080:1080,pad=1080:1920:0:420:color=black,"
-            f"fps=30,format=yuv420p,setsar=1,"
-            f"trim=duration={extended:.3f},setpts=PTS-STARTPTS[v{index}]"
-        )
+    filters = [
+        "[0:v]scale=1080:1080:force_original_aspect_ratio=increase,"
+        "crop=1080:1080,pad=1080:1920:0:420:color=black,"
+        f"fps=30,format=yuv420p,setsar=1,trim=duration={total_duration:.3f},"
+        "setpts=PTS-STARTPTS[vbase]"
+    ]
+    video_label = "vbase"
 
-    video_label = "v0"
-    elapsed = durations[0]
-    for index, transition in enumerate(transitions, 1):
-        next_label = f"x{index}"
-        filters.append(
-            f"[{video_label}][v{index}]xfade=transition=fade:"
-            f"duration={transition:.3f}:offset={elapsed:.3f}[{next_label}]"
-        )
-        video_label = next_label
-        elapsed += durations[index]
-
+    preferred_font_path, preferred_font_name = _find_preferred_font()
+    preferred_font_dir = _escape_ffmpeg_filter_path(Path(preferred_font_path).parent)
     filters.append(
         f"[{video_label}]subtitles=filename='subtitles.srt':"
-        "force_style='FontName=Microsoft YaHei,FontSize=15,"
+        f"fontsdir='{preferred_font_dir}':"
+        f"force_style='FontName={preferred_font_name},FontSize=15,"
         "PrimaryColour=&H0000FFFF,OutlineColour=&H00000000,"
         "BorderStyle=1,Outline=0.8,Shadow=0,MarginV=500,Alignment=2'[vsub]"
     )
@@ -172,15 +199,15 @@ def render_project_video(
                     .replace(":", "\\\\:")
                     .replace("%", "\\\\%"))
 
-        # Use fontfile path with forward slashes for cross-platform compatibility
-        font_path = "C:/Windows/Fonts/msyhbd.ttc"
+        # Use the preferred font (文源圆体 with fallback) for title text
+        font_path = _escape_ffmpeg_filter_path(preferred_font_path)
 
-        # Title line 1 - centered, positioned in upper portion of top blank area
+        # 16pt-style title text on a 1080x1920 canvas.
         if title_line1:
             filters.append(
                 f"[vsub]drawtext=text='{_escape_drawtext(title_line1)}':"
-                f"fontsize=42:fontcolor=yellow:borderw=3:bordercolor=black:"
-                f"x=(w-text_w)/2:y=120:"
+                f"fontsize=32:fontcolor=white:borderw=3:bordercolor=black:"
+                f"x=(w-text_w)/2:y=45:"
                 f"fontfile='{font_path}'[vt1]"
             )
             current_label = "vt1"
@@ -189,10 +216,11 @@ def render_project_video(
 
         # Title line 2 - centered, below line 1
         if title_line2:
+            underlined_title = "".join(f"{char}\u0332" for char in title_line2)
             filters.append(
-                f"[{current_label}]drawtext=text='{_escape_drawtext(title_line2)}':"
-                f"fontsize=42:fontcolor=yellow:borderw=3:bordercolor=black:"
-                f"x=(w-text_w)/2:y=180:"
+                f"[{current_label}]drawtext=text='{_escape_drawtext(underlined_title)}':"
+                f"fontsize=32:fontcolor=yellow:borderw=3:bordercolor=black:"
+                f"x=(w-text_w)/2:y=110:"
                 f"fontfile='{font_path}'[vout]"
             )
         else:
@@ -202,23 +230,27 @@ def render_project_video(
         # No title - rename vsub to vout
         filters.append("[vsub]null[vout]")
     filters.append(
-        f"[{len(scene_paths)}:a]apad,atrim=duration={total_duration:.3f},"
+        f"[1:a]apad,atrim=duration={total_duration:.3f},"
         "asetpts=PTS-STARTPTS[aout]"
     )
     filter_script = output_path.parent / "ffmpeg_filter.txt"
     filter_script.write_text(";\n".join(filters), encoding="utf-8")
 
     command.extend([
+        "-filter_complex_threads",
+        "1",
         "-filter_complex_script",
-        str(filter_script),
+        str(filter_script.resolve()),
         "-map",
         "[vout]",
         "-map",
         "[aout]",
         "-c:v",
         "libx264",
+        "-threads",
+        "2",
         "-preset",
-        "medium",
+        "fast",
         "-crf",
         "20",
         "-c:a",
@@ -229,18 +261,21 @@ def render_project_video(
         "+faststart",
         "-t",
         f"{total_duration:.3f}",
-        str(output_path),
+        str(output_path.resolve()),
     ])
-    _run(command, cwd=output_path.parent)
-    filter_script.unlink(missing_ok=True)
+    try:
+        _run(command, cwd=output_path.parent)
+    finally:
+        filter_script.unlink(missing_ok=True)
+        concat_script.unlink(missing_ok=True)
 
     probe = probe_media(output_path)
     duration_delta = abs(probe["duration_sec"] - total_duration)
     probe.update({
         "expected_duration_sec": round(total_duration, 3),
         "duration_delta_sec": round(duration_delta, 3),
-        "transition": "fade",
-        "transition_sec": transition_sec,
+        "transition": "cut",
+        "transition_sec": 0,
         "subtitles_burned_in": True,
         "passed": (
             probe["width"] == 1080
@@ -373,9 +408,17 @@ def create_jianying_native_draft(
             ),
             "voice",
         )
+    # Use 思源圆体 (ResourceHanRounded) — the closest built-in rounded font
+    # to 文源圆体 in Jianying. Falls back gracefully if unavailable.
+    try:
+        jianying_font = draft.FontType.ResourceHanRoundedCN_Bold
+    except AttributeError:
+        jianying_font = None
+
     subtitle_reference = draft.TextSegment(
         "字幕",
         draft.Timerange(0, 1_000_000),
+        font=jianying_font,
         style=draft.TextStyle(
             size=15,
             bold=True,
@@ -396,27 +439,51 @@ def create_jianying_native_draft(
         clip_settings=None,
     )
 
-    # Add title text overlay in top area of the video
-    if title_line1 or title_line2:
-        title_text = f"{title_line1}\n{title_line2}".strip()
-        title_duration_us = min(audio_duration_us, 5_000_000)  # Show for max 5 seconds
-        title_segment = draft.TextSegment(
-            title_text,
-            draft.Timerange(0, title_duration_us),
-            style=draft.TextStyle(
-                size=28,
-                bold=True,
-                color=(1.0, 0.86, 0.0),
-                align=1,
-                auto_wrapping=True,
+    # Keep both title lines centered at the very top for the full video.
+    title_duration_us = max(audio_duration_us, 1)
+    title_border = draft.TextBorder(
+        color=(0.0, 0.0, 0.0),
+        width=20.0,
+    )
+    if title_line1:
+        script.add_track(draft.TrackType.text, "title_line1")
+        script.add_segment(
+            draft.TextSegment(
+                title_line1,
+                draft.Timerange(0, title_duration_us),
+                font=jianying_font,
+                style=draft.TextStyle(
+                    size=16,
+                    bold=True,
+                    color=(1.0, 1.0, 1.0),
+                    align=1,
+                    auto_wrapping=False,
+                ),
+                border=title_border,
+                clip_settings=draft.ClipSettings(transform_y=0.86),
             ),
-            border=draft.TextBorder(
-                color=(0.0, 0.0, 0.0),
-                width=15.0,
-            ),
-            clip_settings=draft.ClipSettings(transform_y=0.35),
+            "title_line1",
         )
-        script.add_segment(title_segment, "subtitle")
+    if title_line2:
+        script.add_track(draft.TrackType.text, "title_line2")
+        script.add_segment(
+            draft.TextSegment(
+                title_line2,
+                draft.Timerange(0, title_duration_us),
+                font=jianying_font,
+                style=draft.TextStyle(
+                    size=16,
+                    bold=True,
+                    underline=True,
+                    color=(1.0, 0.86, 0.0),
+                    align=1,
+                    auto_wrapping=False,
+                ),
+                border=title_border,
+                clip_settings=draft.ClipSettings(transform_y=0.72),
+            ),
+            "title_line2",
+        )
 
     script.save()
     cover_report = None

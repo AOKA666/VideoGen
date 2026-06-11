@@ -403,7 +403,11 @@ def _build_shot_visuals_prompt(shot_items: list[dict], full_script: str) -> str:
 7. 禁止使用"老照片""历史档案""历史画面""纪实画面""相关画面"等泛化无意义词。
 8. 画面描述要具体、可搜索，避免"相关画面""历史画面""纪实画面"等泛化描述。
 9. 人物识别规则：如果画面主体是独立人物，必须尽量给出该人物的真名（如"钱学森""邓稼先"），严禁使用"女科学家""男教授""老妇人""中年男人"等泛化描述代替人名。只有确实无法确认身份的群像或路人角色才可用泛化词。
-10. 只输出严格 JSON，不要 Markdown。
+10. 人物性别（person_gender）必须根据全文和人物身份准确判断，只能填写 female、male、mixed、none、unknown。女性主体填 female，男性主体填 male，明确包含不同性别人物填 mixed，没有人物填 none，确实无法判断才填 unknown。不得根据科学家、军人、工程师等职业刻板猜测性别。
+11. 人物姓名（person_names）列出画面中具体人物的姓名，仅用于系统内部识别；没有具体人物则返回空数组。
+12. 匿名外貌描述（person_description）不得包含任何人物姓名，只描述性别、年龄段、脸型、发型、服装和气质，例如"八十岁左右的中国女性科学家，短灰发，清瘦脸型，戴细框眼镜，穿深色朴素外套，神情专注"。没有人物则返回空字符串。
+13. visual_need 可以保留具体人物姓名以服务图片搜索，但人物性别必须与 person_gender 一致。
+14. 只输出严格 JSON，不要 Markdown。
 
 全文背景（仅用于消除歧义）：
 {full_script}
@@ -417,6 +421,9 @@ def _build_shot_visuals_prompt(shot_items: list[dict], full_script: str) -> str:
     {{
       "id": "分镜编号",
       "visual_need": "画面描述：描述这个镜头应该展示什么具体画面",
+      "person_gender": "female|male|mixed|none|unknown",
+      "person_names": ["具体人物姓名"],
+      "person_description": "不含姓名的性别、年龄段和大概外貌描述",
       "search_keywords": ["搜索关键词1", "搜索关键词2"],
       "object_tags": ["主体1", "主体2"],
       "scene_tags": ["场景1"],
@@ -470,13 +477,27 @@ def ai_generate_shot_visuals(shots: list[dict], full_script: str) -> dict[str, d
             for item in result.get("shots", []):
                 shot_id = str(item.get("id") or item.get("shot_index") or "")
                 visual_need = str(item.get("visual_need") or "").strip()
+                person_gender = str(item.get("person_gender") or "unknown").strip().lower()
+                if person_gender not in {"female", "male", "mixed", "none", "unknown"}:
+                    person_gender = "unknown"
+                person_names = [str(k).strip() for k in (item.get("person_names") or []) if str(k).strip()]
+                person_description = str(item.get("person_description") or "").strip()
+                for person_name in person_names:
+                    person_description = person_description.replace(person_name, "")
+                person_description = re.sub(r"\s+", " ", person_description).strip(" ，,。")
                 search_keywords = [str(k).strip() for k in (item.get("search_keywords") or []) if str(k).strip()]
                 object_tags = [str(k).strip() for k in (item.get("object_tags") or []) if str(k).strip()]
                 scene_tags = [str(k).strip() for k in (item.get("scene_tags") or []) if str(k).strip()]
                 keywords = [str(k).strip() for k in (item.get("keywords") or []) if str(k).strip()]
-                if visual_need or search_keywords or object_tags or scene_tags or keywords:
+                if (
+                    visual_need or person_names or person_description or search_keywords
+                    or object_tags or scene_tags or keywords or person_gender != "unknown"
+                ):
                     all_visuals[shot_id] = {
                         "visual_need": visual_need,
+                        "person_gender": person_gender,
+                        "person_names": person_names,
+                        "person_description": person_description,
                         "search_keywords": search_keywords,
                         "object_tags": object_tags,
                         "scene_tags": scene_tags,
@@ -497,7 +518,7 @@ def generate_viral_title(script: str) -> dict:
     prompt = (
         "你是爆款短视频标题专家。请根据以下文案内容，生成一个两行式爆款标题。"
         "\n\n标题规则："
-        "\n1. 必须生成两行文字，第一行短（5-12字），第二行稍长（5-12字），总共不超过24字。"
+        "\n1. 必须生成两行文字，每行5-9字，任何一行都不能超过9个字。"
         "\n2. 标题要制造悬念或反差，让用户忍不住点开。"
         "\n3. 以下是爆款标题示范格式，请学习其逻辑但不要照搬："
         "\n   - 第一行：飞机坠毁前 / 第二行：他用身体护住了国家机密"
@@ -541,12 +562,14 @@ def generate_viral_title(script: str) -> dict:
         if isinstance(content, list):
             content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
         result = json.loads(extract_json(str(content)))
-        line1 = str(result.get("line1", "")).strip()[:12]
-        line2 = str(result.get("line2", "")).strip()[:12]
+        line1 = str(result.get("line1", "")).strip()
+        line2 = str(result.get("line2", "")).strip()
         # Strip any punctuation that the model might still produce
         _punct_pat = re.compile(r"[，。！？、；：“”‘’《》【】（）—…\-.!?,;:'\"()\[\]{}<>]")
         line1 = _punct_pat.sub("", line1).strip()
         line2 = _punct_pat.sub("", line2).strip()
+        line1 = line1[:9]
+        line2 = line2[:9]
         return {"line1": line1, "line2": line2, "full_title": f"{line1} {line2}"}
     except Exception as exc:
         return {"line1": "", "line2": "", "full_title": "", "error": str(exc)[:200]}
@@ -594,6 +617,9 @@ def generate_shots(script: str) -> list[dict]:
             "start_time": round(cursor, 2),
             "end_time": round(cursor + duration, 2),
             "visual_need": visual_need,
+            "person_gender": "unknown",
+            "person_names": [],
+            "person_description": "",
             "required_object": required_object,
             "required_scene": required_scene,
             "object_tags": required_object,
@@ -614,6 +640,12 @@ def generate_shots(script: str) -> list[dict]:
         if visual:
             if visual.get("visual_need"):
                 shot["visual_need"] = visual["visual_need"]
+            if visual.get("person_gender"):
+                shot["person_gender"] = visual["person_gender"]
+            if visual.get("person_names"):
+                shot["person_names"] = visual["person_names"]
+            if visual.get("person_description"):
+                shot["person_description"] = visual["person_description"]
             if visual.get("search_keywords"):
                 shot["search_keywords"] = visual["search_keywords"]
             if visual.get("object_tags"):

@@ -18,9 +18,154 @@ from json import JSONDecoder
 from pathlib import Path
 from uuid import uuid4
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from services.store import public_url
+
+
+FEMALE_PERSON_HINTS = {
+    "黄令仪", "王承书", "屠呦呦", "林巧稚", "吴健雄", "何泽慧", "叶叔华",
+}
+MALE_PERSON_HINTS = {
+    "钱学森", "邓稼先", "于敏", "黄旭华", "郭永怀", "袁隆平", "王淦昌",
+    "赵忠尧", "汤飞凡", "顾维钧", "王伟",
+}
+PERSON_APPEARANCE_HINTS = {
+    "黄令仪": "八十岁左右的中国女性科学家，短灰发，清瘦脸型，戴细框眼镜，穿深色朴素外套，神情专注坚毅",
+    "王承书": "中老年中国女性科学家，短发整洁，清瘦脸型，穿朴素年代感外套，神情沉静坚定",
+    "屠呦呦": "老年中国女性科学家，短灰发，面容清瘦，穿朴素深色外套，气质沉稳",
+    "钱学森": "中老年中国男性科学家，短发整齐，清瘦脸型，穿深色中山装或朴素西装，神情严谨",
+    "邓稼先": "中年中国男性科学家，短发，方圆脸型，穿朴素年代感外套，神情沉稳专注",
+    "黄旭华": "老年中国男性工程师，短灰发，清瘦脸型，戴眼镜，穿朴素深色外套，神情坚毅",
+    "赵忠尧": "中年中国男性科学家，短发，清瘦脸型，穿朴素长衫或年代感外套，神情坚毅",
+}
+ALL_PERSON_HINTS = FEMALE_PERSON_HINTS | MALE_PERSON_HINTS | set(PERSON_APPEARANCE_HINTS)
+COMMON_CHINESE_SURNAMES = set(
+    "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜"
+    "戚谢邹喻柏水窦章云苏潘葛奚范彭郎鲁韦昌马苗凤花方俞任袁柳鲍史唐费"
+    "廉岑薛雷贺倪汤滕殷罗毕郝邬安常乐于傅皮卞齐康伍余元顾孟平黄和穆"
+    "萧尹姚邵汪祁毛禹狄米贝明臧计伏成戴谈宋茅庞熊纪舒屈项祝董梁杜阮"
+    "蓝闵席季麻强贾路娄危江童颜郭梅盛林刁钟徐邱骆高夏蔡田樊胡凌霍虞"
+    "万支柯昝管卢莫经房裘缪干解应宗丁宣邓郁单杭洪包诸左石崔吉龚程嵇"
+    "邢滑裴陆荣翁荀羊甄曲家封芮羿储靳汲邴糜松井段富巫乌焦巴弓牧隗山"
+    "谷车侯宓蓬全郗班仰秋仲伊宫宁仇栾暴甘厉戎祖武符刘景詹束龙叶幸司"
+    "黎乔苍双闻莘党翟谭贡劳逄姬申扶堵冉宰郦雍郤璩桑桂濮牛寿通边扈燕"
+    "冀郏浦尚农温别庄晏柴瞿阎连习容向古易廖庾终暨居衡步都耿满弘匡国"
+    "文寇广禄阙东欧沃利蔚越夔隆师巩聂晁勾敖融冷訾辛阚那简饶空曾毋沙"
+    "养鞠须丰巢关蒯相查后荆红游竺权逯盖益桓公"
+)
+
+
+def infer_shot_person_gender(shot: dict) -> str:
+    declared = str(shot.get("person_gender") or "").strip().lower()
+    aliases = {
+        "female": "female", "女": "female", "女性": "female",
+        "male": "male", "男": "male", "男性": "male",
+        "mixed": "mixed", "混合": "mixed", "男女": "mixed",
+        "none": "none", "无人": "none", "无人物": "none",
+        "unknown": "unknown", "未知": "unknown",
+    }
+    if aliases.get(declared) in {"female", "male", "mixed", "none"}:
+        return aliases[declared]
+
+    visual_parts = [
+        shot.get("visual_need"),
+        *(shot.get("object_tags") or []),
+        *(shot.get("required_object") or []),
+        *(shot.get("keywords") or []),
+    ]
+    contexts = [
+        " ".join(str(part or "") for part in visual_parts),
+        str(shot.get("voice_text") or ""),
+    ]
+    for context in contexts:
+        female = any(name in context for name in FEMALE_PERSON_HINTS) or bool(re.search(
+            r"女科学家|女工程师|女军人|女医生|女士|女性|老妇人|老奶奶|母亲|妈妈|妻子|女儿|她(?!们)",
+            context,
+        ))
+        male = any(name in context for name in MALE_PERSON_HINTS) or bool(re.search(
+            r"男科学家|男工程师|男军人|男医生|男士|男性|老先生|老爷爷|父亲|爸爸|丈夫|儿子|他(?!们)",
+            context,
+        ))
+        if female and male:
+            return "mixed"
+        if female:
+            return "female"
+        if male:
+            return "male"
+    return "unknown"
+
+
+def person_gender_instruction(shot: dict) -> str:
+    gender = infer_shot_person_gender(shot)
+    instructions = {
+        "female": (
+            "人物性别硬约束：主要人物必须是女性，保持女性面部、体态和身份特征；"
+            "严禁把该人物画成男性。"
+        ),
+        "male": (
+            "人物性别硬约束：主要人物必须是男性，保持男性面部、体态和身份特征；"
+            "严禁把该人物画成女性。"
+        ),
+        "mixed": "人物性别硬约束：画面包含男性和女性，按画面描述保留各自正确性别，不得互换。",
+    }
+    return instructions.get(gender, "")
+
+
+def _shot_person_names(shot: dict) -> list[str]:
+    explicit = [str(name).strip() for name in (shot.get("person_names") or []) if str(name).strip()]
+    tagged_names = []
+    for item in [
+        *(shot.get("object_tags") or []),
+        *(shot.get("required_object") or []),
+    ]:
+        candidate = str(item or "").strip()
+        if (
+            2 <= len(candidate) <= 4
+            and candidate[0] in COMMON_CHINESE_SURNAMES
+            and re.fullmatch(r"[\u4e00-\u9fff]+", candidate)
+        ):
+            tagged_names.append(candidate)
+    context = " ".join([
+        str(shot.get("visual_need") or ""),
+        str(shot.get("voice_text") or ""),
+        *[str(item) for item in (shot.get("object_tags") or [])],
+        *[str(item) for item in (shot.get("required_object") or [])],
+    ])
+    inferred = [name for name in ALL_PERSON_HINTS if name in context]
+    return list(dict.fromkeys(explicit + tagged_names + inferred))
+
+
+def _anonymous_person_description(shot: dict, person_names: list[str]) -> str:
+    description = str(shot.get("person_description") or "").strip()
+    for name in person_names:
+        description = description.replace(name, "")
+    description = re.sub(r"\s+", " ", description).strip(" ，,。")
+    if description:
+        return description
+
+    mapped = [PERSON_APPEARANCE_HINTS[name] for name in person_names if name in PERSON_APPEARANCE_HINTS]
+    if mapped:
+        return "；".join(mapped)
+
+    gender = infer_shot_person_gender(shot)
+    age_context = f"{shot.get('visual_need') or ''} {shot.get('voice_text') or ''}"
+    age = "老年" if re.search(r"八十|九十|老年|年迈|白发|灰发", age_context) else "中年"
+    descriptions = {
+        "female": f"{age}中国女性，五官自然，发型朴素，穿符合时代背景的简洁服装，神情真实",
+        "male": f"{age}中国男性，五官自然，短发整齐，穿符合时代背景的简洁服装，神情真实",
+        "mixed": "不同性别的中国人物，年龄和服装符合画面时代背景，五官自然，神情真实",
+    }
+    return descriptions.get(gender, "")
+
+
+def _remove_person_names(text: str, person_names: list[str]) -> str:
+    cleaned = str(text or "")
+    for name in sorted(person_names, key=len, reverse=True):
+        cleaned = cleaned.replace(name, "")
+    cleaned = re.sub(r"([，、]\s*){2,}", "，", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip(" ，,、。")
 
 
 def generate_svg_placeholder(path: Path, shot: dict) -> str:
@@ -50,10 +195,19 @@ def generate_svg_placeholder(path: Path, shot: dict) -> str:
 
 
 def build_image_prompt(shot: dict) -> str:
+    person_names = _shot_person_names(shot)
+    visual_need = _remove_person_names(
+        str(shot.get("visual_need") or "历史纪实画面"),
+        person_names,
+    )
+    person_description = _anonymous_person_description(shot, person_names)
+    gender_instruction = person_gender_instruction(shot)
     return (
         "真实历史纪实影像风格，档案照片质感，克制色彩，电影级构图，"
-        f"画面需求：{shot.get('visual_need', '历史纪实画面')}。"
-        f"旁白语境：{shot.get('voice_text', '')}。"
+        f"画面需求：{visual_need or '历史纪实人物场景'}。"
+        f"{f'人物外貌：{person_description}。' if person_description else ''}"
+        f"{gender_instruction}"
+        "不要出现真实人物姓名，不要求复刻任何特定真人的精确面孔。"
         "不要生成文字、水印、Logo，不要夸张奇幻，不要过度美化。"
     )
 
@@ -148,6 +302,7 @@ def generate_doubao_image(path: Path, shot: dict, video_ratio: str | None = "9:1
     if not api_key:
         raise RuntimeError("ARK_API_KEY is not configured")
 
+    person_gender = infer_shot_person_gender(shot)
     prompt = build_image_prompt(shot)
     payload = {
         "model": ark_image_model(),
@@ -189,6 +344,7 @@ def generate_doubao_image(path: Path, shot: dict, video_ratio: str | None = "9:1
         "remote_url": image_url,
         "image_size": payload["size"],
         "seed": body.get("seed"),
+        "person_gender": person_gender,
     }
 
 
@@ -295,17 +451,22 @@ def generate_seedream_cover(
 
 
 def _find_chinese_font(size: int) -> ImageFont.FreeTypeFont:
-    """Find a suitable Chinese font on Windows, falling back to default."""
+    """Find a suitable Chinese font, prioritizing 文源圆体, falling back to default."""
+    project_root = Path(__file__).resolve().parent.parent.parent.parent
     candidates = [
+        project_root / "WenYuanRoundedSCVF.ttf",  # 文源圆体 (bundled)
+        Path("C:/Windows/Fonts/WenYuanRoundedSCVF.ttf"),  # 文源圆体 (system)
         "C:/Windows/Fonts/msyhbd.ttc",   # Microsoft YaHei Bold
         "C:/Windows/Fonts/msyh.ttc",      # Microsoft YaHei
         "C:/Windows/Fonts/simhei.ttf",    # SimHei
         "C:/Windows/Fonts/simsun.ttc",    # SimSun
     ]
     for font_path in candidates:
-        if os.path.exists(font_path):
+        if isinstance(font_path, str):
+            font_path = Path(font_path)
+        if font_path.exists():
             try:
-                return ImageFont.truetype(font_path, size)
+                return ImageFont.truetype(str(font_path), size)
             except Exception:
                 continue
     return ImageFont.load_default()
@@ -355,6 +516,80 @@ def overlay_title_on_cover(cover_path: Path, line1: str, line2: str) -> None:
         # Convert back to RGB for PNG save (preserve format)
         result = result.convert("RGB")
         result.save(cover_path, format="PNG", optimize=True)
+
+
+def compose_uploaded_cover(source_path: Path, cover_path: Path, line1: str, line2: str) -> None:
+    """Compose a cover inside a centered 1080x1440 content area."""
+    canvas_width, canvas_height = 1080, 1920
+    content_top = (canvas_height - 1440) // 2
+    content_bottom = content_top + 1440
+    portrait_size = 960
+    portrait_x = (canvas_width - portrait_size) // 2
+    portrait_y = content_top
+    corner_radius = 56
+
+    with Image.open(source_path) as source:
+        source = ImageOps.exif_transpose(source).convert("RGB")
+        portrait = ImageOps.fit(
+            source,
+            (portrait_size, portrait_size),
+            method=Image.Resampling.LANCZOS,
+            centering=(0.5, 0.5),
+        )
+
+    canvas = Image.new("RGB", (canvas_width, canvas_height), (0, 0, 0))
+    portrait_mask = Image.new("L", (portrait_size, portrait_size), 0)
+    ImageDraw.Draw(portrait_mask).rounded_rectangle(
+        (0, 0, portrait_size - 1, portrait_size - 1),
+        radius=corner_radius,
+        fill=255,
+    )
+    canvas.paste(portrait, (portrait_x, portrait_y), portrait_mask)
+    draw = ImageDraw.Draw(canvas)
+
+    stroke_width = 8
+    line_gap = 30
+    title_area_top = portrait_y + portrait_size + 70
+    title_area_height = content_bottom - title_area_top
+    max_text_width = canvas_width - 80
+
+    font_size = 104
+    while True:
+        font = _find_chinese_font(font_size)
+        try:
+            font.set_variation_by_name("Heavy")
+        except (AttributeError, OSError):
+            pass
+        line_boxes = [
+            draw.textbbox((0, 0), line, font=font, stroke_width=stroke_width)
+            for line in (line1, line2)
+        ]
+        line_heights = [box[3] - box[1] for box in line_boxes]
+        total_height = sum(line_heights) + line_gap
+        widest_line = max(box[2] - box[0] for box in line_boxes)
+        if (widest_line <= max_text_width and total_height <= title_area_height) or font_size <= 64:
+            break
+        font_size -= 4
+
+    line_heights = [box[3] - box[1] for box in line_boxes]
+    total_height = sum(line_heights) + line_gap
+    y = title_area_top + max(0, (title_area_height - total_height) // 2)
+
+    for line, box, line_height in zip((line1, line2), line_boxes, line_heights):
+        line_width = box[2] - box[0]
+        x = (canvas_width - line_width) // 2 - box[0]
+        draw.text(
+            (x, y),
+            line,
+            font=font,
+            fill=(255, 220, 0),
+            stroke_width=stroke_width,
+            stroke_fill=(0, 0, 0),
+        )
+        y += line_height + line_gap
+
+    cover_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(cover_path, format="PNG", optimize=True)
 
 
 def write_silent_wav(path: Path, duration_sec: float) -> None:

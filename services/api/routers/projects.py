@@ -131,8 +131,12 @@ def update_script(project_id: str, payload: ScriptUpdate):
         project["rewritten_script"] = payload.rewritten_script
         project["status"] = "script_ready"
     if payload.title_line1 is not None:
+        if len(payload.title_line1.strip()) > 9:
+            raise HTTPException(400, "Title line 1 must not exceed 9 characters")
         project["title_line1"] = payload.title_line1
     if payload.title_line2 is not None:
+        if len(payload.title_line2.strip()) > 9:
+            raise HTTPException(400, "Title line 2 must not exceed 9 characters")
         project["title_line2"] = payload.title_line2
     if payload.title_line1 is not None or payload.title_line2 is not None:
         project["title_full"] = f"{payload.title_line1 or ''} {payload.title_line2 or ''}"

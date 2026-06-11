@@ -6,16 +6,15 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, HTTPException, UploadFile
 from PIL import Image, ImageOps
 from pydantic import BaseModel
 
 from services.asset_service import new_id
 from services.generation_service import (
+    compose_uploaded_cover,
     generate_doubao_image,
     generate_export_srt,
-    generate_seedream_cover,
-    overlay_title_on_cover,
     remove_watermark_with_seedream,
     synthesize_project_voice,
     write_timeline,
@@ -29,11 +28,6 @@ router = APIRouter(prefix="/api/projects", tags=["generation"])
 class VoicePayload(BaseModel):
     voice_type: str | None = None
     speech_rate: int | None = None
-
-
-class CoverPayload(BaseModel):
-    title: str
-    subtitle: str = ""
 
 
 def _generated_image(db: dict, project_id: str, asset_id: str) -> tuple[dict, Path]:
@@ -234,6 +228,7 @@ def generate_image(project_id: str, shot_id: str):
         "provider": result.get("provider"),
         "model": result.get("model"),
         "image_size": result.get("image_size"),
+        "person_gender": result.get("person_gender"),
         "remote_url": result.get("remote_url"),
         "seed": result.get("seed"),
         "file_url": public_url(out),
@@ -252,6 +247,7 @@ def generate_image(project_id: str, shot_id: str):
         "provider": result.get("provider"),
         "model": result.get("model"),
         "image_size": result.get("image_size"),
+        "person_gender": result.get("person_gender"),
         "status": "success",
     }
 
@@ -338,45 +334,44 @@ def generate_title(project_id: str):
 
 
 @router.post("/{project_id}/generate-cover")
-def generate_cover(project_id: str, payload: CoverPayload):
+def generate_cover(project_id: str, file: UploadFile = File(...)):
     db = load_db()
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
         raise HTTPException(404, "Project not found")
-    if not payload.title.strip():
-        raise HTTPException(400, "Cover title is required")
 
-    cover_path = project_dir(project_id) / "cover" / "cover.png"
+    title_line1 = str(project.get("title_line1") or "").strip()
+    title_line2 = str(project.get("title_line2") or "").strip()
+    if not title_line1 or not title_line2:
+        raise HTTPException(400, "Please confirm the two-line title before generating the cover")
+    if len(title_line1) > 9 or len(title_line2) > 9:
+        raise HTTPException(400, "Each title line must not exceed 9 characters")
+    if not str(file.content_type or "").startswith("image/"):
+        raise HTTPException(400, "Please upload an image file")
+
+    cover_dir = project_dir(project_id) / "cover"
+    cover_dir.mkdir(parents=True, exist_ok=True)
+    source_path = cover_dir / "portrait-upload"
+    cover_path = cover_dir / "cover.png"
     try:
-        # When two-line title exists, skip AI text rendering and use Pillow overlay instead
-        title_line1 = project.get("title_line1", "")
-        title_line2 = project.get("title_line2", "")
-        has_two_line_title = bool(title_line1 and title_line2)
-
-        result = generate_seedream_cover(
-            cover_path,
-            project,
-            payload.title,
-            payload.subtitle,
-            skip_text=has_two_line_title,
-        )
-        _normalize_image_format(cover_path)
-
-        # Overlay title text on the cover image if two-line title exists
-        if has_two_line_title:
-            overlay_title_on_cover(cover_path, title_line1, title_line2)
-
+        with source_path.open("wb") as target:
+            shutil.copyfileobj(file.file, target)
+        if source_path.stat().st_size > 20 * 1024 * 1024:
+            raise ValueError("Uploaded image must not exceed 20 MB")
+        compose_uploaded_cover(source_path, cover_path, title_line1, title_line2)
     except Exception as exc:
-        raise HTTPException(502, str(exc)) from exc
+        source_path.unlink(missing_ok=True)
+        raise HTTPException(400, f"Cover image processing failed: {exc}") from exc
 
     now = datetime.now().isoformat(timespec="seconds")
     project.update({
         "cover_url": public_url(cover_path),
-        "cover_title": result["title"],
-        "cover_subtitle": result["subtitle"],
-        "cover_prompt": result["prompt"],
-        "cover_provider": result["provider"],
-        "cover_model": result["model"],
+        "cover_source_url": public_url(source_path),
+        "cover_title": f"{title_line1} {title_line2}",
+        "cover_subtitle": "",
+        "cover_prompt": "",
+        "cover_provider": "uploaded_image",
+        "cover_model": "pillow_composite",
         "cover_updated_at": now,
         "updated_at": now,
     })
@@ -385,10 +380,10 @@ def generate_cover(project_id: str, payload: CoverPayload):
         "status": "success",
         "cover_url": project["cover_url"],
         "title": project["cover_title"],
-        "subtitle": project["cover_subtitle"],
-        "provider": result["provider"],
-        "model": result["model"],
-        "image_size": result["image_size"],
+        "subtitle": "",
+        "provider": project["cover_provider"],
+        "model": project["cover_model"],
+        "image_size": "1080x1920",
     }
 
 

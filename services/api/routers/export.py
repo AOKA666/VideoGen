@@ -89,6 +89,8 @@ def export_assets(
             "voice_text",
             "duration_sec",
             "visual_need",
+            "person_gender",
+            "person_description",
             "required_object",
             "required_scene",
             "status",
@@ -184,7 +186,7 @@ def export_assets(
                 title_line1=project.get("title_line1", ""),
                 title_line2=project.get("title_line2", ""),
             )
-    except RuntimeError as exc:
+    except Exception as exc:
         raise HTTPException(500, f"Failed to generate export deliverables: {exc}") from exc
     verification = {
         "output": output,
