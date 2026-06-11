@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import html
@@ -16,6 +17,8 @@ from difflib import SequenceMatcher
 from json import JSONDecoder
 from pathlib import Path
 from uuid import uuid4
+
+from PIL import Image, ImageDraw, ImageFont
 
 from services.store import public_url
 
@@ -194,6 +197,7 @@ def generate_seedream_cover(
     project: dict,
     title: str,
     subtitle: str = "",
+    skip_text: bool = False,
 ) -> dict:
     api_key = os.getenv("ARK_API_KEY", "").strip()
     if not api_key:
@@ -210,25 +214,36 @@ def generate_seedream_cover(
         ]
         subtitle = candidates[0] if candidates else ""
     subtitle = subtitle[:28]
-    prompt = (
-        "为一条中文纪实短视频设计专业竖版封面，画布比例9:16。"
-        "根据视频主题设计有冲击力的主体画面，纪实电影海报风格，真实摄影质感，"
-        "构图简洁，主体明确，高对比度，适合手机信息流展示。"
-        f"视频主题：{project.get('name') or title}。"
-        f"文案背景：{script[:260]}。"
-        f"封面必须清晰准确地排版主标题“{title}”，"
-        "主标题使用高饱和亮黄色中文粗体，并添加清晰醒目的黑色粗描边。"
-    )
-    if subtitle:
-        prompt += (
-            f"主标题下方排版较小的副标题“{subtitle}”，"
-            "副标题同样使用黄色粗体和黑色描边。"
+    if skip_text:
+        prompt = (
+            "为一条中文纪实短视频设计专业竖版封面，画布比例9:16。"
+            "根据视频主题设计有冲击力的主体画面，纪实电影海报风格，真实摄影质感，"
+            "构图简洁，主体明确，高对比度，适合手机信息流展示。"
+            f"视频主题：{project.get('name') or title}。"
+            f"文案背景：{script[:260]}。"
+            "画面中央偏上区域留出较大空白，不要在画面中放置任何文字、标题或字幕。"
+            "不添加Logo、平台角标或水印。"
         )
-    prompt += (
-        "所有封面文字只能使用黄色字体、黑色描边，不使用白色或其他颜色；"
-        "字形端正，不能出现错别字、乱码、重复文字；"
-        "文字与背景有清晰层次和足够留白，不添加Logo、平台角标或水印。"
-    )
+    else:
+        prompt = (
+            "为一条中文纪实短视频设计专业竖版封面，画布比例9:16。"
+            "根据视频主题设计有冲击力的主体画面，纪实电影海报风格，真实摄影质感，"
+            "构图简洁，主体明确，高对比度，适合手机信息流展示。"
+            f"视频主题：{project.get('name') or title}。"
+            f"文案背景：{script[:260]}。"
+            f"封面必须清晰准确地排版主标题「{title}」，"
+            "主标题使用高饱和亮黄色中文粗体，并添加清晰醒目的黑色粗描边。"
+        )
+        if subtitle:
+            prompt += (
+                f"主标题下方排版较小的副标题「{subtitle}」，"
+                "副标题同样使用黄色粗体和黑色描边。"
+            )
+        prompt += (
+            "所有封面文字只能使用黄色字体、黑色描边，不使用白色或其他颜色；"
+            "字形端正，不能出现错别字、乱码、重复文字；"
+            "文字与背景有清晰层次和足够留白，不添加Logo、平台角标或水印。"
+        )
     payload = {
         "model": ark_image_model(),
         "prompt": prompt,
@@ -277,6 +292,69 @@ def generate_seedream_cover(
         "subtitle": subtitle,
         "seed": body.get("seed"),
     }
+
+
+def _find_chinese_font(size: int) -> ImageFont.FreeTypeFont:
+    """Find a suitable Chinese font on Windows, falling back to default."""
+    candidates = [
+        "C:/Windows/Fonts/msyhbd.ttc",   # Microsoft YaHei Bold
+        "C:/Windows/Fonts/msyh.ttc",      # Microsoft YaHei
+        "C:/Windows/Fonts/simhei.ttf",    # SimHei
+        "C:/Windows/Fonts/simsun.ttc",    # SimSun
+    ]
+    for font_path in candidates:
+        if os.path.exists(font_path):
+            try:
+                return ImageFont.truetype(font_path, size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
+
+
+def overlay_title_on_cover(cover_path: Path, line1: str, line2: str) -> None:
+    """Overlay two-line title text centered on the cover image."""
+    with Image.open(cover_path) as img:
+        img = img.convert("RGBA")
+        width, height = img.size
+
+        # Create a transparent overlay for text
+        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+
+        font_size = max(60, width // 14)
+        font = _find_chinese_font(font_size)
+
+        # Calculate text positions - centered horizontally, positioned in upper-center area
+        line1_bbox = draw.textbbox((0, 0), line1, font=font)
+        line2_bbox = draw.textbbox((0, 0), line2, font=font)
+        line1_w = line1_bbox[2] - line1_bbox[0]
+        line2_w = line2_bbox[2] - line2_bbox[0]
+        line_h = line1_bbox[3] - line1_bbox[1]
+
+        line_spacing = font_size // 3
+        total_text_h = line_h * 2 + line_spacing
+        start_y = int(height * 0.35) - total_text_h // 2
+
+        line1_x = (width - line1_w) // 2
+        line2_x = (width - line2_w) // 2
+        line1_y = start_y
+        line2_y = start_y + line_h + line_spacing
+
+        # Draw black stroke (outline) then yellow fill for each line
+        stroke_width = max(4, font_size // 15)
+        for text, x, y in [(line1, line1_x, line1_y), (line2, line2_x, line2_y)]:
+            # Draw stroke in 8 directions
+            for dx in range(-stroke_width, stroke_width + 1):
+                for dy in range(-stroke_width, stroke_width + 1):
+                    if dx * dx + dy * dy <= stroke_width * stroke_width:
+                        draw.text((x + dx, y + dy), text, font=font, fill=(0, 0, 0, 255))
+            # Draw main text in bright yellow
+            draw.text((x, y), text, font=font, fill=(255, 220, 0, 255))
+
+        result = Image.alpha_composite(img, overlay)
+        # Convert back to RGB for PNG save (preserve format)
+        result = result.convert("RGB")
+        result.save(cover_path, format="PNG", optimize=True)
 
 
 def write_silent_wav(path: Path, duration_sec: float) -> None:
@@ -379,7 +457,7 @@ def read_tts_response(response) -> bytes:
     return b"".join(chunks)
 
 
-def synthesize_volcengine_tts(text: str, voice_type: str | None = None) -> dict:
+def synthesize_volcengine_tts(text: str, voice_type: str | None = None, speech_rate: int | None = None) -> dict:
     api_key = os.getenv("VOLC_TTS_API_KEY", "").strip()
     app_id = os.getenv("VOLC_TTS_APP_ID", "").strip()
     access_key = os.getenv("VOLC_TTS_ACCESS_KEY", "").strip()
@@ -394,7 +472,7 @@ def synthesize_volcengine_tts(text: str, voice_type: str | None = None) -> dict:
             "audio_params": {
                 "format": "mp3",
                 "sample_rate": 24000,
-                "speech_rate": 0,
+                "speech_rate": speech_rate if speech_rate is not None else 0,
                 "loudness_rate": 0,
                 "enable_subtitle": True,
             },
@@ -596,7 +674,7 @@ def align_voice_to_script(path: Path, shots: list[dict], duration: float, senten
     }
 
 
-def synthesize_project_voice(path: Path, shots: list[dict], voice_type: str | None = None) -> dict:
+def synthesize_project_voice(path: Path, shots: list[dict], voice_type: str | None = None, speech_rate: int | None = None) -> dict:
     legacy_chunk_dir = path.parent / "voice_chunks"
     if legacy_chunk_dir.exists():
         shutil.rmtree(legacy_chunk_dir)
@@ -607,7 +685,7 @@ def synthesize_project_voice(path: Path, shots: list[dict], voice_type: str | No
     )
     if not full_text:
         raise RuntimeError("No voice text to synthesize")
-    response = synthesize_volcengine_tts(full_text, voice_type)
+    response = synthesize_volcengine_tts(full_text, voice_type, speech_rate)
     path.write_bytes(response["audio"])
     final_duration = audio_duration(path)
     alignment = align_voice_to_script(path, shots, final_duration, response.get("sentences") or [])

@@ -103,6 +103,8 @@ def render_project_video(
     subtitles_path: Path,
     output_path: Path,
     transition_sec: float = 0.5,
+    title_line1: str = "",
+    title_line2: str = "",
 ) -> dict[str, Any]:
     if len(shots) != len(scene_paths) or not shots:
         raise RuntimeError("Every shot must have one exported scene")
@@ -157,8 +159,48 @@ def render_project_video(
         f"[{video_label}]subtitles=filename='subtitles.srt':"
         "force_style='FontName=Microsoft YaHei,FontSize=15,"
         "PrimaryColour=&H0000FFFF,OutlineColour=&H00000000,"
-        "BorderStyle=1,Outline=0.8,Shadow=0,MarginV=500,Alignment=2'[vout]"
+        "BorderStyle=1,Outline=0.8,Shadow=0,MarginV=500,Alignment=2'[vsub]"
     )
+
+    # Overlay title text in top blank area if title lines are provided
+    if title_line1 or title_line2:
+        # Escape special characters for FFmpeg drawtext filter
+        def _escape_drawtext(text: str) -> str:
+            return (text
+                    .replace("\\", "\\\\\\\\")
+                    .replace("'", "'\\''")
+                    .replace(":", "\\\\:")
+                    .replace("%", "\\\\%"))
+
+        # Use fontfile path with forward slashes for cross-platform compatibility
+        font_path = "C:/Windows/Fonts/msyhbd.ttc"
+
+        # Title line 1 - centered, positioned in upper portion of top blank area
+        if title_line1:
+            filters.append(
+                f"[vsub]drawtext=text='{_escape_drawtext(title_line1)}':"
+                f"fontsize=42:fontcolor=yellow:borderw=3:bordercolor=black:"
+                f"x=(w-text_w)/2:y=120:"
+                f"fontfile='{font_path}'[vt1]"
+            )
+            current_label = "vt1"
+        else:
+            current_label = "vsub"
+
+        # Title line 2 - centered, below line 1
+        if title_line2:
+            filters.append(
+                f"[{current_label}]drawtext=text='{_escape_drawtext(title_line2)}':"
+                f"fontsize=42:fontcolor=yellow:borderw=3:bordercolor=black:"
+                f"x=(w-text_w)/2:y=180:"
+                f"fontfile='{font_path}'[vout]"
+            )
+        else:
+            # Rename current label to vout
+            filters.append(f"[{current_label}]null[vout]")
+    else:
+        # No title - rename vsub to vout
+        filters.append("[vsub]null[vout]")
     filters.append(
         f"[{len(scene_paths)}:a]apad,atrim=duration={total_duration:.3f},"
         "asetpts=PTS-STARTPTS[aout]"
@@ -272,6 +314,8 @@ def create_jianying_native_draft(
     audio_path: Path,
     subtitles_path: Path,
     cover_path: Path | None = None,
+    title_line1: str = "",
+    title_line2: str = "",
 ) -> dict[str, Any]:
     try:
         import pyJianYingDraft as draft
@@ -351,6 +395,29 @@ def create_jianying_native_draft(
         style_reference=subtitle_reference,
         clip_settings=None,
     )
+
+    # Add title text overlay in top area of the video
+    if title_line1 or title_line2:
+        title_text = f"{title_line1}\n{title_line2}".strip()
+        title_duration_us = min(audio_duration_us, 5_000_000)  # Show for max 5 seconds
+        title_segment = draft.TextSegment(
+            title_text,
+            draft.Timerange(0, title_duration_us),
+            style=draft.TextStyle(
+                size=28,
+                bold=True,
+                color=(1.0, 0.86, 0.0),
+                align=1,
+                auto_wrapping=True,
+            ),
+            border=draft.TextBorder(
+                color=(0.0, 0.0, 0.0),
+                width=15.0,
+            ),
+            clip_settings=draft.ClipSettings(transform_y=0.35),
+        )
+        script.add_segment(title_segment, "subtitle")
+
     script.save()
     cover_report = None
     if cover_path and cover_path.exists():

@@ -167,6 +167,8 @@ def export_assets(
                 copied_audio,
                 export_dir / "subtitles.srt",
                 export_dir / "final_video.mp4",
+                title_line1=project.get("title_line1", ""),
+                title_line2=project.get("title_line2", ""),
             )
             draft_report = None
         else:
@@ -179,6 +181,8 @@ def export_assets(
                 copied_audio,
                 export_dir / "subtitles.srt",
                 cover_source if cover_source.exists() else None,
+                title_line1=project.get("title_line1", ""),
+                title_line2=project.get("title_line2", ""),
             )
     except RuntimeError as exc:
         raise HTTPException(500, f"Failed to generate export deliverables: {exc}") from exc

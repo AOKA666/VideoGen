@@ -15,17 +15,20 @@ from services.generation_service import (
     generate_doubao_image,
     generate_export_srt,
     generate_seedream_cover,
+    overlay_title_on_cover,
     remove_watermark_with_seedream,
     synthesize_project_voice,
     write_timeline,
 )
 from services.store import load_db, project_dir, public_url, save_db
+from services.text_service import generate_viral_title
 
 router = APIRouter(prefix="/api/projects", tags=["generation"])
 
 
 class VoicePayload(BaseModel):
     voice_type: str | None = None
+    speech_rate: int | None = None
 
 
 class CoverPayload(BaseModel):
@@ -264,7 +267,7 @@ def generate_voice(project_id: str, payload: VoicePayload | None = None):
         raise HTTPException(400, "No shots")
     out = project_dir(project_id) / "audio" / "main_voice.mp3"
     try:
-        result = synthesize_project_voice(out, shots, payload.voice_type if payload else None)
+        result = synthesize_project_voice(out, shots, payload.voice_type if payload else None, payload.speech_rate if payload else None)
     except Exception as exc:
         raise HTTPException(502, str(exc)) from exc
     timing_by_shot = {
@@ -304,6 +307,36 @@ def generate_voice(project_id: str, payload: VoicePayload | None = None):
     }
 
 
+@router.post("/{project_id}/generate-title")
+def generate_title(project_id: str):
+    db = load_db()
+    project = next((p for p in db["projects"] if p["id"] == project_id), None)
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    script = str(project.get("rewritten_script") or project.get("raw_script") or "").strip()
+    if not script:
+        raise HTTPException(400, "No script content available for title generation")
+
+    result = generate_viral_title(script)
+    if result.get("error"):
+        raise HTTPException(502, f"Title generation failed: {result['error']}")
+
+    now = datetime.now().isoformat(timespec="seconds")
+    project["title_line1"] = result["line1"]
+    project["title_line2"] = result["line2"]
+    project["title_full"] = result["full_title"]
+    project["updated_at"] = now
+    save_db(db)
+
+    return {
+        "status": "success",
+        "line1": result["line1"],
+        "line2": result["line2"],
+        "full_title": result["full_title"],
+    }
+
+
 @router.post("/{project_id}/generate-cover")
 def generate_cover(project_id: str, payload: CoverPayload):
     db = load_db()
@@ -315,13 +348,24 @@ def generate_cover(project_id: str, payload: CoverPayload):
 
     cover_path = project_dir(project_id) / "cover" / "cover.png"
     try:
+        # When two-line title exists, skip AI text rendering and use Pillow overlay instead
+        title_line1 = project.get("title_line1", "")
+        title_line2 = project.get("title_line2", "")
+        has_two_line_title = bool(title_line1 and title_line2)
+
         result = generate_seedream_cover(
             cover_path,
             project,
             payload.title,
             payload.subtitle,
+            skip_text=has_two_line_title,
         )
         _normalize_image_format(cover_path)
+
+        # Overlay title text on the cover image if two-line title exists
+        if has_two_line_title:
+            overlay_title_on_cover(cover_path, title_line1, title_line2)
+
     except Exception as exc:
         raise HTTPException(502, str(exc)) from exc
 

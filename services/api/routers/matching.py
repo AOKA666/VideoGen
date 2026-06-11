@@ -100,6 +100,58 @@ def retry_image_search(
     }
 
 
+FAILED_STATUSES = {"no_image", "no_match", "intent_failed", "search_stopped"}
+
+
+@router.post("/{project_id}/retry-failed-shots")
+def retry_failed_shots(
+    project_id: str,
+    background_tasks: BackgroundTasks,
+    image_search_provider: str = Query("so", pattern="^(so|tencent)$"),
+):
+    db = load_db()
+    project = next((p for p in db["projects"] if p["id"] == project_id), None)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    failed_shots = [s for s in db["shots"] if s["project_id"] == project_id and s.get("status") in FAILED_STATUSES]
+    if not failed_shots:
+        return {"project_id": project_id, "retried_count": 0, "status": "no_failed_shots"}
+    now = datetime.now().isoformat(timespec="seconds")
+    for shot in failed_shots:
+        shot["status"] = "pending_search"
+        shot["current_search_keyword"] = ""
+        shot["updated_at"] = now
+    project["status"] = "searching_images"
+    project["image_search_provider"] = image_search_provider
+    project["search_stop_requested"] = False
+    project["updated_at"] = now
+    save_db(db)
+    background_tasks.add_task(_retry_failed_shots_task, project_id, [s["id"] for s in failed_shots], image_search_provider)
+    return {
+        "project_id": project_id,
+        "retried_count": len(failed_shots),
+        "status": "searching_images",
+        "image_search_provider": image_search_provider,
+    }
+
+
+def _retry_failed_shots_task(project_id: str, shot_ids: list[str], image_search_provider: str) -> None:
+    for shot_id in shot_ids:
+        db = load_db()
+        project = next((p for p in db.get("projects", []) if p.get("id") == project_id), None)
+        if not project or project.get("search_stop_requested"):
+            break
+        rerun_shot_web_image_search(project_id, shot_id, image_search_provider)
+    db = load_db()
+    project = next((p for p in db.get("projects", []) if p.get("id") == project_id), None)
+    if project and project.get("status") == "searching_images":
+        project["status"] = "shots_ready"
+        project["current_shot_index"] = None
+        project["current_search_keyword"] = ""
+        project["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        save_db(db)
+
+
 @router.patch("/{project_id}/shots/{shot_id}/asset")
 def select_asset(project_id: str, shot_id: str, payload: dict):
     db = load_db()

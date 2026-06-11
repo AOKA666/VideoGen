@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Archive, Crop, Download, Eraser, Film, FolderOpen, ImagePlus, Library, Mic, RefreshCw, Save, Scissors, Search, Tags, Terminal, Trash2, Wand2 } from 'lucide-react';
+import { Archive, Crop, Download, Eraser, Film, FolderOpen, ImagePlus, Library, Mic, RefreshCw, Save, Scissors, Search, Tags, Trash2, Wand2 } from 'lucide-react';
 import './styles.css';
 
 const API = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
@@ -75,13 +75,13 @@ function App() {
   const [generatingShotId, setGeneratingShotId] = useState('');
   const [materialSourceStrategy, setMaterialSourceStrategy] = useState('library_first');
   const [voiceType, setVoiceType] = useState(VOICE_OPTIONS[0].value);
+  const [speechRate, setSpeechRate] = useState(0);
   const [coverTitle, setCoverTitle] = useState('');
   const [coverSubtitle, setCoverSubtitle] = useState('');
+  const [titleLine1, setTitleLine1] = useState('');
+  const [titleLine2, setTitleLine2] = useState('');
+  const [titleConfirmed, setTitleConfirmed] = useState(false);
   const [previewAsset, setPreviewAsset] = useState(null);
-  const [consoleOpen, setConsoleOpen] = useState(false);
-  const [consoleStream, setConsoleStream] = useState('image_search');
-  const [consoleLog, setConsoleLog] = useState('');
-  const [consoleMeta, setConsoleMeta] = useState(null);
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [exportResult, setExportResult] = useState(null);
   const [selectedAssetIds, setSelectedAssetIds] = useState(new Set());
@@ -192,20 +192,6 @@ function App() {
     }
   }
 
-  async function refreshConsoleLog(stream = consoleStream) {
-    const data = await request(`/api/system/logs?stream=${stream}&max_chars=20000`);
-    setConsoleLog(data.content || '');
-    setConsoleMeta(data);
-  }
-
-  useEffect(() => {
-    if (!consoleOpen) return undefined;
-    refreshConsoleLog(consoleStream).catch((err) => setConsoleLog(String(err.message || err)));
-    const timer = window.setInterval(() => {
-      refreshConsoleLog(consoleStream).catch((err) => setConsoleLog(String(err.message || err)));
-    }, 2000);
-    return () => window.clearInterval(timer);
-  }, [consoleOpen, consoleStream]);
 
   useEffect(() => {
     refreshAll();
@@ -215,7 +201,10 @@ function App() {
     if (!project) return;
     setCoverTitle(project.cover_title || project.name || '');
     setCoverSubtitle(project.cover_subtitle || suggestedCoverSubtitle(project));
-  }, [project?.id, project?.cover_title, project?.cover_subtitle]);
+    setTitleLine1(project.title_line1 || '');
+    setTitleLine2(project.title_line2 || '');
+    setTitleConfirmed(Boolean(project.title_line1 && project.title_line2) || Boolean(project.cover_url));
+  }, [project?.id, project?.cover_title, project?.cover_subtitle, project?.title_line1, project?.title_line2, project?.cover_url]);
 
   useEffect(() => {
     if (!assets.some((asset) => asset.analysis_status === 'analyzing')) return undefined;
@@ -454,6 +443,21 @@ function App() {
     await refreshAll(projectId);
   }
 
+  async function retryFailedShots(imageSearchProvider = 'so') {
+    const label = imageSearchProvider === 'tencent' ? '腾讯重新搜索失败分镜' : '重新搜索失败分镜';
+    const result = await run(label, () => request(
+      `/api/projects/${projectId}/retry-failed-shots?image_search_provider=${imageSearchProvider}`,
+      { method: 'POST' },
+    ));
+    if (!result) return;
+    if (result.retried_count === 0) {
+      setMessage('没有失败的分镜需要重新搜索');
+      return;
+    }
+    await refreshAll(projectId);
+    setMessage(`正在重新搜索 ${result.retried_count} 个失败分镜...`);
+  }
+
   async function generateImage(shotId) {
     setGeneratingShotId(shotId);
     try {
@@ -531,7 +535,7 @@ function App() {
     const voiceResult = await run('生成配音', () => request(`/api/projects/${projectId}/generate-voice`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ voice_type: voiceType }),
+      body: JSON.stringify({ voice_type: voiceType, speech_rate: speechRate }),
     }));
     if (!voiceResult) return false;
     const subtitleResult = await run('生成字幕', () => request(`/api/projects/${projectId}/generate-subtitles`, { method: 'POST' }));
@@ -553,6 +557,37 @@ function App() {
     if (!result) return;
     await refreshAll(projectId);
     setMessage('9:16 视频封面生成完成');
+  }
+
+  async function generateTitle() {
+    const result = await run('生成爆款标题', () => request(`/api/projects/${projectId}/generate-title`, {
+      method: 'POST',
+    }));
+    if (!result) return;
+    setTitleLine1(result.line1);
+    setTitleLine2(result.line2);
+    setTitleConfirmed(false);
+    await refreshAll(projectId);
+    setMessage('爆款标题生成完成，请确认或编辑');
+  }
+
+  async function confirmTitle() {
+    if (!titleLine1.trim() || !titleLine2.trim()) {
+      setMessage('请填写两行标题');
+      return;
+    }
+    await run('保存标题', () => request(`/api/projects/${projectId}/script`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title_line1: titleLine1.trim(),
+        title_line2: titleLine2.trim(),
+      }),
+    }));
+    setTitleConfirmed(true);
+    // Auto-populate cover title with the full title
+    setCoverTitle(`${titleLine1.trim()} ${titleLine2.trim()}`);
+    setMessage('标题已确认，可以生成封面');
   }
 
   async function exportPackage(output) {
@@ -621,7 +656,7 @@ function App() {
           <button className={tab === 'script' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('script')}><Wand2 size={18} /> 文案</button>
           <button className={tab === 'storyboard' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('storyboard')}><Archive size={18} /> 分镜</button>
           <button className={tab === 'match' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('match')}><Search size={18} /> 匹配</button>
-          <button className={tab === 'cover' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('cover')}><ImagePlus size={18} /> 封面</button>
+          <button className={tab === 'cover' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('cover')}><ImagePlus size={18} /> 标题与封面</button>
           <button className={tab === 'export' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('export')}><Download size={18} /> 导出</button>
         </nav>
         <div className="project-picker">
@@ -646,7 +681,6 @@ function App() {
             <p>{activeLibrary ? `当前素材库：${activeLibrary.name}` : '进入素材库前，需要先选择一个文件夹作为素材库。'}</p>
           </div>
           <div className="top-actions">
-            <button type="button" onClick={() => setConsoleOpen(true)}><Terminal size={18} /> 后端控制台</button>
             <span className={workflowBusy ? 'status busy' : 'status'}>{workflowMessage}</span>
           </div>
         </header>
@@ -805,6 +839,22 @@ function App() {
                 >
                   <Archive size={18} /> 批量存入素材库并打标签
                 </button>
+                <button
+                  type="button"
+                  disabled={busy || !shots.some((shot) => ['no_image', 'no_match', 'intent_failed', 'search_stopped'].includes(shot.status))}
+                  onClick={() => retryFailedShots('so')}
+                >
+                  <RefreshCw size={18} /> 重新搜索失败分镜
+                </button>
+                <button
+                  type="button"
+                  className="tencent-storyboard"
+                  disabled={busy || !shots.some((shot) => ['no_image', 'no_match', 'intent_failed', 'search_stopped'].includes(shot.status))}
+                  title="使用腾讯云联网图像搜索重新搜索失败分镜"
+                  onClick={() => retryFailedShots('tencent')}
+                >
+                  <Search size={18} /> 重新搜索失败分镜
+                </button>
               </div>
               <small>优先保存已选图片；未选择时保存该镜头第一张，重复图片自动跳过。</small>
             </div>
@@ -839,6 +889,7 @@ function App() {
           <section className="band">
             <div className="toolbar">
               <VoiceSelect value={voiceType} onChange={setVoiceType} />
+              <SpeechRateSelect value={speechRate} onChange={setSpeechRate} />
               <button className="primary" onClick={generateVoiceAndSubtitles}><Mic size={18} /> 生成配音与字幕</button>
             </div>
             <div className="shot-list">
@@ -879,40 +930,86 @@ function App() {
         {tab === 'cover' && project && (
           <section className="band cover-workspace">
             <div className="panel cover-editor">
+              {/* Step 1: Title Generation */}
               <div>
-                <h2>设计视频封面</h2>
-                <p>Seedream 会根据完整文案生成 9:16 竖版封面，并在画面中排版下面的文字。</p>
+                <h2>标题与封面</h2>
+                <p>先为视频生成爆款两行标题，确认后再生成封面。标题会写到封面上和视频顶部。</p>
               </div>
-              <label>
-                封面主标题
-                <input
-                  value={coverTitle}
-                  maxLength={18}
-                  onChange={(event) => setCoverTitle(event.target.value)}
-                  placeholder="输入醒目的封面标题"
-                />
-              </label>
-              <label>
-                封面副标题
-                <input
-                  value={coverSubtitle}
-                  maxLength={28}
-                  onChange={(event) => setCoverSubtitle(event.target.value)}
-                  placeholder="可选，用一句短文案补充主题"
-                />
-              </label>
-              <div className="actions">
-                <button
-                  className="primary"
-                  disabled={busy || !coverTitle.trim()}
-                  onClick={generateCover}
-                >
-                  <Wand2 size={18} /> {project.cover_url ? '重新生成封面' : '生成 9:16 封面'}
-                </button>
-                <button disabled={!project.cover_url} onClick={() => setTab('export')}>
-                  <Download size={18} /> 下一步：导出
-                </button>
+
+              <div className="title-section">
+                <h3>第一步 · 生成标题</h3>
+                <div className="title-inputs">
+                  <label>
+                    标题第一行
+                    <input
+                      value={titleLine1}
+                      maxLength={12}
+                      onChange={(event) => { setTitleLine1(event.target.value); setTitleConfirmed(false); }}
+                      placeholder="5-12字，制造悬念"
+                    />
+                  </label>
+                  <label>
+                    标题第二行
+                    <input
+                      value={titleLine2}
+                      maxLength={12}
+                      onChange={(event) => { setTitleLine2(event.target.value); setTitleConfirmed(false); }}
+                      placeholder="5-12字，揭示反差"
+                    />
+                  </label>
+                </div>
+                <div className="actions">
+                  <button
+                    className="primary"
+                    disabled={busy}
+                    onClick={generateTitle}
+                  >
+                    <Wand2 size={18} /> {titleLine1 ? '重新生成标题' : 'AI 生成爆款标题'}
+                  </button>
+                  <button
+                    disabled={busy || !titleLine1.trim() || !titleLine2.trim()}
+                    onClick={confirmTitle}
+                  >
+                    <Save size={18} /> {titleConfirmed ? '标题已确认 ✓' : '确认标题'}
+                  </button>
+                </div>
               </div>
+
+              {/* Step 2: Cover Generation (only after title is confirmed) */}
+              <div className="cover-section">
+                <h3>第二步 · 生成封面</h3>
+                <label>
+                  封面标题
+                  <input
+                    value={coverTitle}
+                    maxLength={18}
+                    onChange={(event) => setCoverTitle(event.target.value)}
+                    placeholder="标题确认后自动填入"
+                  />
+                </label>
+                <label>
+                  封面副标题
+                  <input
+                    value={coverSubtitle}
+                    maxLength={28}
+                    onChange={(event) => setCoverSubtitle(event.target.value)}
+                    placeholder="可选，用一句短文案补充主题"
+                  />
+                </label>
+                <div className="actions">
+                  <button
+                    className="primary"
+                    disabled={busy || !titleConfirmed || !coverTitle.trim()}
+                    onClick={generateCover}
+                  >
+                    <ImagePlus size={18} /> {project.cover_url ? '重新生成封面' : '生成 9:16 封面'}
+                  </button>
+                  <button disabled={!project.cover_url} onClick={() => setTab('export')}>
+                    <Download size={18} /> 下一步：导出
+                  </button>
+                </div>
+              </div>
+
               {project.cover_model && <small>生成模型：{project.cover_model}</small>}
             </div>
             <div className="cover-preview">
@@ -935,7 +1032,7 @@ function App() {
                 <div className="cover-placeholder">
                   <ImagePlus size={42} />
                   <strong>尚未生成封面</strong>
-                  <span>配音字幕完成后，在这里生成竖版主题封面</span>
+                  <span>确认标题后，在这里生成竖版主题封面</span>
                 </div>
               )}
             </div>
@@ -949,8 +1046,9 @@ function App() {
             {project.audio_url && <audio controls src={`${API}${project.audio_url}`} />}
             <div className="export-actions">
               <VoiceSelect value={voiceType} onChange={setVoiceType} />
+              <SpeechRateSelect value={speechRate} onChange={setSpeechRate} />
               <button onClick={generateVoiceAndSubtitles}><Mic size={18} /> 重新生成配音字幕</button>
-              <button onClick={() => setTab('cover')}><ImagePlus size={18} /> 查看或生成封面</button>
+              <button onClick={() => setTab('cover')}><ImagePlus size={18} /> 标题与封面</button>
               <button onClick={openExportFolder}><FolderOpen size={18} /> 打开导出文件夹</button>
               <button className="primary" onClick={() => exportPackage('mp4')}><Film size={18} /> 导出 MP4</button>
               <button className="primary" onClick={() => exportPackage('draft')}><Archive size={18} /> 导出剪映草稿</button>
@@ -1001,16 +1099,6 @@ function App() {
       )}
       {editingAsset && <AssetEditor asset={editingAsset} onClose={() => setEditingAsset(null)} onSave={saveAssetTags} onDelete={deleteAsset} />}
       {previewAsset && <ImagePreview asset={previewAsset} onClose={() => setPreviewAsset(null)} />}
-      {consoleOpen && (
-        <BackendConsole
-          stream={consoleStream}
-          content={consoleLog}
-          meta={consoleMeta}
-          onStreamChange={setConsoleStream}
-          onRefresh={() => refreshConsoleLog(consoleStream)}
-          onClose={() => setConsoleOpen(false)}
-        />
-      )}
     </div>
   );
 }
@@ -1077,34 +1165,7 @@ function SafeImage({ src, alt }) {
   return <img src={src} alt={alt || ''} onError={() => setBroken(true)} />;
 }
 
-function BackendConsole({ stream, content, meta, onStreamChange, onRefresh, onClose }) {
-  const logRef = useRef(null);
-  useEffect(() => {
-    const node = logRef.current;
-    if (node) node.scrollTop = node.scrollHeight;
-  }, [content]);
-  return (
-    <div className="console-panel">
-      <div className="console-head">
-        <strong><Terminal size={18} /> 后端控制台</strong>
-        <div className="console-tools">
-          <select value={stream} onChange={(e) => onStreamChange(e.target.value)}>
-            <option value="image_search">图片搜索日志</option>
-            <option value="runtime">服务运行日志</option>
-            <option value="errors">错误输出</option>
-          </select>
-          <button type="button" onClick={onRefresh}><RefreshCw size={16} /> 刷新</button>
-          <button type="button" onClick={onClose}>关闭</button>
-        </div>
-      </div>
-      <small>
-        <span className={meta?.exists ? 'console-status online' : 'console-status'} />
-        {meta?.exists ? '每 2 秒自动刷新' : '日志文件还没有生成'}
-      </small>
-      <pre ref={logRef}>{content || '暂无日志输出'}</pre>
-    </div>
-  );
-}
+
 
 function VoiceSelect({ value, onChange }) {
   return (
@@ -1112,6 +1173,21 @@ function VoiceSelect({ value, onChange }) {
       音色
       <select value={value} onChange={(e) => onChange(e.target.value)}>
         {VOICE_OPTIONS.map((voice) => <option key={voice.value} value={voice.value}>{voice.label}</option>)}
+      </select>
+    </label>
+  );
+}
+
+function SpeechRateSelect({ value, onChange }) {
+  return (
+    <label className="compact-control">
+      语速
+      <select value={value} onChange={(e) => onChange(Number(e.target.value))}>
+        <option value={-50}>慢速</option>
+        <option value={-25}>偏慢</option>
+        <option value={0}>正常</option>
+        <option value={25}>偏快</option>
+        <option value={50}>快速</option>
       </select>
     </label>
   );

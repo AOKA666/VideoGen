@@ -488,6 +488,70 @@ def ai_generate_shot_visuals(shots: list[dict], full_script: str) -> dict[str, d
     return all_visuals
 
 
+def generate_viral_title(script: str) -> dict:
+    """Use GLM to generate a two-line viral short video title based on script content."""
+    api_key = os.getenv("BIGMODEL_API_KEY", "").strip()
+    if not api_key:
+        return {"line1": "", "line2": "", "full_title": ""}
+
+    prompt = (
+        "你是爆款短视频标题专家。请根据以下文案内容，生成一个两行式爆款标题。"
+        "\n\n标题规则："
+        "\n1. 必须生成两行文字，第一行短（5-12字），第二行稍长（5-12字），总共不超过24字。"
+        "\n2. 标题要制造悬念或反差，让用户忍不住点开。"
+        "\n3. 以下是爆款标题示范格式，请学习其逻辑但不要照搬："
+        "\n   - 第一行：飞机坠毁前 / 第二行：他用身体护住了国家机密"
+        "\n   - 第一行：母亲骂他三十年不孝 / 第二行：真相曝光后全国泪目"
+        "\n   - 第一行：穿15块胶鞋的老太太 / 第二行：捐出了1000万"
+        "\n4. 标题必须忠于文案事实，不能编造信息。"
+        "\n5. 不要用「震惊」「惊人」「不可思议」等空洞词汇。"
+        "\n6. 标题中禁止出现任何标点符号，包括逗号、句号、感叹号、问号、冒号、破折号等。"
+        "\n7. 只返回 JSON，不要 Markdown，不要解释。"
+        "\n\n文案内容："
+        f"\n{script[:600]}"
+        "\n\n返回格式："
+        '\n{"line1": "第一行标题", "line2": "第二行标题"}'
+    )
+
+    payload = {
+        "model": bigmodel_model(),
+        "messages": [
+            {"role": "system", "content": "你只输出可解析 JSON。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.8,
+        "top_p": 0.9,
+        "max_tokens": 200,
+        "stream": False,
+        "thinking": {"type": "disabled"},
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{bigmodel_endpoint().rstrip('/')}/chat/completions",
+            data=data,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        content = body["choices"][0]["message"]["content"]
+        if isinstance(content, list):
+            content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+        result = json.loads(extract_json(str(content)))
+        line1 = str(result.get("line1", "")).strip()[:12]
+        line2 = str(result.get("line2", "")).strip()[:12]
+        # Strip any punctuation that the model might still produce
+        _punct_pat = re.compile(r"[，。！？、；：“”‘’《》【】（）—…\-.!?,;:'\"()\[\]{}<>]")
+        line1 = _punct_pat.sub("", line1).strip()
+        line2 = _punct_pat.sub("", line2).strip()
+        return {"line1": line1, "line2": line2, "full_title": f"{line1} {line2}"}
+    except Exception as exc:
+        return {"line1": "", "line2": "", "full_title": "", "error": str(exc)[:200]}
+
+
 def generate_shots(script: str) -> list[dict]:
     lines = [line.strip() for line in script.splitlines() if is_meaningful_shot_text(line)]
     chunks: list[str] = lines if len(lines) > 1 else []

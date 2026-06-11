@@ -24,7 +24,9 @@ class ProjectCreate(BaseModel):
 
 
 class ScriptUpdate(BaseModel):
-    rewritten_script: str
+    rewritten_script: str | None = None
+    title_line1: str | None = None
+    title_line2: str | None = None
 
 
 @router.get("")
@@ -62,6 +64,22 @@ def get_project(project_id: str):
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
         raise HTTPException(404, "Project not found")
+
+    # Fix orphaned shot statuses: if project is not searching, shots stuck in
+    # active search statuses should be reset to failed so the UI doesn't hang
+    if project.get("status") not in ("searching_images",):
+        active_statuses = {"searching", "pending_search", "analyzing_intent"}
+        now = datetime.now().isoformat(timespec="seconds")
+        fixed = False
+        for shot in db["shots"]:
+            if shot.get("project_id") == project_id and shot.get("status") in active_statuses:
+                shot["status"] = "no_image"
+                shot["current_search_keyword"] = ""
+                shot["updated_at"] = now
+                fixed = True
+        if fixed:
+            save_db(db)
+
     shots = [s for s in db["shots"] if s["project_id"] == project_id]
     generated_assets = [
         a for a in db.get("generated_assets", [])
@@ -109,8 +127,15 @@ def update_script(project_id: str, payload: ScriptUpdate):
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
         raise HTTPException(404, "Project not found")
-    project["rewritten_script"] = payload.rewritten_script
-    project["status"] = "script_ready"
+    if payload.rewritten_script is not None:
+        project["rewritten_script"] = payload.rewritten_script
+        project["status"] = "script_ready"
+    if payload.title_line1 is not None:
+        project["title_line1"] = payload.title_line1
+    if payload.title_line2 is not None:
+        project["title_line2"] = payload.title_line2
+    if payload.title_line1 is not None or payload.title_line2 is not None:
+        project["title_full"] = f"{payload.title_line1 or ''} {payload.title_line2 or ''}"
     project["updated_at"] = datetime.now().isoformat(timespec="seconds")
     save_db(db)
     return {"status": "saved"}

@@ -543,6 +543,32 @@ h3 { font-size: 16px; line-height: 1.48; }
 }
 .cover-editor { display: grid; gap: 18px; }
 .cover-editor p { color: var(--muted); line-height: 1.7; }
+.title-section,
+.cover-section { display: grid; gap: 12px; }
+.title-section h3,
+.cover-section h3 {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--brand);
+  margin: 0;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line);
+}
+.title-section h3::before,
+.cover-section h3::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  background: var(--brand);
+  border-radius: 50%;
+  margin-right: 8px;
+  vertical-align: middle;
+}
+.title-inputs { display: grid; gap: 10px; }
+.title-inputs input { font-weight: 600; font-size: 15px; }
+.cover-section { opacity: 1; transition: opacity .2s; }
+.cover-section:has(button:disabled:first-of-type) { opacity: .55; }
 .cover-preview {
   display: flex;
   justify-content: center;
