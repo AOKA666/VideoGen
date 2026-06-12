@@ -551,25 +551,15 @@ function App() {
     setMessage('9:16 视频封面生成完成');
   }
 
-  async function downloadCover() {
+  function downloadCover() {
     if (!project?.cover_url) return;
-    try {
-      const version = encodeURIComponent(project.cover_updated_at || '');
-      const response = await fetch(`${API}${project.cover_url}?v=${version}`);
-      if (!response.ok) throw new Error('封面文件读取失败');
-      const blob = await response.blob();
-      const blobUrl = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = blobUrl;
-      link.download = '视频封面.png';
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      URL.revokeObjectURL(blobUrl);
-      setMessage('封面下载完成');
-    } catch (err) {
-      setMessage(`下载失败：${err.message}`);
-    }
+    const link = document.createElement('a');
+    link.href = `${API}/api/projects/${projectId}/download-cover`;
+    link.download = '视频封面.png';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setMessage('封面下载已开始');
   }
 
   async function generateTitle() {
@@ -1324,12 +1314,28 @@ function SearchProgress({ progress, project, onStop }) {
 
 function ImagePreview({ asset, onClose }) {
   const src = assetImageUrl(asset);
+  const canDownloadPng = Boolean(asset.project_id && asset.id && asset.file_type !== 'video');
+  function downloadPng() {
+    const link = document.createElement('a');
+    link.href = `${API}/api/projects/${asset.project_id}/generated-assets/${asset.id}/download-png`;
+    link.download = `${(asset.file_name || 'image').replace(/\.[^.]+$/, '')}.png`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }
   return (
     <div className="image-preview-backdrop" onClick={onClose}>
       <div className="image-preview" onClick={(e) => e.stopPropagation()}>
         <div className="image-preview-head">
           <strong>{asset.file_name || '图片预览'}</strong>
-          <button type="button" onClick={onClose}>关闭</button>
+          <div className="image-preview-actions">
+            {canDownloadPng && (
+              <button type="button" className="primary" onClick={downloadPng}>
+                <Download size={17} /> 下载 PNG
+              </button>
+            )}
+            <button type="button" onClick={onClose}>关闭</button>
+          </div>
         </div>
         <SafeImage src={src} alt={asset.file_name || 'preview'} />
         {(asset.source_page || asset.remote_url) && (

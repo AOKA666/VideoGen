@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from services.store import PROJECTS_DIR, load_db, project_dir, save_db
 from services.text_service import RewriteQualityError, infer_title, rewrite_script
+from services.web_image_pipeline import recover_interrupted_searches
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
@@ -64,6 +65,8 @@ def get_project(project_id: str):
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
         raise HTTPException(404, "Project not found")
+    if recover_interrupted_searches(db, project_id):
+        save_db(db)
 
     # Fix orphaned shot statuses: if project is not searching, shots stuck in
     # active search statuses should be reset to failed so the UI doesn't hang

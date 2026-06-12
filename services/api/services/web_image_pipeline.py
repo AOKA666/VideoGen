@@ -4,8 +4,8 @@ import shutil
 import os
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from services.asset_service import new_id
@@ -35,6 +35,8 @@ FULL_IMAGES_PER_SHOT = 8
 FULL_IMAGES_PER_KEYWORD = 4
 FAST_VISUAL_SCORE_LIMIT = 0
 FULL_VISUAL_SCORE_LIMIT = 0
+SEARCH_BATCH_TIMEOUT_SECONDS = 180
+STALE_SEARCH_SECONDS = 180
 TENCENT_RETRY_SUFFIXES = [
     "现场照片",
     "新闻图片",
@@ -81,6 +83,63 @@ def _completed_count(shots: list[dict], project_id: str) -> int:
         1 for item in shots
         if item.get("project_id") == project_id and item.get("status") in DONE_STATUSES
     )
+
+
+def _timestamp(value: str | None) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value or ""))
+    except ValueError:
+        return None
+
+
+def recover_interrupted_searches(
+    db: dict,
+    project_id: str | None = None,
+    *,
+    force: bool = False,
+) -> bool:
+    now = datetime.now()
+    cutoff = now - timedelta(seconds=STALE_SEARCH_SECONDS)
+    changed = False
+    for project in db.get("projects", []):
+        if project_id and project.get("id") != project_id:
+            continue
+        if project.get("status") != "searching_images":
+            continue
+        updated_at = _timestamp(project.get("updated_at"))
+        if not force and updated_at and updated_at > cutoff:
+            continue
+
+        active_shots = [
+            shot for shot in db.get("shots", [])
+            if shot.get("project_id") == project.get("id")
+            and shot.get("status") in ACTIVE_SEARCH_STATUSES
+        ]
+        if not active_shots:
+            project["status"] = "shots_ready"
+            project["search_stage"] = "done"
+            project["current_shot_index"] = None
+            project["current_search_keyword"] = ""
+        else:
+            asset_ids = {
+                asset.get("id") for asset in db.get("generated_assets", [])
+                if asset.get("project_id") == project.get("id")
+            }
+            for shot in active_shots:
+                selected_id = shot.get("selected_asset_id")
+                shot["status"] = "web_downloaded" if selected_id in asset_ids else "no_image"
+                shot["current_search_keyword"] = ""
+                shot["search_finished_at"] = now.isoformat(timespec="seconds")
+                shot["updated_at"] = shot["search_finished_at"]
+            project["status"] = "shots_ready"
+            project["search_stage"] = "interrupted"
+            project["current_shot_index"] = None
+            project["current_search_keyword"] = ""
+            project["search_error"] = "Image search was interrupted or timed out; unfinished shots were released for retry."
+        project["search_completed"] = _completed_count(db.get("shots", []), project.get("id"))
+        project["updated_at"] = now.isoformat(timespec="seconds")
+        changed = True
+    return changed
 
 
 def _project_stop_requested(project_id: str) -> bool:
@@ -637,9 +696,12 @@ def _search_shots_batch(project_id: str, shots: list[dict], *, total: int) -> bo
         dict(shot) for shot in db.get("shots", [])
         if shot.get("id") in shot_ids and shot.get("status") == "searching"
     ]
-    with ThreadPoolExecutor(max_workers=min(web_image_concurrency(), max(1, len(shot_snapshots)))) as executor:
-        futures = {executor.submit(_download_and_rank_shot, project_id, shot): shot for shot in shot_snapshots}
-        for future in as_completed(futures):
+    executor = ThreadPoolExecutor(max_workers=min(web_image_concurrency(), max(1, len(shot_snapshots))))
+    futures = {executor.submit(_download_and_rank_shot, project_id, shot): shot for shot in shot_snapshots}
+    handled = set()
+    try:
+        for future in as_completed(futures, timeout=SEARCH_BATCH_TIMEOUT_SECONDS):
+            handled.add(future)
             if _project_stop_requested(project_id):
                 for pending in futures:
                     pending.cancel()
@@ -674,6 +736,31 @@ def _search_shots_batch(project_id: str, shots: list[dict], *, total: int) -> bo
                 project["current_search_keyword"] = "并发搜索中"
                 project["updated_at"] = _now()
             save_db(db)
+    except FuturesTimeoutError:
+        logger.error(
+            "[image-search] project=%s batch timed out after %ss",
+            project_id,
+            SEARCH_BATCH_TIMEOUT_SECONDS,
+        )
+        for future, source_shot in futures.items():
+            if future in handled:
+                continue
+            future.cancel()
+            db = load_db()
+            _apply_search_result(db, project_id, {
+                "shot_id": source_shot["id"],
+                "shot_index": source_shot["shot_index"],
+                "downloaded": [],
+                "best": None,
+                "failures": [{
+                    "keyword": search_query_for_shot(source_shot),
+                    "stage": "worker_timeout",
+                    "error": f"Search exceeded {SEARCH_BATCH_TIMEOUT_SECONDS} seconds",
+                }],
+            })
+            save_db(db)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
     return True
 
 
@@ -713,7 +800,7 @@ def _analyze_intents_with_progress(project_id: str, batch: list[dict], full_text
         executor.shutdown(wait=future.done(), cancel_futures=True)
 
 
-def run_project_web_image_search(project_id: str) -> None:
+def _run_project_web_image_search(project_id: str) -> None:
     db = load_db()
     project = next((p for p in db.get("projects", []) if p.get("id") == project_id), None)
     if not project:
@@ -857,6 +944,28 @@ def run_project_web_image_search(project_id: str) -> None:
         project["current_search_keyword"] = ""
         project["search_stage"] = "done"
         project["updated_at"] = _now()
+        save_db(db)
+
+
+def run_project_web_image_search(project_id: str) -> None:
+    try:
+        _run_project_web_image_search(project_id)
+    except Exception as exc:
+        logger.exception("[image-search] project=%s background task failed", project_id)
+        db = load_db()
+        project = next((p for p in db.get("projects", []) if p.get("id") == project_id), None)
+        if project:
+            project["status"] = "search_failed"
+            project["search_stage"] = "failed"
+            project["current_shot_index"] = None
+            project["current_search_keyword"] = ""
+            project["search_error"] = str(exc)[:500]
+            project["updated_at"] = _now()
+        for shot in db.get("shots", []):
+            if shot.get("project_id") == project_id and shot.get("status") in ACTIVE_SEARCH_STATUSES:
+                shot["status"] = "no_image"
+                shot["current_search_keyword"] = ""
+                shot["updated_at"] = _now()
         save_db(db)
 
 

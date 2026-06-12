@@ -14,6 +14,7 @@ import urllib.error
 import urllib.request
 import wave
 from difflib import SequenceMatcher
+from io import BytesIO
 from json import JSONDecoder
 from pathlib import Path
 from uuid import uuid4
@@ -232,6 +233,20 @@ def image_size_for_ratio(video_ratio: str | None) -> str:
     return "1440x2560"
 
 
+def image_edit_size_for_source(path: Path) -> str:
+    with Image.open(path) as image:
+        width, height = image.size
+    if width <= 0 or height <= 0:
+        raise RuntimeError(f"Image has invalid dimensions: {width}x{height}")
+
+    aspect_ratio = width / height
+    if aspect_ratio >= 1.2:
+        return image_size_for_ratio("16:9")
+    if aspect_ratio <= (1 / 1.2):
+        return image_size_for_ratio("9:16")
+    return image_size_for_ratio("1:1")
+
+
 def remove_watermark_with_seedream(path: Path, shot: dict | None = None) -> dict:
     api_key = os.getenv("ARK_API_KEY", "").strip()
     if not api_key:
@@ -239,14 +254,14 @@ def remove_watermark_with_seedream(path: Path, shot: dict | None = None) -> dict
     if not path.exists():
         raise RuntimeError(f"Image does not exist: {path}")
 
-    prompt = (
-        "请对这张图片做写实修复：只移除可见水印、logo、平台署名、角落文字、覆盖式文字标记；"
-        "保持主体、构图、色彩、清晰度和画面内容不变，不要新增文字，不要改成插画。"
-    )
-    if shot:
-        prompt += f" 分镜画面语境：{shot.get('visual_need') or shot.get('voice_text') or ''}"
+    prompt = "去除图片上的字幕、残留的Logo和水印"
 
-    image_b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+    original_bytes = path.read_bytes()
+    with Image.open(BytesIO(original_bytes)) as source:
+        original = ImageOps.exif_transpose(source)
+        original_size = original.size
+
+    image_b64 = base64.b64encode(original_bytes).decode("ascii")
     mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
     image_data_uri = f"data:{mime};base64,{image_b64}"
 
@@ -254,9 +269,9 @@ def remove_watermark_with_seedream(path: Path, shot: dict | None = None) -> dict
         "model": ark_image_edit_model(),
         "prompt": prompt,
         "image": image_data_uri,
-        "strength": 0.65,
+        "strength": 0.3,
         "n": 1,
-        "size": "1024x1024",
+        "size": image_edit_size_for_source(path),
         "response_format": "url",
     }
     req = urllib.request.Request(
@@ -287,12 +302,35 @@ def remove_watermark_with_seedream(path: Path, shot: dict | None = None) -> dict
     else:
         raise RuntimeError(f"Volcengine Ark image edit response does not contain an image: {response_body}")
 
-    path.write_bytes(edited)
+    try:
+        with Image.open(BytesIO(edited)) as source:
+            edited_image = ImageOps.exif_transpose(source)
+            edited_image.load()
+            if edited_image.size != original_size:
+                edited_image = edited_image.resize(original_size, Image.Resampling.LANCZOS)
+            suffix = path.suffix.lower()
+            save_format = {
+                ".png": "PNG",
+                ".webp": "WEBP",
+            }.get(suffix, "JPEG")
+            edited_image = edited_image.convert("RGBA" if save_format == "PNG" else "RGB")
+            output = BytesIO()
+            save_options = {"quality": 95} if save_format in {"JPEG", "WEBP"} else {}
+            edited_image.save(output, format=save_format, **save_options)
+            output_bytes = output.getvalue()
+    except Exception as exc:
+        raise RuntimeError(f"Volcengine Ark returned an invalid edited image: {exc}") from exc
+
+    path.write_bytes(output_bytes)
     return {
         "watermark_checked_by_ai": True,
         "watermark_removed": True,
+        "subtitles_removed": True,
+        "logos_removed": True,
+        "original_size_preserved": True,
         "provider": "volcengine_ark",
         "model": ark_image_edit_model(),
+        "image_size": payload["size"],
         "remote_url": image_url or "",
     }
 

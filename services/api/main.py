@@ -8,10 +8,14 @@ from fastapi.staticfiles import StaticFiles
 
 from routers import assets, export, generation, matching, projects, shots, system
 from services.env import load_env_local
-from services.store import ensure_storage
+from services.store import ensure_storage, load_db, save_db
+from services.web_image_pipeline import recover_interrupted_searches
 
 load_env_local()
 ensure_storage()
+startup_db = load_db()
+if recover_interrupted_searches(startup_db, force=True):
+    save_db(startup_db)
 
 
 def configure_file_logging() -> None:

@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from io import BytesIO
 from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse, StreamingResponse
 from PIL import Image, ImageOps
 from pydantic import BaseModel
 
@@ -83,6 +85,30 @@ def _crop_square(path: Path) -> None:
         }.get(suffix, "JPEG")
         save_options = {"quality": 95} if save_format in {"JPEG", "WEBP"} else {}
         cropped.save(path, format=save_format, **save_options)
+
+
+@router.get("/{project_id}/generated-assets/{asset_id}/download-png")
+def download_generated_image_png(project_id: str, asset_id: str):
+    db = load_db()
+    asset, path = _generated_image(db, project_id, asset_id)
+    try:
+        with Image.open(path) as source:
+            image = ImageOps.exif_transpose(source)
+            image.load()
+            if image.mode not in {"RGB", "RGBA"}:
+                image = image.convert("RGBA" if "transparency" in image.info else "RGB")
+            output = BytesIO()
+            image.save(output, format="PNG", optimize=True)
+            output.seek(0)
+    except Exception as exc:
+        raise HTTPException(500, f"PNG conversion failed: {exc}") from exc
+
+    filename = f"{Path(str(asset.get('file_name') or path.name)).stem}.png"
+    return StreamingResponse(
+        output,
+        media_type="image/png",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/{project_id}/generated-assets/{asset_id}/crop-square")
@@ -385,6 +411,22 @@ def generate_cover(project_id: str, file: UploadFile = File(...)):
         "model": project["cover_model"],
         "image_size": "1080x1920",
     }
+
+
+@router.get("/{project_id}/download-cover")
+def download_cover(project_id: str):
+    db = load_db()
+    project = next((p for p in db["projects"] if p["id"] == project_id), None)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    cover_path = project_dir(project_id) / "cover" / "cover.png"
+    if not project.get("cover_url") or not cover_path.exists():
+        raise HTTPException(404, "Cover image not found")
+    return FileResponse(
+        cover_path,
+        media_type="image/png",
+        filename="video-cover.png",
+    )
 
 
 @router.post("/{project_id}/generate-subtitles")

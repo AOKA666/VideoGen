@@ -754,6 +754,17 @@ h3 { font-size: 16px; line-height: 1.48; }
   text-align: center;
 }
 
+.image-preview-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.image-preview-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .shot-list { display: grid; gap: 16px; }
 .shot-card {
   display: grid;
