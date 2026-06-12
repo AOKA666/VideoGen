@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid5, NAMESPACE_URL
 
 ROOT = Path(__file__).resolve().parents[3]
 STORAGE = ROOT / "storage"
@@ -23,6 +26,122 @@ DEFAULT_DB: dict[str, Any] = {
     "web_image_diagnostics": [],
 }
 _DB_LOCK = threading.RLock()
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+_SHOT_DIR_PATTERN = re.compile(r"^shot_(\d+)$")
+_SHOT_FILE_PATTERN = re.compile(r"^shot_(\d+)\.(?:png|jpe?g|webp)$", re.IGNORECASE)
+
+
+def _current_storage_path(value: str | Path) -> Path:
+    path = Path(value)
+    if path.exists():
+        return path.resolve()
+    parts = list(path.parts)
+    storage_indexes = [index for index, part in enumerate(parts) if part.lower() == "storage"]
+    if not storage_indexes:
+        return path
+    relocated = STORAGE.joinpath(*parts[storage_indexes[-1] + 1:])
+    return relocated.resolve() if relocated.exists() else path
+
+
+def _asset_source(path: Path) -> str:
+    if path.parent.name == "images" and _SHOT_FILE_PATTERN.match(path.name):
+        return "ai_generated"
+    if path.name.lower().startswith("manual_"):
+        return "manual_upload"
+    return "web_search"
+
+
+def _recover_orphaned_generated_assets(data: dict[str, Any]) -> bool:
+    known_projects = {item.get("id") for item in data.get("projects", [])}
+    known_paths = {
+        str(_current_storage_path(item["local_path"])).lower()
+        for item in data.get("generated_assets", [])
+        if item.get("local_path")
+    }
+    shots_by_project_index = {
+        (shot.get("project_id"), int(shot.get("shot_index", 0))): shot
+        for shot in data.get("shots", [])
+        if shot.get("project_id") and shot.get("shot_index")
+    }
+    recovered_by_shot: dict[str, list[dict[str, Any]]] = {}
+    now = datetime.now().isoformat(timespec="seconds")
+
+    for project_id in known_projects:
+        images_dir = PROJECTS_DIR / str(project_id) / "images"
+        if not images_dir.exists():
+            continue
+        for path in sorted(images_dir.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in _IMAGE_SUFFIXES:
+                continue
+            resolved = path.resolve()
+            if str(resolved).lower() in known_paths:
+                continue
+            shot_index = None
+            folder_match = _SHOT_DIR_PATTERN.match(path.parent.name)
+            file_match = _SHOT_FILE_PATTERN.match(path.name)
+            if folder_match:
+                shot_index = int(folder_match.group(1))
+            elif path.parent == images_dir and file_match:
+                shot_index = int(file_match.group(1))
+            if shot_index is None:
+                continue
+            shot = shots_by_project_index.get((project_id, shot_index))
+            if not shot:
+                continue
+            source = _asset_source(path)
+            asset_id = str(uuid5(NAMESPACE_URL, resolved.as_posix().lower()))
+            asset = {
+                "id": asset_id,
+                "project_id": project_id,
+                "shot_id": shot["id"],
+                "type": "image",
+                "file_type": "image",
+                "file_name": path.name,
+                "asset_source": source,
+                "provider": "recovered_local_file",
+                "file_size": path.stat().st_size,
+                "file_url": public_url(resolved),
+                "local_path": str(resolved),
+                "status": "success",
+                "created_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
+                "recovered_at": now,
+            }
+            data.setdefault("generated_assets", []).append(asset)
+            data.setdefault("project_assets", []).append({
+                "project_id": project_id,
+                "shot_id": shot["id"],
+                "asset_id": asset_id,
+                "asset_source": source,
+                "match_score": 100 if source != "web_search" else 80,
+                "match_reason": "Recovered from the project image directory",
+                "created_at": now,
+            })
+            known_paths.add(str(resolved).lower())
+            recovered_by_shot.setdefault(shot["id"], []).append(asset)
+
+    if not recovered_by_shot:
+        return False
+
+    valid_asset_ids = {item.get("id") for item in data.get("generated_assets", [])}
+    for shot in data.get("shots", []):
+        recovered = recovered_by_shot.get(shot.get("id"))
+        if not recovered:
+            continue
+        if shot.get("selected_asset_id") not in valid_asset_ids:
+            preferred = next(
+                (item for item in recovered if item.get("asset_source") in {"ai_generated", "manual_upload"}),
+                recovered[0],
+            )
+            shot["selected_asset_id"] = preferred["id"]
+            shot["asset_source"] = preferred["asset_source"]
+        shot["downloaded_image_count"] = len(recovered)
+        shot["status"] = (
+            "ai_generated"
+            if shot.get("asset_source") == "ai_generated"
+            else "web_downloaded"
+        )
+        shot["updated_at"] = now
+    return True
 
 
 def ensure_storage() -> None:
@@ -38,10 +157,20 @@ def ensure_storage() -> None:
             if key not in data:
                 data[key] = default
                 changed = True
+        for asset in data.get("generated_assets", []):
+            local_path = asset.get("local_path")
+            if not local_path:
+                continue
+            current_path = _current_storage_path(local_path)
+            if not current_path.exists() or str(current_path) == str(local_path):
+                continue
+            asset["local_path"] = str(current_path)
+            asset["file_url"] = public_url(current_path)
+            changed = True
         stale_asset_ids = {
             item.get("id")
             for item in data.get("generated_assets", [])
-            if item.get("local_path") and not Path(str(item["local_path"])).exists()
+            if item.get("local_path") and not _current_storage_path(str(item["local_path"])).exists()
         }
         if stale_asset_ids:
             data["generated_assets"] = [
@@ -67,6 +196,8 @@ def ensure_storage() -> None:
                 shot["match_score"] = 0
                 shot["image_score"] = None
                 shot["search_attempts"] = 0
+            changed = True
+        if _recover_orphaned_generated_assets(data):
             changed = True
         if changed:
             save_db(data)

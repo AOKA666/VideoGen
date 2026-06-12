@@ -332,6 +332,11 @@ h3 { font-size: 16px; line-height: 1.48; }
   margin-bottom: 18px;
 }
 .single-upload { grid-template-columns: minmax(240px, 1fr) minmax(220px, .45fr) auto; }
+.asset-upload-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 .row, .actions {
   display: flex;
   align-items: center;
@@ -379,6 +384,7 @@ h3 { font-size: 16px; line-height: 1.48; }
   background: rgba(255, 255, 255, .88);
   box-shadow: 0 2px 8px rgba(0, 0, 0, .12);
   cursor: pointer;
+  transition: opacity .16s ease, transform .16s ease;
 }
 .asset-checkbox input {
   width: 16px;
@@ -672,6 +678,28 @@ h3 { font-size: 16px; line-height: 1.48; }
   position: relative;
   overflow: hidden;
   transition: transform .2s ease, box-shadow .2s ease, border-color .2s ease;
+}
+.library-asset-card .preview {
+  aspect-ratio: 1 / 1;
+}
+.library-asset-card .asset-checkbox {
+  opacity: 0;
+  pointer-events: none;
+  transform: scale(.88);
+}
+.library-asset-card:hover .asset-checkbox,
+.library-asset-card:focus-within .asset-checkbox,
+.library-asset-card.selected .asset-checkbox {
+  opacity: 1;
+  pointer-events: auto;
+  transform: scale(1);
+}
+.preview-clickable {
+  cursor: zoom-in;
+}
+.preview-clickable:focus-visible {
+  outline: 3px solid rgba(36, 103, 91, .42);
+  outline-offset: -3px;
 }
 .asset-card:hover {
   transform: translateY(-2px);

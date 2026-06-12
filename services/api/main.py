@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 
 from routers import assets, export, generation, matching, projects, shots, system
 from services.env import load_env_local
-from services.store import ensure_storage, load_db, save_db
+from services.store import STORAGE, ensure_storage, load_db, save_db
 from services.web_image_pipeline import recover_interrupted_searches
 
 load_env_local()
@@ -49,7 +49,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/storage", StaticFiles(directory="../../storage"), name="storage")
+app.mount("/storage", StaticFiles(directory=str(STORAGE)), name="storage")
 
 app.include_router(projects.router)
 app.include_router(assets.router)

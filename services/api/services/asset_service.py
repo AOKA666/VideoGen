@@ -22,7 +22,7 @@ def bigmodel_endpoint() -> str:
 
 
 def bigmodel_model() -> str:
-    return os.getenv("BIGMODEL_MODEL", "glm-5.1")
+    return os.getenv("BIGMODEL_IMAGE_MODEL", "glm-4.6v")
 
 
 def detect_file_type(filename: str) -> str:

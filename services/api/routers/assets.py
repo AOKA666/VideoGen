@@ -156,14 +156,42 @@ def analyze_asset_background(asset_id: str, manual_tags: dict | None) -> None:
         asset.get("file_type"),
     )
     tags = merge_manual_tags(tags, manual_tags)
+    db = load_db()
+    asset = next((a for a in db["assets"] if a["id"] == asset_id), None)
+    if not asset:
+        return
+    shot = next(
+        (
+            item for item in db.get("shots", [])
+            if item.get("id") == asset.get("archived_from_shot_id")
+        ),
+        None,
+    )
+    intent = (shot or {}).get("material_intent") or {}
+    intent_tags = {
+        "object": intent.get("objects") or [],
+        "scene": intent.get("scenes") or [],
+        "keywords": intent.get("keywords") or [],
+    }
+    for key in ("object", "scene", "keywords"):
+        tags[key] = list(dict.fromkeys([
+            *[str(x).strip() for x in intent_tags.get(key) or [] if str(x).strip()],
+            *[str(x).strip() for x in tags.get(key) or [] if str(x).strip()],
+        ]))[:12]
     for key in ["era", "emotion", "visual_style"]:
         asset.pop(key, None)
     asset.pop("people", None)
     asset.update(tags)
     rename_analyzed_asset(asset)
-    asset["analysis_status"] = "ready" if not tags.get("analysis_error") else "failed"
+    has_tags = any(tags.get(key) for key in ("object", "scene", "keywords"))
+    asset["analysis_status"] = "ready" if has_tags or not tags.get("analysis_error") else "failed"
     asset["updated_at"] = datetime.now().isoformat(timespec="seconds")
     save_db(db)
+
+
+def analyze_assets_background(asset_ids: list[str]) -> None:
+    for asset_id in asset_ids:
+        analyze_asset_background(asset_id, None)
 
 
 @router.post("/upload")
@@ -195,6 +223,46 @@ def upload_assets(
     return {"status": "analyzing", "count": len(uploaded), "skipped": skipped, "assets": uploaded}
 
 
+@router.post("/retry-analysis")
+def retry_asset_analysis(background_tasks: BackgroundTasks):
+    db = load_db()
+    retry_ids = []
+    now = datetime.now().isoformat(timespec="seconds")
+    for asset in db.get("assets", []):
+        if (
+            asset.get("file_type") != "image"
+            or asset.get("analysis_status") not in {"analyzing", "failed"}
+            or not Path(str(asset.get("local_path") or "")).exists()
+        ):
+            continue
+        shot = next(
+            (
+                item for item in db.get("shots", [])
+                if item.get("id") == asset.get("archived_from_shot_id")
+            ),
+            None,
+        )
+        intent = (shot or {}).get("material_intent") or {}
+        if "contentFilter" in str(asset.get("analysis_error") or "") and any(intent.values()):
+            asset["object"] = list(intent.get("objects") or [])
+            asset["scene"] = list(intent.get("scenes") or [])
+            asset["keywords"] = list(intent.get("keywords") or [])
+            asset["analysis_status"] = "ready"
+            asset["analysis_provider"] = "storyboard_fallback"
+            asset["updated_at"] = now
+            rename_analyzed_asset(asset)
+            continue
+        retry_ids.append(asset["id"])
+        asset["analysis_status"] = "analyzing"
+        asset["analysis_provider"] = "pending"
+        asset["analysis_error"] = ""
+        asset["updated_at"] = now
+    save_db(db)
+    if retry_ids:
+        background_tasks.add_task(analyze_assets_background, retry_ids)
+    return {"status": "analyzing" if retry_ids else "completed", "queued": len(retry_ids)}
+
+
 @router.post("/{asset_id}/analyze")
 def analyze(asset_id: str):
     db = load_db()
@@ -208,7 +276,8 @@ def analyze(asset_id: str):
     asset.pop("people", None)
     asset.update(tags)
     rename_analyzed_asset(asset)
-    asset["analysis_status"] = "ready" if not tags.get("analysis_error") else "failed"
+    has_tags = any(tags.get(key) for key in ("object", "scene", "keywords"))
+    asset["analysis_status"] = "ready" if has_tags or not tags.get("analysis_error") else "failed"
     asset["updated_at"] = datetime.now().isoformat(timespec="seconds")
     save_db(db)
     return {"asset_id": asset_id, **tags}

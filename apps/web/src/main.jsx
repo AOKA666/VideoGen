@@ -126,7 +126,7 @@ function App() {
   const searchProgress = useMemo(() => {
     const total = shots.length || project?.search_total || 0;
     const success = shots.filter((shot) => ['web_downloaded', 'ai_generated', 'matched'].includes(shot.status)).length;
-    const failed = shots.filter((shot) => ['no_image', 'intent_failed'].includes(shot.status)).length;
+    const failed = shots.filter((shot) => ['no_image', 'no_match', 'intent_failed'].includes(shot.status)).length;
     const completed = shots.length
       ? success + failed
       : Math.min(total, project?.search_completed || 0);
@@ -221,10 +221,14 @@ function App() {
     } else if (previous === 'searching_images' && current === 'search_stopped') {
       setMessage('');
     } else if (previous === 'searching_images' && current && current !== 'searching_images') {
-      setMessage('分镜图片处理完成');
+      if (searchProgress.total && searchProgress.completed < searchProgress.total) {
+        setMessage(`分镜图片处理结束，仍有 ${searchProgress.total - searchProgress.completed} 个分镜未完成`);
+      } else {
+        setMessage('分镜图片处理完成');
+      }
     }
     lastProjectStatusRef.current = current;
-  }, [project?.status, project?.search_error]);
+  }, [project?.status, project?.search_error, searchProgress.completed, searchProgress.total]);
 
   async function chooseLibraryFolder() {
     if ('showDirectoryPicker' in window) {
@@ -391,6 +395,15 @@ function App() {
     if (editingAsset && ids.includes(editingAsset.id)) setEditingAsset(null);
     await refreshAll(projectId);
     setMessage(`已删除 ${result.deleted_count} 个素材（${result.deleted_files} 个文件）`);
+  }
+
+  async function retryAssetAnalysis() {
+    const result = await run('重试标签识别', () => request('/api/assets/retry-analysis', {
+      method: 'POST',
+    }));
+    if (!result) return;
+    setMessage(result.queued ? `已重新提交 ${result.queued} 张图片进行标签识别` : '没有需要重试的图片');
+    await refreshAll(projectId);
   }
 
   function toggleAssetSelect(assetId) {
@@ -725,7 +738,10 @@ function App() {
                 <div className="toolbar single-upload">
                   <input ref={uploadInputRef} name="files" type="file" accept=".jpg,.jpeg,.png,.webp,.mp4,.mov" multiple onChange={handleUploadPick} />
                   <span>{pendingUpload ? `已选择 ${pendingUpload.files.length} 个文件` : '选择图片或视频后先设置标签'}</span>
-                  <button className="primary" type="button" onClick={() => uploadInputRef.current?.click()}><ImagePlus size={18} /> 选择素材</button>
+                  <div className="asset-upload-actions">
+                    <button type="button" onClick={retryAssetAnalysis}><RefreshCw size={18} /> 重试标签识别</button>
+                    <button className="primary" type="button" onClick={() => uploadInputRef.current?.click()}><ImagePlus size={18} /> 选择素材</button>
+                  </div>
                 </div>
                 {assets.length > 0 && (
                   <div className="batch-bar">
@@ -747,8 +763,10 @@ function App() {
                     <AssetCard
                       key={asset.id}
                       asset={asset}
+                      libraryCard
                       selected={selectedAssetIds.has(asset.id)}
                       onSelect={() => toggleAssetSelect(asset.id)}
+                      onPreview={() => setPreviewAsset(asset)}
                       onEdit={() => setEditingAsset(asset)}
                       onDelete={() => deleteAsset(asset)}
                     />
@@ -979,7 +997,7 @@ function App() {
               {/* Step 2: Cover Generation (only after title is confirmed) */}
               <div className="cover-section">
                 <h3>第二步 · 生成封面</h3>
-                <p className="cover-layout-note">上传人物图片后，系统会将图片居中裁剪为 1:1 并添加圆角。图片和两行标题会完整排在 9:16 画布正中的 1080×1440 区域内。</p>
+                <p className="cover-layout-note">上传人物图片后，系统会将图片居中裁剪为 1:1 并添加圆角。图片顶部会预留安全间距，图片和两行标题会完整排在平台居中裁切的 3:4 区域内。</p>
                 <input
                   ref={coverInputRef}
                   className="hidden-input"
@@ -1128,18 +1146,32 @@ function ProjectSelect({ projects, projectId, open, onOpenChange, onSelect }) {
   );
 }
 
-function AssetCard({ asset, selected, onSelect, onEdit, onDelete, imageTools }) {
+function AssetCard({ asset, selected, onSelect, onPreview, onEdit, onDelete, imageTools, libraryCard = false }) {
   const imageScore = asset.score_result?.score ?? asset.match_score;
   const imageReason = asset.score_result?.reason;
   const src = assetImageUrl(asset);
+  const canPreview = Boolean(onPreview && asset.file_type === 'image');
+  function openPreview(event) {
+    if (!canPreview) return;
+    if (event.type === 'keydown' && !['Enter', ' '].includes(event.key)) return;
+    event.preventDefault();
+    onPreview();
+  }
   return (
-    <article className={`${asset.analysis_status === 'analyzing' ? 'asset-card analyzing' : 'asset-card'}${selected ? ' selected' : ''}`}>
+    <article className={`${asset.analysis_status === 'analyzing' ? 'asset-card analyzing' : 'asset-card'}${libraryCard ? ' library-asset-card' : ''}${selected ? ' selected' : ''}`}>
       {onSelect && (
         <label className="asset-checkbox" onClick={(e) => e.stopPropagation()}>
           <input type="checkbox" checked={!!selected} onChange={onSelect} />
         </label>
       )}
-      <div className="preview">
+      <div
+        className={`preview${canPreview ? ' preview-clickable' : ''}`}
+        role={canPreview ? 'button' : undefined}
+        tabIndex={canPreview ? 0 : undefined}
+        title={canPreview ? '点击放大预览' : undefined}
+        onClick={openPreview}
+        onKeyDown={openPreview}
+      >
         {asset.file_type === 'image' ? <SafeImage src={src} alt={asset.file_name} /> : <video src={src} controls />}
         {imageTools}
       </div>

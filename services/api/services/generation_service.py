@@ -254,7 +254,11 @@ def remove_watermark_with_seedream(path: Path, shot: dict | None = None) -> dict
     if not path.exists():
         raise RuntimeError(f"Image does not exist: {path}")
 
-    prompt = "去除图片上的字幕、残留的Logo和水印"
+    prompt = (
+        "仅移除原图中已有的字幕、Logo和水印，并自然修复被遮挡区域。"
+        "禁止新增任何文字、Logo、角标、水印、平台标识或“AI生成”标识。"
+        "保持原图主体、人物、构图、色彩、光影和画面比例不变。"
+    )
 
     original_bytes = path.read_bytes()
     with Image.open(BytesIO(original_bytes)) as source:
@@ -272,6 +276,7 @@ def remove_watermark_with_seedream(path: Path, shot: dict | None = None) -> dict
         "strength": 0.3,
         "n": 1,
         "size": image_edit_size_for_source(path),
+        "watermark": False,
         "response_format": "url",
     }
     req = urllib.request.Request(
@@ -327,6 +332,7 @@ def remove_watermark_with_seedream(path: Path, shot: dict | None = None) -> dict
         "watermark_removed": True,
         "subtitles_removed": True,
         "logos_removed": True,
+        "output_watermark_disabled": True,
         "original_size_preserved": True,
         "provider": "volcengine_ark",
         "model": ark_image_edit_model(),
@@ -563,7 +569,7 @@ def compose_uploaded_cover(source_path: Path, cover_path: Path, line1: str, line
     content_bottom = content_top + 1440
     portrait_size = 960
     portrait_x = (canvas_width - portrait_size) // 2
-    portrait_y = content_top
+    portrait_y = content_top + 72
     corner_radius = 56
 
     with Image.open(source_path) as source:

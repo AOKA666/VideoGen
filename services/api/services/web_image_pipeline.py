@@ -23,7 +23,7 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-DONE_STATUSES = {"web_downloaded", "no_image", "ai_generated", "matched"}
+DONE_STATUSES = {"web_downloaded", "no_image", "no_match", "ai_generated", "matched"}
 ACTIVE_SEARCH_STATUSES = {"pending_search", "analyzing_intent", "searching"}
 MIN_ACCEPT_SCORE = 30
 MAX_SEARCH_ROUNDS = 2
@@ -267,6 +267,21 @@ def _search_result_history(items: list) -> list[dict]:
 
 def _project_seen_images(db: dict, project_id: str, *, exclude_shot_id: str | None = None) -> dict[str, set[str]]:
     seen = {"urls": set(), "hashes": set(), "sources": set()}
+    selected_ids = {
+        shot.get("selected_asset_id")
+        for shot in db.get("shots", [])
+        if shot.get("project_id") == project_id
+        and (not exclude_shot_id or shot.get("id") != exclude_shot_id)
+        and shot.get("selected_asset_id")
+    }
+    for asset in db.get("assets", []):
+        if asset.get("id") not in selected_ids:
+            continue
+        if asset.get("hash"):
+            seen["hashes"].add(str(asset["hash"]))
+        original_path = str(asset.get("original_path") or "")
+        if original_path.startswith(("http://", "https://")):
+            seen["sources"].add(_url_key(original_path))
     for asset in db.get("generated_assets", []):
         if asset.get("project_id") != project_id:
             continue
@@ -1014,6 +1029,12 @@ def rerun_shot_web_image_search(project_id: str, shot_id: str, image_search_prov
         shot.pop("_search_query_overrides", None)
     if project:
         project["status"] = "shots_ready"
+        project["search_stage"] = "done"
+        project["search_total"] = len([
+            item for item in db.get("shots", [])
+            if item.get("project_id") == project_id
+        ])
+        project["search_completed"] = _completed_count(db.get("shots", []), project_id)
         project["current_shot_index"] = None
         project["current_search_keyword"] = ""
         project["updated_at"] = _now()

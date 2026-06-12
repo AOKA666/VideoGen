@@ -15,6 +15,19 @@ def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def archived_image_name(topic: str, timestamp: str, sequence: int, suffix: str) -> str:
+    safe_topic = safe_storage_name(topic).replace(" ", "_") or "素材"
+    return safe_storage_name(f"{safe_topic}-{timestamp}-{sequence:03d}{suffix}")
+
+
+def archived_image_subject(intent: dict) -> str:
+    candidates = [
+        *(intent.get("objects") or []),
+        *(intent.get("keywords") or []),
+    ]
+    return next((str(item).strip() for item in candidates if str(item).strip()), "素材")
+
+
 def build_material_intent(shot: dict) -> dict:
     # Prefer AI-generated structured tags (object_tags, scene_tags, keywords)
     # over the legacy keywords_from_text() approach
@@ -61,10 +74,44 @@ def apply_material_intent(shot: dict) -> dict:
     return intent
 
 
+def used_library_assets(db: dict, project_id: str, *, exclude_shot_id: str | None = None) -> tuple[set[str], set[str]]:
+    library_assets = {item.get("id"): item for item in db.get("assets", []) if item.get("id")}
+    generated_assets = {
+        item.get("id"): item
+        for item in db.get("generated_assets", [])
+        if item.get("id")
+    }
+    used_ids: set[str] = set()
+    used_hashes: set[str] = set()
+    for project_shot in db.get("shots", []):
+        if project_shot.get("project_id") != project_id:
+            continue
+        if exclude_shot_id and project_shot.get("id") == exclude_shot_id:
+            continue
+        selected_id = project_shot.get("selected_asset_id")
+        asset = library_assets.get(selected_id) or generated_assets.get(selected_id)
+        if not asset:
+            continue
+        if selected_id in library_assets:
+            used_ids.add(selected_id)
+        if asset.get("hash"):
+            used_hashes.add(str(asset["hash"]))
+    return used_ids, used_hashes
+
+
 def apply_library_match(db: dict, project_id: str, shot: dict, minimum_score: int = 50) -> bool:
     best: tuple[dict | None, int, str] = (None, 0, "")
+    used_ids, used_hashes = used_library_assets(
+        db,
+        project_id,
+        exclude_shot_id=shot.get("id"),
+    )
     for asset in db.get("assets", []):
         if asset.get("file_type") != "image" or not asset.get("is_available", True):
+            continue
+        if asset.get("id") in used_ids:
+            continue
+        if asset.get("hash") and str(asset["hash"]) in used_hashes:
             continue
         if not Path(str(asset.get("local_path") or "")).exists():
             continue
@@ -103,18 +150,48 @@ def analyze_archived_asset(asset_id: str) -> None:
         return
     path = Path(str(asset.get("local_path") or ""))
     tags = analyze_asset(asset.get("file_name") or path.name, path, "image")
+    db = load_db()
+    asset = next((x for x in db.get("assets", []) if x.get("id") == asset_id), None)
+    if not asset:
+        return
+    shot = next(
+        (
+            item for item in db.get("shots", [])
+            if item.get("id") == asset.get("archived_from_shot_id")
+        ),
+        None,
+    )
+    intent = (shot or {}).get("material_intent") or (build_material_intent(shot) if shot else {})
+    intent_tags = {
+        "object": intent.get("objects") or [],
+        "scene": intent.get("scenes") or [],
+        "keywords": intent.get("keywords") or [],
+    }
     for key in ("object", "scene", "keywords"):
         tags[key] = list(dict.fromkeys([
             *[str(x).strip() for x in asset.get(key) or [] if str(x).strip()],
+            *[str(x).strip() for x in intent_tags.get(key) or [] if str(x).strip()],
             *[str(x).strip() for x in tags.get(key) or [] if str(x).strip()],
         ]))[:12]
     asset.update(tags)
-    asset["analysis_status"] = "ready" if not tags.get("analysis_error") else "failed"
+    has_tags = any(tags.get(key) for key in ("object", "scene", "keywords"))
+    asset["analysis_status"] = "ready" if has_tags or not tags.get("analysis_error") else "failed"
     asset["updated_at"] = now_iso()
     save_db(db)
 
 
+def analyze_archived_assets(asset_ids: list[str]) -> None:
+    for asset_id in asset_ids:
+        analyze_archived_asset(asset_id)
+
+
 def archive_project_images(db: dict, project_id: str) -> dict:
+    project = next(
+        (item for item in db.get("projects", []) if item.get("id") == project_id),
+        None,
+    )
+    topic = str((project or {}).get("name") or (project or {}).get("content_type") or "素材").strip()
+    batch_timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     shots = sorted(
         [x for x in db.get("shots", []) if x.get("project_id") == project_id],
         key=lambda x: x.get("shot_index", 0),
@@ -154,11 +231,23 @@ def archive_project_images(db: dict, project_id: str) -> dict:
             continue
         asset_id = new_id()
         suffix = source.suffix.lower() or ".jpg"
-        filename = safe_storage_name(f"shot-{shot.get('shot_index', 0):03d}-{asset_id}{suffix}")
+        intent = shot.get("material_intent") or apply_material_intent(shot)
+        subject = archived_image_subject(intent)
+        sequence = int(shot.get("shot_index", 0))
+        filename = archived_image_name(subject, batch_timestamp, sequence, suffix)
         target = ASSETS_DIR / filename
         ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+        counter = 1
+        while target.exists():
+            filename = archived_image_name(
+                subject,
+                batch_timestamp,
+                sequence,
+                f"-{counter}{suffix}",
+            )
+            target = ASSETS_DIR / filename
+            counter += 1
         shutil.copy2(source, target)
-        intent = shot.get("material_intent") or apply_material_intent(shot)
         now = now_iso()
         asset = {
             "id": asset_id,
@@ -173,8 +262,9 @@ def archive_project_images(db: dict, project_id: str) -> dict:
             "object": list(intent.get("objects") or []),
             "scene": list(intent.get("scenes") or []),
             "keywords": list(dict.fromkeys([
+                topic,
                 *(intent.get("keywords") or []),
-            ])),
+            ]))[:12],
             "visual_style": "新闻纪实",
             "analysis_status": "analyzing",
             "analysis_provider": "pending",

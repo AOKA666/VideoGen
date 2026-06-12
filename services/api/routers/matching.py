@@ -9,7 +9,7 @@ from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Query, Uplo
 from PIL import Image
 
 from services.asset_service import new_id
-from services.material_library_service import analyze_archived_asset, archive_project_images
+from services.material_library_service import analyze_archived_assets, archive_project_images
 from services.store import load_db, project_dir, public_url, save_db
 from services.web_image_pipeline import (
     mark_project_searching,
@@ -32,8 +32,8 @@ def archive_selected_images(project_id: str, background_tasks: BackgroundTasks):
         raise HTTPException(400, "Please choose an asset library folder first")
     result = archive_project_images(db, project_id)
     save_db(db)
-    for asset_id in result["created_ids"]:
-        background_tasks.add_task(analyze_archived_asset, asset_id)
+    if result["created_ids"]:
+        background_tasks.add_task(analyze_archived_assets, result["created_ids"])
     return {
         "status": "analyzing" if result["created"] else "completed",
         **result,
@@ -145,7 +145,17 @@ def _retry_failed_shots_task(project_id: str, shot_ids: list[str], image_search_
     db = load_db()
     project = next((p for p in db.get("projects", []) if p.get("id") == project_id), None)
     if project and project.get("status") == "searching_images":
+        project_shots = [
+            item for item in db.get("shots", [])
+            if item.get("project_id") == project_id
+        ]
         project["status"] = "shots_ready"
+        project["search_stage"] = "done"
+        project["search_total"] = len(project_shots)
+        project["search_completed"] = sum(
+            1 for item in project_shots
+            if item.get("status") in {"web_downloaded", "no_image", "no_match", "ai_generated", "matched"}
+        )
         project["current_shot_index"] = None
         project["current_search_keyword"] = ""
         project["updated_at"] = datetime.now().isoformat(timespec="seconds")

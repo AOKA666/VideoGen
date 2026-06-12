@@ -39,6 +39,7 @@
 BIGMODEL_API_KEY=your_bigmodel_api_key
 BIGMODEL_ENDPOINT=https://open.bigmodel.cn/api/paas/v4
 BIGMODEL_MODEL=glm-5.1
+BIGMODEL_IMAGE_MODEL=glm-4.6v
 
 # 火山方舟 / Seedream：AI 分镜图和去水印
 ARK_API_KEY=your_ark_api_key

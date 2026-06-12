@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from services.store import PROJECTS_DIR, load_db, project_dir, save_db
 from services.text_service import RewriteQualityError, infer_title, rewrite_script
-from services.web_image_pipeline import recover_interrupted_searches
+from services.web_image_pipeline import DONE_STATUSES, recover_interrupted_searches
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
@@ -84,6 +84,18 @@ def get_project(project_id: str):
             save_db(db)
 
     shots = [s for s in db["shots"] if s["project_id"] == project_id]
+    if project.get("status") == "shots_ready":
+        completed = sum(1 for shot in shots if shot.get("status") in DONE_STATUSES)
+        if (
+            project.get("search_total") != len(shots)
+            or project.get("search_completed") != completed
+            or (completed == len(shots) and project.get("search_stage") != "done")
+        ):
+            project["search_total"] = len(shots)
+            project["search_completed"] = completed
+            if completed == len(shots):
+                project["search_stage"] = "done"
+            save_db(db)
     generated_assets = [
         a for a in db.get("generated_assets", [])
         if a.get("project_id") == project_id
