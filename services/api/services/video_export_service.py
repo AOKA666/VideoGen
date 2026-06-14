@@ -136,6 +136,83 @@ def probe_media(path: Path) -> dict[str, Any]:
     }
 
 
+def render_looped_background_music(
+    music_path: Path,
+    output_path: Path,
+    target_duration_sec: float,
+    start_sec: float = 0,
+    volume: float = 0.2,
+    crossfade_sec: float = 1.0,
+) -> dict[str, Any]:
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        raise RuntimeError("FFmpeg and ffprobe are required to prepare background music")
+    music_probe = probe_media(music_path)
+    source_duration = float(music_probe.get("duration_sec") or 0)
+    if source_duration <= 0:
+        raise RuntimeError("Background music has no readable duration")
+
+    start_sec = max(0.0, min(float(start_sec or 0), max(source_duration - 0.1, 0)))
+    target_duration_sec = max(float(target_duration_sec), 0.1)
+    volume = max(0.0, min(float(volume), 1.0))
+    first_duration = source_duration - start_sec
+    fade = min(max(float(crossfade_sec), 0), source_duration / 3, first_duration / 3)
+    if first_duration < 1:
+        start_sec = 0
+        first_duration = source_duration
+        fade = min(max(float(crossfade_sec), 0), source_duration / 3)
+
+    segment_count = 1
+    combined_duration = first_duration
+    added_duration = max(source_duration - fade, 0.1)
+    while combined_duration < target_duration_sec:
+        segment_count += 1
+        combined_duration += added_duration
+    segment_count = min(segment_count, 200)
+
+    split_labels = "".join(f"[s{index}]" for index in range(segment_count))
+    filters = [f"[0:a]asplit={segment_count}{split_labels}"]
+    for index in range(segment_count):
+        trim_start = start_sec if index == 0 else 0
+        filters.append(
+            f"[s{index}]atrim=start={trim_start:.6f}:end={source_duration:.6f},"
+            f"asetpts=PTS-STARTPTS[p{index}]"
+        )
+    current = "p0"
+    for index in range(1, segment_count):
+        output_label = f"x{index}"
+        if fade > 0:
+            filters.append(
+                f"[{current}][p{index}]acrossfade=d={fade:.6f}:c1=tri:c2=tri[{output_label}]"
+            )
+        else:
+            filters.append(f"[{current}][p{index}]concat=n=2:v=0:a=1[{output_label}]")
+        current = output_label
+    filters.append(
+        f"[{current}]atrim=duration={target_duration_sec:.6f},"
+        f"volume={volume:.6f},asetpts=PTS-STARTPTS[aout]"
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(music_path.resolve()),
+        "-filter_complex", ";\n".join(filters),
+        "-map", "[aout]",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        str(output_path.resolve()),
+    ])
+    report = probe_media(output_path)
+    report.update({
+        "source": music_path.name,
+        "source_start_sec": round(start_sec, 3),
+        "volume": round(volume, 3),
+        "loop_segments": segment_count,
+        "crossfade_sec": round(fade, 3),
+    })
+    return report
+
+
 def render_project_video(
     shots: list[dict[str, Any]],
     scene_paths: list[Path],
@@ -145,6 +222,7 @@ def render_project_video(
     transition_sec: float = 0.5,
     title_line1: str = "",
     title_line2: str = "",
+    background_music_path: Path | None = None,
 ) -> dict[str, Any]:
     if len(shots) != len(scene_paths) or not shots:
         raise RuntimeError("Every shot must have one exported scene")
@@ -170,6 +248,8 @@ def render_project_video(
         "-f", "concat", "-safe", "0", "-i", str(concat_script.resolve()),
         "-i", str(audio_path.resolve()),
     ]
+    if background_music_path:
+        command.extend(["-i", str(background_music_path.resolve())])
 
     filters = [
         "[0:v]scale=1080:1080:force_original_aspect_ratio=increase,"
@@ -231,8 +311,19 @@ def render_project_video(
         filters.append("[vsub]null[vout]")
     filters.append(
         f"[1:a]apad,atrim=duration={total_duration:.3f},"
-        "asetpts=PTS-STARTPTS[aout]"
+        "asetpts=PTS-STARTPTS[voice]"
     )
+    if background_music_path:
+        filters.append(
+            f"[2:a]apad,atrim=duration={total_duration:.3f},"
+            "asetpts=PTS-STARTPTS[music]"
+        )
+        filters.append(
+            "[voice][music]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+            "alimiter=limit=0.95[aout]"
+        )
+    else:
+        filters.append("[voice]anull[aout]")
     filter_script = output_path.parent / "ffmpeg_filter.txt"
     filter_script.write_text(";\n".join(filters), encoding="utf-8")
 
@@ -351,6 +442,10 @@ def create_jianying_native_draft(
     cover_path: Path | None = None,
     title_line1: str = "",
     title_line2: str = "",
+    background_music_path: Path | None = None,
+    background_music_start_sec: float = 0,
+    background_music_volume: float = 0.2,
+    music_crossfade_sec: float = 1.0,
 ) -> dict[str, Any]:
     try:
         import pyJianYingDraft as draft
@@ -380,6 +475,10 @@ def create_jianying_native_draft(
         local_scenes.append(target)
     local_audio = audio_dir / audio_path.name
     shutil.copy2(audio_path, local_audio)
+    local_music = None
+    if background_music_path:
+        local_music = audio_dir / f"background_music{background_music_path.suffix.lower()}"
+        shutil.copy2(background_music_path, local_music)
     local_subtitles = materials_dir / "subtitles.srt"
     shutil.copy2(subtitles_path, local_subtitles)
 
@@ -408,6 +507,44 @@ def create_jianying_native_draft(
             ),
             "voice",
         )
+    if local_music:
+        music_material = draft.AudioMaterial(str(local_music))
+        source_duration_us = music_material.duration
+        start_us = max(
+            0,
+            min(round(float(background_music_start_sec or 0) * 1_000_000), max(source_duration_us - 100_000, 0)),
+        )
+        first_duration_us = source_duration_us - start_us
+        if first_duration_us < 1_000_000:
+            start_us = 0
+            first_duration_us = source_duration_us
+        fade_us = min(
+            round(max(float(music_crossfade_sec), 0) * 1_000_000),
+            source_duration_us // 3,
+            first_duration_us // 3,
+        )
+        script.add_track(draft.TrackType.audio, "music_a")
+        script.add_track(draft.TrackType.audio, "music_b")
+        target_start_us = 0
+        segment_index = 0
+        while target_start_us < audio_duration_us and segment_index < 200:
+            source_start_us = start_us if segment_index == 0 else 0
+            available_us = source_duration_us - source_start_us
+            target_duration_us = min(available_us, audio_duration_us - target_start_us)
+            segment = draft.AudioSegment(
+                music_material,
+                draft.Timerange(target_start_us, target_duration_us),
+                source_timerange=draft.Timerange(source_start_us, target_duration_us),
+                volume=max(0.0, min(float(background_music_volume), 1.0)),
+            )
+            segment_fade_us = min(fade_us, target_duration_us // 3)
+            if segment_fade_us > 0:
+                segment.add_fade(segment_fade_us, segment_fade_us)
+            script.add_segment(segment, "music_a" if segment_index % 2 == 0 else "music_b")
+            if target_start_us + target_duration_us >= audio_duration_us:
+                break
+            target_start_us += max(target_duration_us - fade_us, 1)
+            segment_index += 1
     # Use 思源圆体 (ResourceHanRounded) — the closest built-in rounded font
     # to 文源圆体 in Jianying. Falls back gracefully if unavailable.
     try:
@@ -501,4 +638,5 @@ def create_jianying_native_draft(
         "draft_path": str(draft_path.resolve()),
         "file_count": sum(1 for item in draft_path.rglob("*") if item.is_file()),
         "cover": cover_report,
+        "background_music": bool(local_music),
     }

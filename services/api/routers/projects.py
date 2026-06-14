@@ -68,6 +68,14 @@ def get_project(project_id: str):
     if recover_interrupted_searches(db, project_id):
         save_db(db)
 
+    if project.get("status") != "searching_images" and (
+        project.get("current_shot_index") is not None
+        or project.get("current_search_keyword")
+    ):
+        project["current_shot_index"] = None
+        project["current_search_keyword"] = ""
+        save_db(db)
+
     # Fix orphaned shot statuses: if project is not searching, shots stuck in
     # active search statuses should be reset to failed so the UI doesn't hang
     if project.get("status") not in ("searching_images",):

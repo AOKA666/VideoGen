@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -13,6 +14,7 @@ from services.asset_service import analyze_asset, detect_file_type, new_id, safe
 from services.store import ASSETS_DIR, load_db, public_url, save_db
 
 router = APIRouter(prefix="/api/assets", tags=["assets"])
+AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
 
 
 class LibraryConfig(BaseModel):
@@ -66,6 +68,78 @@ def rename_analyzed_asset(asset: dict) -> None:
 def get_library():
     library = load_db().get("asset_library")
     return {"library": library if is_valid_library(library) else None}
+
+
+def _audio_duration(path: Path) -> float:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=0x08000000,
+        )
+        return round(float(result.stdout.strip()), 3)
+    except (FileNotFoundError, subprocess.CalledProcessError, ValueError) as exc:
+        raise HTTPException(400, f"无法读取音乐文件：{exc}") from exc
+
+
+@router.get("/music")
+def list_music():
+    db = load_db()
+    music = [
+        item for item in db.get("music_library", [])
+        if Path(str(item.get("local_path") or "")).exists()
+    ]
+    return {"music": music}
+
+
+@router.post("/music")
+def upload_music(file: UploadFile = File(...)):
+    db = load_db()
+    require_library(db)
+    original_name = safe_storage_name(file.filename or "background-music")
+    suffix = Path(original_name).suffix.lower()
+    if suffix not in AUDIO_EXTS:
+        raise HTTPException(400, "仅支持 MP3、WAV、M4A、AAC、OGG、FLAC 音乐文件")
+
+    music_id = new_id()
+    target = ASSETS_DIR / f"music_{music_id}{suffix}"
+    try:
+        with target.open("wb") as output:
+            shutil.copyfileobj(file.file, output)
+        if target.stat().st_size > 100 * 1024 * 1024:
+            raise ValueError("音乐文件不能超过 100 MB")
+        duration = _audio_duration(target)
+        if duration <= 0:
+            raise ValueError("音乐时长无效")
+    except Exception as exc:
+        target.unlink(missing_ok=True)
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(400, f"音乐上传失败：{exc}") from exc
+
+    now = datetime.now().isoformat(timespec="seconds")
+    preset = {
+        "id": music_id,
+        "name": Path(original_name).stem,
+        "file_name": original_name,
+        "file_url": public_url(target),
+        "local_path": str(target),
+        "duration_sec": duration,
+        "file_size": target.stat().st_size,
+        "created_at": now,
+    }
+    db.setdefault("music_library", []).append(preset)
+    save_db(db)
+    return {"status": "success", "music": preset}
 
 
 @router.post("/library")

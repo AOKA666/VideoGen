@@ -21,11 +21,13 @@ DEFAULT_DB: dict[str, Any] = {
     "assets": [],
     "project_assets": [],
     "generated_assets": [],
+    "music_library": [],
     "asset_library": None,
     "web_image_failures": [],
     "web_image_diagnostics": [],
 }
 _DB_LOCK = threading.RLock()
+_STORAGE_INITIALIZED = False
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 _SHOT_DIR_PATTERN = re.compile(r"^shot_(\d+)$")
 _SHOT_FILE_PATTERN = re.compile(r"^shot_(\d+)\.(?:png|jpe?g|webp)$", re.IGNORECASE)
@@ -135,21 +137,24 @@ def _recover_orphaned_generated_assets(data: dict[str, Any]) -> bool:
             shot["selected_asset_id"] = preferred["id"]
             shot["asset_source"] = preferred["asset_source"]
         shot["downloaded_image_count"] = len(recovered)
-        shot["status"] = (
-            "ai_generated"
-            if shot.get("asset_source") == "ai_generated"
-            else "web_downloaded"
-        )
+        shot["status"] = {
+            "ai_generated": "ai_generated",
+            "manual_upload": "uploaded",
+        }.get(shot.get("asset_source"), "web_downloaded")
         shot["updated_at"] = now
     return True
 
 
 def ensure_storage() -> None:
+    global _STORAGE_INITIALIZED
     with _DB_LOCK:
+        if _STORAGE_INITIALIZED:
+            return
         ASSETS_DIR.mkdir(parents=True, exist_ok=True)
         PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
         if not DB.exists():
             save_db(dict(DEFAULT_DB))
+            _STORAGE_INITIALIZED = True
             return
         data = _read_db_file()
         changed = False
@@ -187,7 +192,7 @@ def ensure_storage() -> None:
                 if item.get("shot_id")
             }
             for shot in data.get("shots", []):
-                if shot.get("status") != "web_downloaded" or shot.get("id") in remaining_by_shot:
+                if shot.get("status") not in {"web_downloaded", "uploaded"} or shot.get("id") in remaining_by_shot:
                     continue
                 shot["status"] = "no_image"
                 shot["selected_asset_id"] = None
@@ -201,6 +206,7 @@ def ensure_storage() -> None:
             changed = True
         if changed:
             save_db(data)
+        _STORAGE_INITIALIZED = True
 
 
 def load_db() -> dict[str, Any]:

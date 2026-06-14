@@ -23,7 +23,7 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-DONE_STATUSES = {"web_downloaded", "no_image", "no_match", "ai_generated", "matched"}
+DONE_STATUSES = {"web_downloaded", "uploaded", "no_image", "no_match", "ai_generated", "matched"}
 ACTIVE_SEARCH_STATUSES = {"pending_search", "analyzing_intent", "searching"}
 MIN_ACCEPT_SCORE = 30
 MAX_SEARCH_ROUNDS = 2
@@ -127,7 +127,17 @@ def recover_interrupted_searches(
             }
             for shot in active_shots:
                 selected_id = shot.get("selected_asset_id")
-                shot["status"] = "web_downloaded" if selected_id in asset_ids else "no_image"
+                selected_asset = next(
+                    (
+                        asset for asset in db.get("generated_assets", [])
+                        if asset.get("id") == selected_id
+                    ),
+                    None,
+                )
+                if selected_asset and selected_asset.get("asset_source") == "manual_upload":
+                    shot["status"] = "uploaded"
+                else:
+                    shot["status"] = "web_downloaded" if selected_id in asset_ids else "no_image"
                 shot["current_search_keyword"] = ""
                 shot["search_finished_at"] = now.isoformat(timespec="seconds")
                 shot["updated_at"] = shot["search_finished_at"]
@@ -981,6 +991,93 @@ def run_project_web_image_search(project_id: str) -> None:
                 shot["status"] = "no_image"
                 shot["current_search_keyword"] = ""
                 shot["updated_at"] = _now()
+        save_db(db)
+
+
+def rerun_failed_shots_web_image_search(
+    project_id: str,
+    shot_ids: list[str],
+    image_search_provider: str = "so",
+) -> None:
+    db = load_db()
+    project = next((p for p in db.get("projects", []) if p.get("id") == project_id), None)
+    if not project:
+        return
+
+    now = _now()
+    retry_shots = []
+    for shot in db.get("shots", []):
+        if shot.get("project_id") != project_id or shot.get("id") not in shot_ids:
+            continue
+        _clear_shot_web_assets(db, project_id, shot["id"])
+        shot["selected_asset_id"] = None
+        shot["asset_source"] = None
+        shot["match_score"] = 0
+        shot["image_score"] = None
+        shot["status"] = "pending_search"
+        shot["downloaded_image_count"] = 0
+        shot.pop("_search_query_overrides", None)
+        if image_search_provider == "tencent":
+            shot["_search_query_overrides"] = _tencent_retry_queries(shot)
+        shot["_image_search_provider"] = image_search_provider
+        shot["current_search_keyword"] = search_query_for_shot(shot)
+        shot["updated_at"] = now
+        retry_shots.append(shot)
+
+    project["status"] = "searching_images"
+    project["search_stage"] = "retrying_failed"
+    project["image_search_provider"] = image_search_provider
+    project["search_stop_requested"] = False
+    project["search_total"] = len([
+        shot for shot in db.get("shots", [])
+        if shot.get("project_id") == project_id
+    ])
+    project["current_shot_index"] = None
+    project["current_search_keyword"] = (
+        f"正在使用{'腾讯云' if image_search_provider == 'tencent' else '360'}"
+        f"重新搜索 {len(retry_shots)} 个失败分镜"
+    )
+    project["updated_at"] = now
+    save_db(db)
+
+    try:
+        if retry_shots:
+            _search_shots_batch(
+                project_id,
+                retry_shots,
+                total=int(project.get("search_total") or len(retry_shots)),
+            )
+    except Exception as exc:
+        logger.exception("[image-search] project=%s failed-shot retry crashed", project_id)
+        db = load_db()
+        project = next((p for p in db.get("projects", []) if p.get("id") == project_id), None)
+        if project:
+            project["search_error"] = str(exc)[:500]
+        for shot in db.get("shots", []):
+            if shot.get("project_id") == project_id and shot.get("id") in shot_ids:
+                if shot.get("status") in ACTIVE_SEARCH_STATUSES:
+                    shot["status"] = "no_image"
+                    shot["current_search_keyword"] = ""
+                    shot["updated_at"] = _now()
+        save_db(db)
+    finally:
+        db = load_db()
+        project = next((p for p in db.get("projects", []) if p.get("id") == project_id), None)
+        for shot in db.get("shots", []):
+            if shot.get("project_id") == project_id and shot.get("id") in shot_ids:
+                shot.pop("_search_query_overrides", None)
+                shot.pop("_image_search_provider", None)
+                if shot.get("status") in ACTIVE_SEARCH_STATUSES:
+                    shot["status"] = "no_image"
+                    shot["current_search_keyword"] = ""
+                    shot["updated_at"] = _now()
+        if project and project.get("status") != "search_stopped":
+            project["status"] = "shots_ready"
+            project["search_stage"] = "done"
+            project["search_completed"] = _completed_count(db.get("shots", []), project_id)
+            project["current_shot_index"] = None
+            project["current_search_keyword"] = ""
+            project["updated_at"] = _now()
         save_db(db)
 
 

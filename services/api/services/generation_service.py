@@ -341,13 +341,18 @@ def remove_watermark_with_seedream(path: Path, shot: dict | None = None) -> dict
     }
 
 
-def generate_doubao_image(path: Path, shot: dict, video_ratio: str | None = "9:16") -> dict:
+def generate_doubao_image(
+    path: Path,
+    shot: dict,
+    video_ratio: str | None = "9:16",
+    prompt_override: str | None = None,
+) -> dict:
     api_key = os.getenv("ARK_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("ARK_API_KEY is not configured")
 
     person_gender = infer_shot_person_gender(shot)
-    prompt = build_image_prompt(shot)
+    prompt = str(prompt_override or "").strip() or build_image_prompt(shot)
     payload = {
         "model": ark_image_model(),
         "prompt": prompt,

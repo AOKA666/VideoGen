@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from services.asset_service import new_id
 from services.generation_service import (
+    build_image_prompt,
     compose_uploaded_cover,
     generate_doubao_image,
     generate_export_srt,
@@ -30,6 +31,16 @@ router = APIRouter(prefix="/api/projects", tags=["generation"])
 class VoicePayload(BaseModel):
     voice_type: str | None = None
     speech_rate: int | None = None
+
+
+class ImageGenerationPayload(BaseModel):
+    prompt: str | None = None
+
+
+class MusicSettingsPayload(BaseModel):
+    music_id: str | None = None
+    start_sec: float = 0
+    volume: float = 0.2
 
 
 def _generated_image(db: dict, project_id: str, asset_id: str) -> tuple[dict, Path]:
@@ -232,15 +243,24 @@ def remove_generated_image_watermark(project_id: str, asset_id: str):
     return {"status": "success", "asset": asset, "watermark": result}
 
 
+@router.get("/{project_id}/shots/{shot_id}/image-prompt")
+def get_image_prompt(project_id: str, shot_id: str):
+    db = load_db()
+    shot = next((s for s in db["shots"] if s["project_id"] == project_id and s["id"] == shot_id), None)
+    if not shot:
+        raise HTTPException(404, "Shot not found")
+    return {"shot_id": shot_id, "prompt": build_image_prompt(shot)}
+
+
 @router.post("/{project_id}/shots/{shot_id}/generate-image")
-def generate_image(project_id: str, shot_id: str):
+def generate_image(project_id: str, shot_id: str, payload: ImageGenerationPayload | None = None):
     db = load_db()
     shot = next((s for s in db["shots"] if s["project_id"] == project_id and s["id"] == shot_id), None)
     if not shot:
         raise HTTPException(404, "Shot not found")
     out = project_dir(project_id) / "images" / f"shot_{shot['shot_index']:03d}.png"
     try:
-        result = generate_doubao_image(out, shot, "1:1")
+        result = generate_doubao_image(out, shot, "1:1", payload.prompt if payload else None)
     except Exception as exc:
         raise HTTPException(502, str(exc)) from exc
     prompt = result["prompt"]
@@ -427,6 +447,44 @@ def download_cover(project_id: str):
         media_type="image/png",
         filename="video-cover.png",
     )
+
+
+@router.patch("/{project_id}/music-settings")
+def update_music_settings(project_id: str, payload: MusicSettingsPayload):
+    db = load_db()
+    project = next((p for p in db["projects"] if p["id"] == project_id), None)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    music = None
+    if payload.music_id:
+        music = next(
+            (item for item in db.get("music_library", []) if item.get("id") == payload.music_id),
+            None,
+        )
+        if not music or not Path(str(music.get("local_path") or "")).exists():
+            raise HTTPException(404, "Music preset not found")
+
+    duration = float((music or {}).get("duration_sec") or 0)
+    start_sec = max(0.0, float(payload.start_sec or 0))
+    if duration > 0:
+        start_sec = min(start_sec, max(duration - 0.1, 0))
+    volume = max(0.0, min(1.0, float(payload.volume)))
+    now = datetime.now().isoformat(timespec="seconds")
+    project.update({
+        "background_music_id": music.get("id") if music else None,
+        "background_music_name": music.get("name") if music else "",
+        "background_music_url": music.get("file_url") if music else "",
+        "background_music_start_sec": round(start_sec, 3),
+        "background_music_volume": round(volume, 3),
+        "updated_at": now,
+    })
+    save_db(db)
+    return {
+        "status": "success",
+        "music": music,
+        "start_sec": project["background_music_start_sec"],
+        "volume": project["background_music_volume"],
+    }
 
 
 @router.post("/{project_id}/generate-subtitles")

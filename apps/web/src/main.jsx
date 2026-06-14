@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Archive, Crop, Download, Eraser, Film, FolderOpen, ImagePlus, Library, Mic, RefreshCw, Save, Scissors, Search, Tags, Trash2, Wand2 } from 'lucide-react';
+import { Archive, Crop, Download, Eraser, Film, FolderOpen, ImagePlus, Library, Mic, Music, RefreshCw, Save, Scissors, Search, Tags, Trash2, Wand2 } from 'lucide-react';
 import './styles.css';
 
 const API = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
@@ -58,12 +58,14 @@ function App() {
   const [generatedAssets, setGeneratedAssets] = useState([]);
   const [webImageDiagnostics, setWebImageDiagnostics] = useState([]);
   const [library, setLibrary] = useState(null);
+  const [musicLibrary, setMusicLibrary] = useState([]);
   const [editingAsset, setEditingAsset] = useState(null);
   const [pendingUpload, setPendingUpload] = useState(null);
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
   const [processingImage, setProcessingImage] = useState('');
   const [generatingShotId, setGeneratingShotId] = useState('');
+  const [imagePromptEditors, setImagePromptEditors] = useState({});
   const [materialSourceStrategy, setMaterialSourceStrategy] = useState('library_first');
   const [voiceType, setVoiceType] = useState(VOICE_OPTIONS[0].value);
   const [speechRate, setSpeechRate] = useState(0);
@@ -71,13 +73,19 @@ function App() {
   const [titleLine2, setTitleLine2] = useState('');
   const [titleConfirmed, setTitleConfirmed] = useState(false);
   const [coverImage, setCoverImage] = useState(null);
+  const [backgroundMusicId, setBackgroundMusicId] = useState('');
+  const [backgroundMusicStart, setBackgroundMusicStart] = useState(0);
+  const [backgroundMusicVolume, setBackgroundMusicVolume] = useState(20);
   const [previewAsset, setPreviewAsset] = useState(null);
+  const [libraryPickerShotId, setLibraryPickerShotId] = useState('');
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [exportResult, setExportResult] = useState(null);
   const [selectedAssetIds, setSelectedAssetIds] = useState(new Set());
   const folderFallbackRef = useRef(null);
   const uploadInputRef = useRef(null);
   const coverInputRef = useRef(null);
+  const musicInputRef = useRef(null);
+  const musicPreviewRef = useRef(null);
   const lastProjectStatusRef = useRef('');
 
   const activeLibrary = validLibrary(library) ? library : null;
@@ -116,7 +124,11 @@ function App() {
       if (!selected) return;
       const list = map.get(shot.id) || [];
       if (!list.some((asset) => asset.id === selected.id)) {
-        list.unshift({ ...selected, shot_id: shot.id, asset_source: 'local' });
+        list.unshift({
+          ...selected,
+          shot_id: shot.id,
+          asset_source: shot.asset_source === 'library_upload' ? 'library_upload' : 'local',
+        });
       }
       map.set(shot.id, list);
     });
@@ -125,7 +137,7 @@ function App() {
   }, [assets, generatedAssets, shots]);
   const searchProgress = useMemo(() => {
     const total = shots.length || project?.search_total || 0;
-    const success = shots.filter((shot) => ['web_downloaded', 'ai_generated', 'matched'].includes(shot.status)).length;
+    const success = shots.filter((shot) => ['web_downloaded', 'uploaded', 'ai_generated', 'matched'].includes(shot.status)).length;
     const failed = shots.filter((shot) => ['no_image', 'no_match', 'intent_failed'].includes(shot.status)).length;
     const completed = shots.length
       ? success + failed
@@ -159,20 +171,22 @@ function App() {
   }
 
   async function refreshAll(id = projectId) {
-    const [projectList, assetList, libraryData] = await Promise.all([
+    const [projectList, assetList, libraryData, musicData, projectData] = await Promise.all([
       request('/api/projects'),
       request('/api/assets'),
       request('/api/assets/library'),
+      request('/api/assets/music'),
+      id ? request(`/api/projects/${id}`) : Promise.resolve(null),
     ]);
     setProjects(projectList.projects);
     setAssets(assetList.assets);
     setLibrary(validLibrary(libraryData.library) ? libraryData.library : null);
-    if (id) {
-      const data = await request(`/api/projects/${id}`);
-      setProject(data.project);
-      setShots(data.shots);
-      setGeneratedAssets(data.generated_assets || []);
-      setWebImageDiagnostics(data.web_image_diagnostics || []);
+    setMusicLibrary(musicData.music || []);
+    if (projectData) {
+      setProject(projectData.project);
+      setShots(projectData.shots);
+      setGeneratedAssets(projectData.generated_assets || []);
+      setWebImageDiagnostics(projectData.web_image_diagnostics || []);
       setProjectId(id);
     } else {
       setProject(null);
@@ -181,6 +195,15 @@ function App() {
       setWebImageDiagnostics([]);
       setProjectId('');
     }
+  }
+
+  async function refreshProject(id = projectId) {
+    if (!id) return;
+    const data = await request(`/api/projects/${id}`);
+    setProject(data.project);
+    setShots(data.shots);
+    setGeneratedAssets(data.generated_assets || []);
+    setWebImageDiagnostics(data.web_image_diagnostics || []);
   }
 
 
@@ -194,12 +217,41 @@ function App() {
     setTitleLine2(project.title_line2 || '');
     setTitleConfirmed(Boolean(project.title_line1 && project.title_line2) || Boolean(project.cover_url));
     setCoverImage(null);
-  }, [project?.id, project?.title_line1, project?.title_line2, project?.cover_url]);
+    setBackgroundMusicId(project.background_music_id || '');
+    setBackgroundMusicStart(Number(project.background_music_start_sec || 0));
+    setBackgroundMusicVolume(Math.round(Number(project.background_music_volume ?? 0.2) * 100));
+  }, [
+    project?.id,
+    project?.title_line1,
+    project?.title_line2,
+    project?.cover_url,
+    project?.background_music_id,
+    project?.background_music_start_sec,
+    project?.background_music_volume,
+  ]);
+
+  useEffect(() => {
+    const player = musicPreviewRef.current;
+    if (!player) return;
+    player.volume = Math.max(0, Math.min(1, backgroundMusicVolume / 100));
+  }, [backgroundMusicVolume, backgroundMusicId]);
+
+  useEffect(() => {
+    const player = musicPreviewRef.current;
+    if (!player || !Number.isFinite(player.duration)) return;
+    player.currentTime = Math.min(
+      backgroundMusicStart,
+      Math.max(player.duration - 0.1, 0),
+    );
+  }, [backgroundMusicStart, backgroundMusicId]);
 
   useEffect(() => {
     if (!assets.some((asset) => asset.analysis_status === 'analyzing')) return undefined;
     const timer = window.setInterval(() => {
-      refreshAll(projectId);
+      Promise.all([
+        request('/api/assets').then((data) => setAssets(data.assets)),
+        projectId ? refreshProject(projectId) : Promise.resolve(),
+      ]);
     }, 2500);
     return () => window.clearInterval(timer);
   }, [assets, projectId]);
@@ -208,7 +260,7 @@ function App() {
     const activeStatuses = ['pending_search', 'analyzing_intent', 'searching'];
     if (!projectId || !shots.some((shot) => activeStatuses.includes(shot.status)) && project?.status !== 'searching_images') return undefined;
     const timer = window.setInterval(() => {
-      refreshAll(projectId);
+      refreshProject(projectId);
     }, 1500);
     return () => window.clearInterval(timer);
   }, [shots, projectId, project]);
@@ -461,10 +513,44 @@ function App() {
     setMessage(`正在重新搜索 ${result.retried_count} 个失败分镜...`);
   }
 
-  async function generateImage(shotId) {
+  async function openImagePromptEditor(shotId) {
+    if (imagePromptEditors[shotId] !== undefined) return;
+    const result = await run('读取图片提示词', () => request(
+      `/api/projects/${projectId}/shots/${shotId}/image-prompt`,
+    ));
+    if (!result) return;
+    setImagePromptEditors((current) => ({ ...current, [shotId]: result.prompt || '' }));
+  }
+
+  function updateImagePrompt(shotId, prompt) {
+    setImagePromptEditors((current) => ({ ...current, [shotId]: prompt }));
+  }
+
+  function closeImagePromptEditor(shotId) {
+    setImagePromptEditors((current) => {
+      const next = { ...current };
+      delete next[shotId];
+      return next;
+    });
+  }
+
+  async function generateImage(shotId, prompt) {
+    if (!String(prompt || '').trim()) {
+      setMessage('图片提示词不能为空');
+      return;
+    }
     setGeneratingShotId(shotId);
     try {
-      await run('生成占位图', () => request(`/api/projects/${projectId}/shots/${shotId}/generate-image`, { method: 'POST' }));
+      const result = await run('生成占位图', () => request(
+        `/api/projects/${projectId}/shots/${shotId}/generate-image`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt: String(prompt).trim() }),
+        },
+      ));
+      if (!result) return;
+      closeImagePromptEditor(shotId);
       await refreshAll(projectId);
     } finally {
       setGeneratingShotId('');
@@ -526,12 +612,20 @@ function App() {
   }
 
   async function selectAsset(shotId, assetId, assetSource = 'web_search') {
-    await run('指定素材', () => request(`/api/projects/${projectId}/shots/${shotId}/asset`, {
+    const result = await run('指定素材', () => request(`/api/projects/${projectId}/shots/${shotId}/asset`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ asset_id: assetId, asset_source: assetSource }),
     }));
+    if (!result) return false;
     await refreshAll(projectId);
+    return true;
+  }
+
+  async function uploadShotImageFromLibrary(assetId) {
+    if (!libraryPickerShotId) return;
+    const selected = await selectAsset(libraryPickerShotId, assetId, 'library_upload');
+    if (selected) setLibraryPickerShotId('');
   }
 
   async function generateVoiceAndSubtitles() {
@@ -573,6 +667,77 @@ function App() {
     link.click();
     link.remove();
     setMessage('封面下载已开始');
+  }
+
+  async function saveMusicSettings(overrides = {}) {
+    const musicId = overrides.musicId ?? backgroundMusicId;
+    const startSec = overrides.startSec ?? backgroundMusicStart;
+    const volumePercent = overrides.volumePercent ?? backgroundMusicVolume;
+    const result = await run('保存配乐设置', () => request(
+      `/api/projects/${projectId}/music-settings`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          music_id: musicId || null,
+          start_sec: Number(startSec) || 0,
+          volume: Math.max(0, Math.min(100, Number(volumePercent) || 0)) / 100,
+        }),
+      },
+    ));
+    if (result) await refreshProject(projectId);
+  }
+
+  async function uploadBackgroundMusic(file) {
+    if (!file) return;
+    const data = new FormData();
+    data.append('file', file, file.name);
+    const result = await run('上传背景音乐', () => request('/api/assets/music', {
+      method: 'POST',
+      body: data,
+    }));
+    if (!result?.music) return;
+    const musicData = await request('/api/assets/music');
+    setMusicLibrary(musicData.music || []);
+    setBackgroundMusicId(result.music.id);
+    setBackgroundMusicStart(0);
+    await saveMusicSettings({
+      musicId: result.music.id,
+      startSec: 0,
+      volumePercent: backgroundMusicVolume,
+    });
+  }
+
+  function updateMusicPreviewStart(value) {
+    const nextStart = Math.max(0, Number(value) || 0);
+    setBackgroundMusicStart(nextStart);
+    const player = musicPreviewRef.current;
+    if (player?.duration) {
+      player.currentTime = Math.min(nextStart, Math.max(player.duration - 0.1, 0));
+    }
+  }
+
+  function updateMusicPreviewVolume(value) {
+    const nextVolume = Math.max(0, Math.min(100, Number(value) || 0));
+    setBackgroundMusicVolume(nextVolume);
+    if (musicPreviewRef.current) {
+      musicPreviewRef.current.volume = nextVolume / 100;
+    }
+  }
+
+  async function playMusicPreview() {
+    const player = musicPreviewRef.current;
+    if (!player) return;
+    player.currentTime = Math.min(
+      backgroundMusicStart,
+      Math.max((player.duration || backgroundMusicStart) - 0.1, 0),
+    );
+    player.volume = backgroundMusicVolume / 100;
+    try {
+      await player.play();
+    } catch {
+      setMessage('浏览器阻止了自动播放，请点击播放器的播放按钮');
+    }
   }
 
   async function generateTitle() {
@@ -670,7 +835,7 @@ function App() {
           <button className={tab === 'script' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('script')}><Wand2 size={18} /> 文案</button>
           <button className={tab === 'storyboard' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('storyboard')}><Archive size={18} /> 分镜</button>
           <button className={tab === 'match' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('match')}><Search size={18} /> 匹配</button>
-          <button className={tab === 'cover' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('cover')}><ImagePlus size={18} /> 标题与封面</button>
+          <button className={tab === 'cover' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('cover')}><Music size={18} /> 标题封面与配乐</button>
           <button className={tab === 'export' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('export')}><Download size={18} /> 导出</button>
         </nav>
         <div className="project-picker">
@@ -890,7 +1055,11 @@ function App() {
                   diagnostics={diagnosticsByShot.get(shot.id) || []}
                   onSelect={(assetId, assetSource) => selectAsset(shot.id, assetId, assetSource)}
                   onPreview={setPreviewAsset}
-                  onGenerate={() => generateImage(shot.id)}
+                  imagePrompt={imagePromptEditors[shot.id]}
+                  onOpenImagePrompt={() => openImagePromptEditor(shot.id)}
+                  onImagePromptChange={(prompt) => updateImagePrompt(shot.id, prompt)}
+                  onCancelImagePrompt={() => closeImagePromptEditor(shot.id)}
+                  onGenerate={(prompt) => generateImage(shot.id, prompt)}
                   onRetry={() => retryImageSearch(shot.id, 'so')}
                   onTencentRetry={() => retryImageSearch(shot.id, 'tencent')}
                   processingImage={processingImage}
@@ -898,6 +1067,7 @@ function App() {
                   onCrop={(assetId) => processGeneratedImage(assetId, 'crop-square')}
                   onRemoveWatermark={(assetId) => processGeneratedImage(assetId, 'remove-watermark')}
                   onManualUpload={(file) => uploadManualShotImage(shot.id, file)}
+                  onLibraryUpload={() => setLibraryPickerShotId(shot.id)}
                 />
               ))}
             </div>
@@ -923,7 +1093,11 @@ function App() {
                     diagnostics={diagnosticsByShot.get(shot.id) || []}
                     onSelect={(assetId, assetSource) => selectAsset(shot.id, assetId, assetSource)}
                     onPreview={setPreviewAsset}
-                    onGenerate={() => generateImage(shot.id)}
+                    imagePrompt={imagePromptEditors[shot.id]}
+                    onOpenImagePrompt={() => openImagePromptEditor(shot.id)}
+                    onImagePromptChange={(prompt) => updateImagePrompt(shot.id, prompt)}
+                    onCancelImagePrompt={() => closeImagePromptEditor(shot.id)}
+                    onGenerate={(prompt) => generateImage(shot.id, prompt)}
                     onRetry={() => retryImageSearch(shot.id, 'so')}
                     onTencentRetry={() => retryImageSearch(shot.id, 'tencent')}
                     processingImage={processingImage}
@@ -931,6 +1105,7 @@ function App() {
                     onCrop={(assetId) => processGeneratedImage(assetId, 'crop-square')}
                     onRemoveWatermark={(assetId) => processGeneratedImage(assetId, 'remove-watermark')}
                     onManualUpload={(file) => uploadManualShotImage(shot.id, file)}
+                    onLibraryUpload={() => setLibraryPickerShotId(shot.id)}
                   />
                   <select value={shot.selected_asset_id || ''} onChange={(e) => {
                     const options = selectableAssets.filter((item) => !item.shot_id || item.shot_id === shot.id);
@@ -951,8 +1126,8 @@ function App() {
             <div className="panel cover-editor">
               {/* Step 1: Title Generation */}
               <div>
-                <h2>标题与封面</h2>
-                <p>先为视频生成爆款两行标题，确认后再生成封面。标题会写到封面上和视频顶部。</p>
+                <h2>标题封面与配乐</h2>
+                <p>生成两行标题和视频封面，并从音乐库选择背景音乐。配乐设置会在 MP4 和剪映草稿导出时自动应用。</p>
               </div>
 
               <div className="title-section">
@@ -1021,10 +1196,102 @@ function App() {
                   >
                     <ImagePlus size={18} /> {project.cover_url ? '重新合成封面' : '生成 9:16 封面'}
                   </button>
-                  <button disabled={!project.cover_url} onClick={() => setTab('export')}>
-                    <Download size={18} /> 下一步：导出
-                  </button>
                 </div>
+              </div>
+
+              <div className="music-section">
+                <h3>第三步 · 设置背景音乐</h3>
+                <input
+                  ref={musicInputRef}
+                  className="hidden-input"
+                  type="file"
+                  accept=".mp3,.wav,.m4a,.aac,.ogg,.flac,audio/*"
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    if (file) uploadBackgroundMusic(file);
+                    event.target.value = '';
+                  }}
+                />
+                <label>
+                  音乐库
+                  <select
+                    value={backgroundMusicId}
+                    onChange={(event) => {
+                      setBackgroundMusicId(event.target.value);
+                      setBackgroundMusicStart(0);
+                    }}
+                  >
+                    <option value="">不添加背景音乐</option>
+                    {musicLibrary.map((music) => (
+                      <option key={music.id} value={music.id}>
+                        {music.name} · {Math.round(Number(music.duration_sec || 0))}秒
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <button type="button" onClick={() => musicInputRef.current?.click()}>
+                  <Music size={18} /> 上传音乐并加入音乐库
+                </button>
+                {backgroundMusicId && (() => {
+                  const selectedMusic = musicLibrary.find((music) => music.id === backgroundMusicId);
+                  if (!selectedMusic) return null;
+                  const maxStart = Math.max(0, Number(selectedMusic.duration_sec || 0) - 0.1);
+                  return (
+                    <>
+                      <audio
+                        ref={musicPreviewRef}
+                        controls
+                        src={`${API}${selectedMusic.file_url}`}
+                        onLoadedMetadata={(event) => {
+                          try {
+                            event.currentTarget.currentTime = Math.min(backgroundMusicStart, event.currentTarget.duration || 0);
+                            event.currentTarget.volume = backgroundMusicVolume / 100;
+                          } catch {
+                            // Browsers may reject seeking before metadata is ready.
+                          }
+                        }}
+                        onPlay={(event) => {
+                          event.currentTarget.volume = backgroundMusicVolume / 100;
+                          if (event.currentTarget.currentTime < backgroundMusicStart) {
+                            event.currentTarget.currentTime = backgroundMusicStart;
+                          }
+                        }}
+                      />
+                      <button type="button" onClick={playMusicPreview}>
+                        <Music size={18} /> 从设置位置试听
+                      </button>
+                      <label>
+                        音乐起始位置：{Number(backgroundMusicStart).toFixed(1)} 秒
+                        <input
+                          type="range"
+                          min="0"
+                          max={maxStart}
+                          step="0.1"
+                          value={Math.min(backgroundMusicStart, maxStart)}
+                          onChange={(event) => updateMusicPreviewStart(event.target.value)}
+                        />
+                      </label>
+                      <label>
+                        音乐音量：{backgroundMusicVolume}%
+                        <input
+                          type="range"
+                          min="0"
+                          max="100"
+                          step="1"
+                          value={backgroundMusicVolume}
+                          onChange={(event) => updateMusicPreviewVolume(event.target.value)}
+                        />
+                      </label>
+                    </>
+                  );
+                })()}
+                <button type="button" className="primary" disabled={busy} onClick={() => saveMusicSettings()}>
+                  <Save size={18} /> 保存配乐设置
+                </button>
+                <small>音乐不足视频时长时会自动循环，相邻循环片段使用 1 秒淡入淡出衔接。</small>
+                <button type="button" disabled={!project.cover_url} onClick={() => setTab('export')}>
+                  <Download size={18} /> 下一步：导出
+                </button>
               </div>
 
               {project.cover_model && <small>封面处理：{project.cover_model}</small>}
@@ -1070,7 +1337,7 @@ function App() {
               <VoiceSelect value={voiceType} onChange={setVoiceType} />
               <SpeechRateSelect value={speechRate} onChange={setSpeechRate} />
               <button onClick={generateVoiceAndSubtitles}><Mic size={18} /> 重新生成配音字幕</button>
-              <button onClick={() => setTab('cover')}><ImagePlus size={18} /> 标题与封面</button>
+              <button onClick={() => setTab('cover')}><Music size={18} /> 标题封面与配乐</button>
               <button onClick={openExportFolder}><FolderOpen size={18} /> 打开导出文件夹</button>
               <button className="primary" onClick={() => exportPackage('mp4')}><Film size={18} /> 导出 MP4</button>
               <button className="primary" onClick={() => exportPackage('draft')}><Archive size={18} /> 导出剪映草稿</button>
@@ -1121,6 +1388,13 @@ function App() {
       )}
       {editingAsset && <AssetEditor asset={editingAsset} onClose={() => setEditingAsset(null)} onSave={saveAssetTags} onDelete={deleteAsset} />}
       {previewAsset && <ImagePreview asset={previewAsset} onClose={() => setPreviewAsset(null)} />}
+      {libraryPickerShotId && (
+        <LibraryImagePicker
+          assets={assets}
+          onClose={() => setLibraryPickerShotId('')}
+          onSelect={uploadShotImageFromLibrary}
+        />
+      )}
     </div>
   );
 }
@@ -1468,6 +1742,40 @@ function AssetEditor({ asset, onClose, onSave, onDelete }) {
   );
 }
 
+function LibraryImagePicker({ assets, onClose, onSelect }) {
+  const images = assets.filter((asset) => asset.file_type === 'image' && asset.is_available !== false);
+  return (
+    <div className="modal-backdrop">
+      <div className="asset-editor library-image-picker">
+        <div className="row">
+          <div>
+            <h2>从素材库选择图片</h2>
+            <small>选择后会作为用户上传图片应用到当前分镜。</small>
+          </div>
+          <button type="button" onClick={onClose}>关闭</button>
+        </div>
+        {images.length ? (
+          <div className="library-picker-grid">
+            {images.map((asset) => (
+              <button
+                type="button"
+                className="library-picker-item"
+                key={asset.id}
+                onClick={() => onSelect(asset.id)}
+              >
+                <SafeImage src={assetImageUrl(asset)} alt={asset.file_name} />
+                <span>{asset.file_name}</span>
+              </button>
+            ))}
+          </div>
+        ) : (
+          <div className="empty-state">素材库中暂无可用图片，请先到素材库上传图片。</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function ShotCard({
   shot,
   assets = [],
@@ -1477,6 +1785,10 @@ function ShotCard({
   diagnostics = [],
   onSelect,
   onPreview,
+  imagePrompt,
+  onOpenImagePrompt,
+  onImagePromptChange,
+  onCancelImagePrompt,
   onGenerate,
   onRetry,
   onTencentRetry,
@@ -1485,6 +1797,7 @@ function ShotCard({
   onCrop,
   onRemoveWatermark,
   onManualUpload,
+  onLibraryUpload,
 }) {
   const manualUploadRef = useRef(null);
   const isGeneratingImage = generatingShotId === shot.id;
@@ -1530,6 +1843,28 @@ function ShotCard({
           </button>
         </div>
         <div className="shot-images">
+          {imagePrompt !== undefined && !isGeneratingImage && (
+            <div className="ai-prompt-editor">
+              <strong>编辑 AI 图片提示词</strong>
+              <textarea
+                value={imagePrompt}
+                onChange={(event) => onImagePromptChange?.(event.target.value)}
+                placeholder="输入希望 Seedream 生成的画面描述"
+                autoFocus
+              />
+              <div className="ai-prompt-actions">
+                <button type="button" onClick={onCancelImagePrompt}>取消</button>
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={!String(imagePrompt || '').trim()}
+                  onClick={() => onGenerate?.(imagePrompt)}
+                >
+                  <Wand2 size={16} /> 确认生成
+                </button>
+              </div>
+            </div>
+          )}
           {isGeneratingImage && (
             <div className="ai-generating-overlay">
               <Wand2 size={26} />
@@ -1636,11 +1971,18 @@ function ShotCard({
           ))}
         </div>
         <div className="shot-bottom-actions">
-          <button className={isGeneratingImage ? 'ai-generate-button active' : 'ai-generate-button'} onClick={onGenerate} disabled={isGeneratingImage}>
-            <Wand2 size={18} /> {isGeneratingImage ? 'AI 生成中' : 'AI 占位图'}
+          <button
+            className={isGeneratingImage ? 'ai-generate-button active' : 'ai-generate-button'}
+            onClick={onOpenImagePrompt}
+            disabled={isGeneratingImage}
+          >
+            <Wand2 size={18} /> {isGeneratingImage ? 'AI 生成中' : imagePrompt !== undefined ? '编辑提示词中' : 'AI 占位图'}
           </button>
           <button type="button" onClick={() => manualUploadRef.current?.click()}>
             <ImagePlus size={18} /> 上传下载图片
+          </button>
+          <button type="button" onClick={onLibraryUpload}>
+            <Library size={18} /> 从素材库选择
           </button>
           <input
             ref={manualUploadRef}

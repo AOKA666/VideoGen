@@ -20,6 +20,8 @@ from services.store import load_db, project_dir, public_url
 from services.video_export_service import (
     create_jianying_native_draft,
     jianying_drafts_root,
+    probe_media,
+    render_looped_background_music,
     render_project_video,
 )
 
@@ -161,6 +163,35 @@ def export_assets(
     if not copied_audio:
         raise HTTPException(400, "No voice audio found. Please generate voice and subtitles before export.")
 
+    music_preset = next(
+        (
+            item for item in db.get("music_library", [])
+            if item.get("id") == project.get("background_music_id")
+        ),
+        None,
+    )
+    source_music_value = str((music_preset or {}).get("local_path") or "").strip()
+    source_music = Path(source_music_value) if source_music_value else None
+    if source_music is not None and not source_music.is_file():
+        source_music = None
+    music_start_sec = float(project.get("background_music_start_sec") or 0)
+    music_volume = float(project.get("background_music_volume") or 0.2)
+    prepared_music = None
+    music_report = None
+    if source_music:
+        music_copy = export_dir / f"background_music_source{source_music.suffix.lower()}"
+        shutil.copy2(source_music, music_copy)
+        if output == "mp4":
+            prepared_music = export_dir / "background_music_loop.m4a"
+            music_report = render_looped_background_music(
+                music_copy,
+                prepared_music,
+                probe_media(copied_audio)["duration_sec"],
+                start_sec=music_start_sec,
+                volume=music_volume,
+                crossfade_sec=1.0,
+            )
+
     try:
         if output == "mp4":
             video_report = render_project_video(
@@ -171,6 +202,7 @@ def export_assets(
                 export_dir / "final_video.mp4",
                 title_line1=project.get("title_line1", ""),
                 title_line2=project.get("title_line2", ""),
+                background_music_path=prepared_music,
             )
             draft_report = None
         else:
@@ -185,6 +217,10 @@ def export_assets(
                 cover_source if cover_source.exists() else None,
                 title_line1=project.get("title_line1", ""),
                 title_line2=project.get("title_line2", ""),
+                background_music_path=source_music,
+                background_music_start_sec=music_start_sec,
+                background_music_volume=music_volume,
+                music_crossfade_sec=1.0,
             )
     except Exception as exc:
         raise HTTPException(500, f"Failed to generate export deliverables: {exc}") from exc
@@ -192,6 +228,12 @@ def export_assets(
         "output": output,
         "mp4": video_report,
         "jianying": draft_report,
+        "background_music": music_report or ({
+            "source": source_music.name,
+            "source_start_sec": music_start_sec,
+            "volume": music_volume,
+            "crossfade_sec": 1.0,
+        } if source_music else None),
     }
     (export_dir / "export_verification.json").write_text(
         json.dumps(verification, ensure_ascii=False, indent=2),

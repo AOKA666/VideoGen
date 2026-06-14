@@ -14,6 +14,7 @@ from services.store import load_db, project_dir, public_url, save_db
 from services.web_image_pipeline import (
     mark_project_searching,
     request_stop_project_search,
+    rerun_failed_shots_web_image_search,
     rerun_shot_web_image_search,
     reset_project_web_images,
     run_project_web_image_search,
@@ -126,41 +127,18 @@ def retry_failed_shots(
     project["search_stop_requested"] = False
     project["updated_at"] = now
     save_db(db)
-    background_tasks.add_task(_retry_failed_shots_task, project_id, [s["id"] for s in failed_shots], image_search_provider)
+    background_tasks.add_task(
+        rerun_failed_shots_web_image_search,
+        project_id,
+        [s["id"] for s in failed_shots],
+        image_search_provider,
+    )
     return {
         "project_id": project_id,
         "retried_count": len(failed_shots),
         "status": "searching_images",
         "image_search_provider": image_search_provider,
     }
-
-
-def _retry_failed_shots_task(project_id: str, shot_ids: list[str], image_search_provider: str) -> None:
-    for shot_id in shot_ids:
-        db = load_db()
-        project = next((p for p in db.get("projects", []) if p.get("id") == project_id), None)
-        if not project or project.get("search_stop_requested"):
-            break
-        rerun_shot_web_image_search(project_id, shot_id, image_search_provider)
-    db = load_db()
-    project = next((p for p in db.get("projects", []) if p.get("id") == project_id), None)
-    if project and project.get("status") == "searching_images":
-        project_shots = [
-            item for item in db.get("shots", [])
-            if item.get("project_id") == project_id
-        ]
-        project["status"] = "shots_ready"
-        project["search_stage"] = "done"
-        project["search_total"] = len(project_shots)
-        project["search_completed"] = sum(
-            1 for item in project_shots
-            if item.get("status") in {"web_downloaded", "no_image", "no_match", "ai_generated", "matched"}
-        )
-        project["current_shot_index"] = None
-        project["current_search_keyword"] = ""
-        project["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        save_db(db)
-
 
 @router.patch("/{project_id}/shots/{shot_id}/asset")
 def select_asset(project_id: str, shot_id: str, payload: dict):
@@ -169,13 +147,24 @@ def select_asset(project_id: str, shot_id: str, payload: dict):
     if not shot:
         raise HTTPException(404, "Shot not found")
     asset_id = payload.get("asset_id")
-    if asset_id and not any(a["id"] == asset_id for a in db["assets"]) and not any(a["id"] == asset_id for a in db.get("generated_assets", [])):
+    library_asset = next((a for a in db["assets"] if a["id"] == asset_id), None)
+    generated_asset = next((a for a in db.get("generated_assets", []) if a["id"] == asset_id), None)
+    if asset_id and not library_asset and not generated_asset:
         raise HTTPException(404, "Asset not found")
+    asset_source = payload.get("asset_source", "web_search")
+    if asset_source == "library_upload" and (
+        not library_asset
+        or library_asset.get("file_type") != "image"
+        or library_asset.get("is_available") is False
+    ):
+        raise HTTPException(400, "Please choose an available image from the asset library")
     shot["selected_asset_id"] = asset_id
-    shot["asset_source"] = payload.get("asset_source", "web_search")
+    shot["asset_source"] = asset_source
     if not asset_id:
         shot["status"] = "no_match"
-    elif any(a["id"] == asset_id for a in db["assets"]):
+    elif asset_source == "library_upload":
+        shot["status"] = "uploaded"
+    elif library_asset:
         shot["status"] = "matched"
     for candidate in db.get("project_assets", []):
         if candidate.get("project_id") == project_id and candidate.get("shot_id") == shot_id:
@@ -249,7 +238,7 @@ def upload_manual_shot_image(project_id: str, shot_id: str, file: UploadFile = F
             candidate["is_selected"] = candidate.get("asset_id") == asset_id
     shot["selected_asset_id"] = asset_id
     shot["asset_source"] = "manual_upload"
-    shot["status"] = "web_downloaded"
+    shot["status"] = "uploaded"
     shot["downloaded_image_count"] = len([
         item for item in db.get("generated_assets", []) if item.get("shot_id") == shot_id
     ])
