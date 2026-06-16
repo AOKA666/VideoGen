@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import urllib.error
 import urllib.request
@@ -15,6 +16,21 @@ MIN_REWRITE_LENGTH_RATIO = 0.85
 MAX_REWRITE_LENGTH_RATIO = 1.25
 MIN_REWRITE_DIFFERENCE = 45
 MAX_REWRITE_ATTEMPTS = 3
+RANDOM = random.SystemRandom()
+GUOZHIJILIANG_STORY_SEEDS = [
+    ("钱学森", "美国海关扣下他的行李，硬说里面藏着国家机密"),
+    ("邓稼先", "在戈壁核试验场，他明知有危险仍走向爆心查找碎片"),
+    ("黄旭华", "父亲去世不能回家奔丧，母亲多年不知道他去了哪里"),
+    ("郭永怀", "飞机失事前，他和警卫员用身体护住装有绝密资料的公文包"),
+    ("林俊德", "生命最后一天，他穿着病号服坐到电脑前整理资料"),
+    ("王淦昌", "他放下自己的名字，化名王京在西北隐身多年"),
+    ("于敏", "他从零开始转向氢弹理论研究，连家人都不知道他在做什么"),
+    ("袁隆平", "他蹲在稻田里寻找那株改变无数人饭碗的天然雄性不育株"),
+    ("孙家栋", "卫星发射前，他在控制大厅盯着屏幕等待最后的信号"),
+    ("屠呦呦", "她翻遍古籍后，把青蒿提取实验一次次推倒重来"),
+    ("王承书", "她主动要求抹掉自己的名字，隐姓埋名参与国家工程"),
+    ("彭士禄", "核潜艇研制最难的时候，他带着队伍在简陋条件下啃硬骨头"),
+]
 
 
 class RewriteQualityError(RuntimeError):
@@ -364,6 +380,116 @@ def rewrite_script(raw_script: str, style: str = "纪实故事型") -> dict:
     except Exception as exc:
         fallback["rewrite_error"] = str(exc)[:300]
         return fallback
+
+
+def choose_guozhijiliang_seed(person_name: str = "", event_angle: str = "") -> tuple[str, str]:
+    person = person_name.strip()
+    angle = event_angle.strip()
+    if person and angle:
+        return person, angle
+    if not person:
+        person, default_angle = RANDOM.choice(GUOZHIJILIANG_STORY_SEEDS)
+        return person, angle or default_angle
+    default_angle = next(
+        (seed_angle for seed_person, seed_angle in GUOZHIJILIANG_STORY_SEEDS if seed_person == person),
+        "从这个人物真实经历中选择一个最适合短视频叙事的核心事件",
+    )
+    return person, angle or default_angle
+
+
+def build_guozhijiliang_script_prompt(person_name: str = "", event_angle: str = "") -> str:
+    person_line, event_line = choose_guozhijiliang_seed(person_name, event_angle)
+    return f"""你是一名擅长视频号卖书短视频的文案策划，尤其擅长写《国之脊梁》风格的人物故事文案。
+
+我要你围绕《国之脊梁》相关院士写一篇短视频文案，目标是在视频号发布，用来带《国之脊梁》这类人物传记/爱国教育类图书。
+
+人物名称：{person_line}
+核心事件或角度：{event_line}
+目标书籍：《国之脊梁》
+文案长度：适合视频号 4 到 5 分钟（1000字左右）。
+
+核心要求：前三秒暴击、故事化、少大道理、按镜头分段、自然带书。
+
+整体风格：
+不要写成人物百科，不要平铺直叙介绍生平，不要从“某某出生于某年”开始。写成一个有画面感、有冲突、有悬念、有细节的人物故事。风格接近视频号爆款卖书文案，不是官方传记，不是新闻通稿，也不是空喊口号。核心感觉是：感动中国式叙事 + 短视频强钩子 + 家长愿意买给孩子看的价值观。
+
+前三秒开头：
+开头必须直接抓人，用强反差、强悬念、强画面，不能平铺直叙。优先使用结果反差、生死瞬间、身份反差、亲情冲突、被抹掉/消失悬念。开头要先给冲突，不要先讲背景。
+
+故事结构：
+1. 暴击开头：先抛出最有冲突的场景或结果。
+2. 留下悬念：让观众想知道“为什么会这样”。
+3. 揭示人物：自然引出人物名字，不要像百科一样硬介绍。
+4. 进入具体事件：只围绕一个核心事件展开，不要把人物一生全部塞进去。
+5. 加入细节：必须有具体动作、物品、场景，例如病号服、旧胶鞋、抽屉、笔记、手稿、公文包、实验室的灯、戈壁风沙、病床旁的电脑。
+6. 写出牺牲：不要直接说“他很伟大”，而是通过他放弃了什么、承受了什么来体现。
+7. 情绪收束：用一句人物原话、一个动作、一个画面或一个结果完成情绪爆发。
+8. 自然带书：结尾再自然提到《国之脊梁》，不要硬广，不要喊“赶紧购买”。
+
+内容要求：
+不要写大而空的句子，比如“他为国家做出了巨大贡献”“他是中华民族的脊梁”“他用一生诠释了伟大”“我们要永远铭记英雄”。这些意思可以通过故事和细节让观众自己感受到。不要频繁使用“震惊世界”“美国最害怕”“比核弹还恐怖”“全球第一”“举世无双”等夸张词，除非确有必要。
+
+镜头分段要求：
+文案必须按分镜分段。一个镜头一段。同一个镜头内部不要换行。每一段都必须能对应一个完整画面，方便后续 AI 配图、素材搜索、剪映剪辑。不要出现只有几个字的段落。每段建议 30 到 80 字左右。换段标准是：时间变化、地点变化、人物动作变化、画面主体变化、情绪节点变化。不要按朗读断句分段，而要按画面分段。
+
+故事化要求：
+每篇文案必须围绕一个具体故事，不要写人物一生简介。可参考但不要照搬这些角度：钱学森聚焦美国海关扣下行李；黄旭华聚焦父亲去世不能奔丧；郭永怀聚焦飞机失事前用身体护住公文包；林俊德聚焦生命最后一天穿病号服坐到电脑前整理资料；王承书聚焦主动要求抹掉自己的名字。
+
+结尾带书方式：
+结尾必须自然带《国之脊梁》，但不要硬卖。可以类似“最近读《国之脊梁》，再次看到他的故事，心里久久不能平静。”“如果家里有孩子，真希望他们认识这样的人。”不要连续喊口号。
+
+输出格式：
+只返回 JSON，不要 Markdown，不要解释写作思路，不要列大纲，不要加小标题，不要加“镜头一、镜头二”。JSON 字段必须包含 title, person, event_angle, script。script 字段里只放按镜头分段后的正文。"""
+
+
+def generate_guozhijiliang_script(person_name: str = "", event_angle: str = "") -> dict:
+    api_key = os.getenv("BIGMODEL_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("BIGMODEL_API_KEY is not configured")
+
+    selected_person, selected_angle = choose_guozhijiliang_seed(person_name, event_angle)
+    prompt = build_guozhijiliang_script_prompt(selected_person, selected_angle)
+    payload = {
+        "model": bigmodel_model(),
+        "messages": [
+            {"role": "system", "content": "你只输出可解析 JSON。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.85,
+        "top_p": 0.9,
+        "max_tokens": 4096,
+        "stream": False,
+        "thinking": {"type": "disabled"},
+        "response_format": {"type": "json_object"},
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{bigmodel_endpoint().rstrip('/')}/chat/completions",
+        data=data,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=90) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"GLM API {exc.code}: {error_body}") from exc
+
+    content = body["choices"][0]["message"]["content"]
+    if isinstance(content, list):
+        content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+    result = json.loads(extract_json(str(content)))
+    script = clean_rewritten_script("", str(result.get("script") or result.get("rewritten_script") or "")).strip()
+    if not script:
+        raise RuntimeError("GLM response does not contain script")
+    return {
+        "title": str(result.get("title") or infer_title(script)).strip()[:40],
+        "person": str(result.get("person") or selected_person).strip(),
+        "event_angle": str(result.get("event_angle") or selected_angle).strip(),
+        "script": script,
+        "provider": bigmodel_model(),
+    }
 
 
 def extract_json(text: str) -> str:

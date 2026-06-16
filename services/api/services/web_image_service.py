@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from services.asset_source_service import url_key
 from services.image_scoring_service import aspect_ratio_score, quick_score_image_for_shot
 from services.image_postprocess_service import detect_blocking_watermark
 from services.search_intent_service import validate_core_keyword
@@ -76,10 +77,7 @@ def _unique_results(results: list[ImageResult]) -> list[ImageResult]:
 
 
 def _url_key(url: str) -> str:
-    parsed = urllib.parse.urlsplit(url or "")
-    query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=False)
-    filtered = [(k, v) for k, v in query if not k.lower().startswith(("utm_", "spm", "from"))]
-    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urllib.parse.urlencode(filtered), ""))
+    return url_key(url)
 
 
 def _blocked_source_text(*values: str | None) -> str:

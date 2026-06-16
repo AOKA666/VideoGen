@@ -37,6 +37,7 @@ function emptyTagForm() {
     object: '',
     scene: '',
     keywords: '',
+    source_page: '',
     source_note: '用户上传',
     copyright_note: '自用素材',
   };
@@ -63,6 +64,9 @@ function App() {
   const [pendingUpload, setPendingUpload] = useState(null);
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
+  const [rawScriptDraft, setRawScriptDraft] = useState('');
+  const [aiScriptPerson, setAiScriptPerson] = useState('');
+  const [aiScriptAngle, setAiScriptAngle] = useState('');
   const [processingImage, setProcessingImage] = useState('');
   const [generatingShotId, setGeneratingShotId] = useState('');
   const [imagePromptEditors, setImagePromptEditors] = useState({});
@@ -314,14 +318,33 @@ function App() {
     ev.preventDefault();
     const form = new FormData(ev.currentTarget);
     const payload = Object.fromEntries(form.entries());
+    payload.raw_script = rawScriptDraft;
     const data = await run('创建项目', () => request('/api/projects', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     }));
     if (data?.project_id) {
+      setRawScriptDraft('');
+      setAiScriptPerson('');
+      setAiScriptAngle('');
       await refreshAll(data.project_id);
       setTab('script');
+    }
+  }
+
+  async function generateAiRawScript() {
+    const data = await run('AI 写文案', () => request('/api/projects/generate-guozhijiliang-script', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        person_name: aiScriptPerson,
+        event_angle: aiScriptAngle,
+      }),
+    }));
+    if (data?.script) {
+      setRawScriptDraft(data.script);
+      setMessage(data.person ? `AI 文案已生成：${data.person}` : 'AI 文案已生成');
     }
   }
 
@@ -400,6 +423,7 @@ function App() {
     if (!pendingUpload?.files?.length) return;
     const data = new FormData();
     pendingUpload.files.forEach((file) => data.append('files', file, file.name));
+    data.append('source_page', form.source_page || '');
     data.append('source_note', form.source_note || '用户上传');
     data.append('copyright_note', form.copyright_note || '自用素材');
     data.append('manual_tags', JSON.stringify({
@@ -708,6 +732,22 @@ function App() {
     });
   }
 
+  async function deleteBackgroundMusic() {
+    if (!backgroundMusicId) return;
+    const selectedMusic = musicLibrary.find((music) => music.id === backgroundMusicId);
+    if (!selectedMusic) return;
+    if (!window.confirm(`确认删除音乐「${selectedMusic.name}」吗？正在使用它的项目会清空配乐设置。`)) return;
+    const result = await run('删除背景音乐', () => request(`/api/assets/music/${backgroundMusicId}`, {
+      method: 'DELETE',
+    }));
+    if (!result) return;
+    const musicData = await request('/api/assets/music');
+    setMusicLibrary(musicData.music || []);
+    setBackgroundMusicId('');
+    setBackgroundMusicStart(0);
+    await refreshProject(projectId);
+  }
+
   function updateMusicPreviewStart(value) {
     const nextStart = Math.max(0, Number(value) || 0);
     setBackgroundMusicStart(nextStart);
@@ -869,8 +909,27 @@ function App() {
             <form onSubmit={createProject} className="panel">
               <h2>创建项目</h2>
               <label>项目名称<input name="name" placeholder="可留空，系统自动取标题" /></label>
-              <label>原始文案<textarea name="raw_script" required rows="12" placeholder="粘贴历史人物/纪实解说文案" /></label>
-              <button className="primary"><Save size={18} /> 创建并进入文案</button>
+              <div className="ai-script-options">
+                <label>人物名称（可选）<input value={aiScriptPerson} onChange={(event) => setAiScriptPerson(event.target.value)} placeholder="留空则随机选择《国之脊梁》院士" /></label>
+                <label>核心事件或角度（可选）<input value={aiScriptAngle} onChange={(event) => setAiScriptAngle(event.target.value)} placeholder="如：生命最后一天整理资料" /></label>
+              </div>
+              <label>
+                原始文案
+                <textarea
+                  name="raw_script"
+                  required
+                  rows="12"
+                  value={rawScriptDraft}
+                  onChange={(event) => setRawScriptDraft(event.target.value)}
+                  placeholder="粘贴历史人物/纪实解说文案，或点击 AI 写《国之脊梁》文案"
+                />
+              </label>
+              <div className="script-create-actions">
+                <button type="button" onClick={generateAiRawScript} disabled={busy}>
+                  <Wand2 size={18} /> AI 写文案
+                </button>
+                <button className="primary" disabled={!rawScriptDraft.trim()}><Save size={18} /> 创建并进入文案</button>
+              </div>
             </form>
             <div className="notes">
               <h2>V1 范围</h2>
@@ -914,13 +973,11 @@ function App() {
                       <input type="checkbox" checked={selectedAssetIds.size === assets.length && assets.length > 0} onChange={toggleSelectAllAssets} />
                       全选 ({assets.length})
                     </label>
-                    {selectedAssetIds.size > 0 && (
-                      <>
+                    <div className={selectedAssetIds.size > 0 ? 'batch-selection-actions visible' : 'batch-selection-actions'}>
                         <span className="batch-count">已选 {selectedAssetIds.size} 项</span>
                         <button className="danger compact-button" onClick={batchDeleteAssets}><Trash2 size={16} /> 批量删除</button>
                         <button className="compact-button" onClick={() => setSelectedAssetIds(new Set())}>取消选择</button>
-                      </>
-                    )}
+                    </div>
                   </div>
                 )}
                 <div className="asset-grid">
@@ -1214,20 +1271,32 @@ function App() {
                 />
                 <label>
                   音乐库
-                  <select
-                    value={backgroundMusicId}
-                    onChange={(event) => {
-                      setBackgroundMusicId(event.target.value);
-                      setBackgroundMusicStart(0);
-                    }}
-                  >
-                    <option value="">不添加背景音乐</option>
-                    {musicLibrary.map((music) => (
-                      <option key={music.id} value={music.id}>
-                        {music.name} · {Math.round(Number(music.duration_sec || 0))}秒
-                      </option>
-                    ))}
-                  </select>
+                  <div className="music-library-row">
+                    <select
+                      value={backgroundMusicId}
+                      onChange={(event) => {
+                        setBackgroundMusicId(event.target.value);
+                        setBackgroundMusicStart(0);
+                      }}
+                    >
+                      <option value="">不添加背景音乐</option>
+                      {musicLibrary.map((music) => (
+                        <option key={music.id} value={music.id}>
+                          {music.name} · {Math.round(Number(music.duration_sec || 0))}秒
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      className="danger icon-button"
+                      title="删除当前选中的音乐"
+                      aria-label="删除当前选中的音乐"
+                      disabled={!backgroundMusicId || busy}
+                      onClick={deleteBackgroundMusic}
+                    >
+                      <Trash2 size={18} />
+                    </button>
+                  </div>
                 </label>
                 <button type="button" onClick={() => musicInputRef.current?.click()}>
                   <Music size={18} /> 上传音乐并加入音乐库
@@ -1659,6 +1728,7 @@ function TagFields({ form, update }) {
         <label>主体标签<input value={form.object} onChange={(e) => update('object', e.target.value)} placeholder="钱学森，火车，纪念碑" /></label>
         <label>场景标签<input value={form.scene} onChange={(e) => update('scene', e.target.value)} placeholder="实验室，会议室，戈壁滩" /></label>
         <label>关键词<input value={form.keywords} onChange={(e) => update('keywords', e.target.value)} placeholder="归国科学家，留学回国" /></label>
+        <label>来源链接<input value={form.source_page || ''} onChange={(e) => update('source_page', e.target.value)} placeholder="https://..." /></label>
       </div>
       <label>来源备注<input value={form.source_note} onChange={(e) => update('source_note', e.target.value)} /></label>
       <label>版权备注<input value={form.copyright_note} onChange={(e) => update('copyright_note', e.target.value)} /></label>
@@ -1698,6 +1768,7 @@ function AssetEditor({ asset, onClose, onSave, onDelete }) {
     object: listToText(asset.object || asset.people),
     scene: listToText(asset.scene),
     keywords: listToText(asset.keywords),
+    source_page: asset.source_page || asset.remote_url || '',
     source_note: asset.source_note || '',
     copyright_note: asset.copyright_note || '',
     is_available: asset.is_available !== false,
@@ -1713,6 +1784,7 @@ function AssetEditor({ asset, onClose, onSave, onDelete }) {
       object: textToList(form.object),
       scene: textToList(form.scene),
       keywords: textToList(form.keywords),
+      source_page: form.source_page,
       source_note: form.source_note,
       copyright_note: form.copyright_note,
       is_available: form.is_available,

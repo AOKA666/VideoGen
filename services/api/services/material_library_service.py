@@ -5,10 +5,35 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
+from services.asset_source_service import asset_source_keys, normalize_asset_source_fields, url_key
 from services.asset_service import analyze_asset, new_id, safe_storage_name
 from services.match_service import score_asset
 from services.store import ASSETS_DIR, load_db, public_url, save_db
 from services.text_service import keywords_from_text
+
+
+MAX_TAG_LENGTH = {
+    "object": 8,
+    "scene": 8,
+    "keywords": 10,
+}
+
+
+def clean_asset_tags(key: str, values: list) -> list[str]:
+    max_length = MAX_TAG_LENGTH.get(key, 10)
+    cleaned: list[str] = []
+    for value in values or []:
+        tag = str(value).strip()
+        if not tag:
+            continue
+        if len(tag) > max_length:
+            continue
+        if any(char in tag for char in "，。！？；：、,.!?;:"):
+            continue
+        if tag in cleaned:
+            continue
+        cleaned.append(tag)
+    return cleaned[:12]
 
 
 def now_iso() -> str:
@@ -31,9 +56,9 @@ def archived_image_subject(intent: dict) -> str:
 def build_material_intent(shot: dict) -> dict:
     # Prefer AI-generated structured tags (object_tags, scene_tags, keywords)
     # over the legacy keywords_from_text() approach
-    ai_objects = [str(x).strip() for x in shot.get("object_tags") or [] if str(x).strip()]
-    ai_scenes = [str(x).strip() for x in shot.get("scene_tags") or [] if str(x).strip()]
-    ai_keywords = [str(x).strip() for x in shot.get("keywords") or [] if str(x).strip()]
+    ai_objects = clean_asset_tags("object", shot.get("object_tags") or [])
+    ai_scenes = clean_asset_tags("scene", shot.get("scene_tags") or [])
+    ai_keywords = clean_asset_tags("keywords", shot.get("keywords") or [])
 
     if ai_objects or ai_scenes or ai_keywords:
         return {
@@ -43,12 +68,8 @@ def build_material_intent(shot: dict) -> dict:
         }
 
     # Fallback: use required_object / required_scene if AI tags are not yet available
-    objects = list(dict.fromkeys([
-        *[str(x).strip() for x in shot.get("required_object") or [] if str(x).strip()],
-    ]))[:4]
-    scenes = list(dict.fromkeys([
-        *[str(x).strip() for x in shot.get("required_scene") or [] if str(x).strip()],
-    ]))[:3]
+    objects = clean_asset_tags("object", shot.get("required_object") or [])[:4]
+    scenes = clean_asset_tags("scene", shot.get("required_scene") or [])[:3]
     keywords: list[str] = []
 
     if not objects and not scenes:
@@ -168,11 +189,11 @@ def analyze_archived_asset(asset_id: str) -> None:
         "keywords": intent.get("keywords") or [],
     }
     for key in ("object", "scene", "keywords"):
-        tags[key] = list(dict.fromkeys([
-            *[str(x).strip() for x in asset.get(key) or [] if str(x).strip()],
-            *[str(x).strip() for x in intent_tags.get(key) or [] if str(x).strip()],
-            *[str(x).strip() for x in tags.get(key) or [] if str(x).strip()],
-        ]))[:12]
+        tags[key] = clean_asset_tags(key, [
+            *(asset.get(key) or []),
+            *(intent_tags.get(key) or []),
+            *(tags.get(key) or []),
+        ])
     asset.update(tags)
     has_tags = any(tags.get(key) for key in ("object", "scene", "keywords"))
     asset["analysis_status"] = "ready" if has_tags or not tags.get("analysis_error") else "failed"
@@ -186,11 +207,6 @@ def analyze_archived_assets(asset_ids: list[str]) -> None:
 
 
 def archive_project_images(db: dict, project_id: str) -> dict:
-    project = next(
-        (item for item in db.get("projects", []) if item.get("id") == project_id),
-        None,
-    )
-    topic = str((project or {}).get("name") or (project or {}).get("content_type") or "素材").strip()
     batch_timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     shots = sorted(
         [x for x in db.get("shots", []) if x.get("project_id") == project_id],
@@ -198,7 +214,9 @@ def archive_project_images(db: dict, project_id: str) -> dict:
     )
     generated = [x for x in db.get("generated_assets", []) if x.get("project_id") == project_id]
     existing_hashes: set[str] = set()
+    existing_source_keys: set[str] = set()
     for asset in db.get("assets", []):
+        normalize_asset_source_fields(asset)
         content_hash = str(asset.get("hash") or "")
         path = Path(str(asset.get("local_path") or ""))
         if not content_hash and path.exists() and asset.get("file_type") == "image":
@@ -206,6 +224,7 @@ def archive_project_images(db: dict, project_id: str) -> dict:
             asset["hash"] = content_hash
         if content_hash:
             existing_hashes.add(content_hash)
+        existing_source_keys.update(asset_source_keys(asset))
     created_ids: list[str] = []
     skipped = 0
     missing = 0
@@ -226,13 +245,22 @@ def archive_project_images(db: dict, project_id: str) -> dict:
             missing += 1
             continue
         content_hash = selected.get("hash") or hashlib.sha256(source.read_bytes()).hexdigest()
-        if content_hash in existing_hashes:
+        selected_source_keys = {
+            url_key(str(selected.get("source_page") or "")),
+            url_key(str(selected.get("remote_url") or "")),
+        }
+        selected_source_keys = {key for key in selected_source_keys if key}
+        if content_hash in existing_hashes or selected_source_keys.intersection(existing_source_keys):
             skipped += 1
             continue
         asset_id = new_id()
         suffix = source.suffix.lower() or ".jpg"
         intent = shot.get("material_intent") or apply_material_intent(shot)
-        subject = archived_image_subject(intent)
+        intent_keywords = clean_asset_tags("keywords", list(intent.get("keywords") or []))
+        subject = archived_image_subject({
+            "objects": clean_asset_tags("object", list(intent.get("objects") or [])),
+            "keywords": intent_keywords,
+        })
         sequence = int(shot.get("shot_index", 0))
         filename = archived_image_name(subject, batch_timestamp, sequence, suffix)
         target = ASSETS_DIR / filename
@@ -254,17 +282,17 @@ def archive_project_images(db: dict, project_id: str) -> dict:
             "library_id": (db.get("asset_library") or {}).get("id"),
             "file_name": filename,
             "original_path": selected.get("source_page") or selected.get("remote_url") or "",
+            "remote_url": selected.get("remote_url") or "",
+            "source_page": selected.get("source_page") or "",
+            "source_type": "archived_web",
             "file_type": "image",
             "file_url": public_url(target),
             "thumbnail_url": public_url(target),
             "local_path": str(target),
             "hash": content_hash,
-            "object": list(intent.get("objects") or []),
-            "scene": list(intent.get("scenes") or []),
-            "keywords": list(dict.fromkeys([
-                topic,
-                *(intent.get("keywords") or []),
-            ]))[:12],
+            "object": clean_asset_tags("object", list(intent.get("objects") or [])),
+            "scene": clean_asset_tags("scene", list(intent.get("scenes") or [])),
+            "keywords": intent_keywords,
             "visual_style": "新闻纪实",
             "analysis_status": "analyzing",
             "analysis_provider": "pending",
@@ -277,8 +305,10 @@ def archive_project_images(db: dict, project_id: str) -> dict:
             "created_at": now,
             "updated_at": now,
         }
+        normalize_asset_source_fields(asset)
         db.setdefault("assets", []).append(asset)
         existing_hashes.add(content_hash)
+        existing_source_keys.update(asset_source_keys(asset))
         created_ids.append(asset_id)
     return {
         "created_ids": created_ids,

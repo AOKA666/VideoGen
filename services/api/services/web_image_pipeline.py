@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import hashlib
 import os
 import logging
 import time
@@ -8,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from services.asset_source_service import asset_source_keys, normalize_asset_source_fields
 from services.asset_service import new_id
 from services.image_scoring_service import rank_images_for_shot
 from services.material_library_service import apply_library_match, apply_material_intent
@@ -277,6 +279,24 @@ def _search_result_history(items: list) -> list[dict]:
 
 def _project_seen_images(db: dict, project_id: str, *, exclude_shot_id: str | None = None) -> dict[str, set[str]]:
     seen = {"urls": set(), "hashes": set(), "sources": set()}
+    for asset in db.get("assets", []):
+        if asset.get("file_type") != "image":
+            continue
+        normalize_asset_source_fields(asset)
+        if asset.get("hash"):
+            seen["hashes"].add(str(asset["hash"]))
+        else:
+            path = Path(str(asset.get("local_path") or ""))
+            if path.exists():
+                try:
+                    asset["hash"] = hashlib.sha256(path.read_bytes()).hexdigest()
+                    seen["hashes"].add(str(asset["hash"]))
+                except OSError:
+                    pass
+        for source_key in asset_source_keys(asset):
+            seen["urls"].add(source_key)
+            seen["sources"].add(source_key)
+
     selected_ids = {
         shot.get("selected_asset_id")
         for shot in db.get("shots", [])
@@ -289,9 +309,9 @@ def _project_seen_images(db: dict, project_id: str, *, exclude_shot_id: str | No
             continue
         if asset.get("hash"):
             seen["hashes"].add(str(asset["hash"]))
-        original_path = str(asset.get("original_path") or "")
-        if original_path.startswith(("http://", "https://")):
-            seen["sources"].add(_url_key(original_path))
+        for source_key in asset_source_keys(asset):
+            seen["urls"].add(source_key)
+            seen["sources"].add(source_key)
     for asset in db.get("generated_assets", []):
         if asset.get("project_id") != project_id:
             continue
@@ -419,6 +439,8 @@ def _register_downloaded_image(db: dict, project_id: str, shot: dict, item: dict
         "prompt": item["keyword"],
         "remote_url": item["image_url"],
         "source_page": item["source_page"],
+        "source_key": _url_key(item.get("source_page") or item.get("image_url") or ""),
+        "source_type": "web_search",
         "title": item["title"],
         "width": item["width"],
         "height": item["height"],
@@ -444,6 +466,7 @@ def _register_downloaded_image(db: dict, project_id: str, shot: dict, item: dict
         "watermark": item.get("watermark"),
         "source_page": item["source_page"],
         "image_url": item["image_url"],
+        "source_key": _url_key(item.get("source_page") or item.get("image_url") or ""),
         "is_selected": shot.get("selected_asset_id") == asset_id,
         "created_at": now,
     })
@@ -1104,6 +1127,10 @@ def rerun_shot_web_image_search(project_id: str, shot_id: str, image_search_prov
     shot["current_search_keyword"] = search_query_for_shot(shot)
     shot["_project_video_ratio"] = project.get("video_ratio", "1:1")
     shot["_image_search_provider"] = image_search_provider
+    project_seen = _project_seen_images(db, project_id, exclude_shot_id=shot.get("id"))
+    shot["_project_seen_urls"] = list(project_seen["urls"])
+    shot["_project_seen_hashes"] = list(project_seen["hashes"])
+    shot["_project_seen_sources"] = list(project_seen["sources"])
     shot["updated_at"] = now
     project["status"] = "searching_images"
     project["image_search_provider"] = image_search_provider

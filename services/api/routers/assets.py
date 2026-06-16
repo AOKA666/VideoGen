@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import shutil
 import subprocess
 from datetime import datetime
@@ -10,6 +11,7 @@ from uuid import uuid4
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
+from services.asset_source_service import normalize_asset_source_fields
 from services.asset_service import analyze_asset, detect_file_type, new_id, safe_storage_name
 from services.store import ASSETS_DIR, load_db, public_url, save_db
 
@@ -142,6 +144,44 @@ def upload_music(file: UploadFile = File(...)):
     return {"status": "success", "music": preset}
 
 
+@router.delete("/music/{music_id}")
+def delete_music(music_id: str):
+    db = load_db()
+    music = next((item for item in db.get("music_library", []) if item.get("id") == music_id), None)
+    if not music:
+        raise HTTPException(404, "Music not found")
+
+    local_path = Path(str(music.get("local_path") or ""))
+    deleted_file = False
+    if local_path.exists() and ASSETS_DIR.resolve() in local_path.resolve().parents:
+        local_path.unlink()
+        deleted_file = True
+
+    db["music_library"] = [
+        item for item in db.get("music_library", [])
+        if item.get("id") != music_id
+    ]
+    now = datetime.now().isoformat(timespec="seconds")
+    cleared_projects = 0
+    for project in db.get("projects", []):
+        if project.get("background_music_id") != music_id:
+            continue
+        project["background_music_id"] = None
+        project["background_music_name"] = ""
+        project["background_music_url"] = ""
+        project["background_music_start_sec"] = 0
+        project["background_music_volume"] = 0.2
+        project["updated_at"] = now
+        cleared_projects += 1
+    save_db(db)
+    return {
+        "status": "deleted",
+        "music_id": music_id,
+        "deleted_file": deleted_file,
+        "cleared_projects": cleared_projects,
+    }
+
+
 @router.post("/library")
 def set_library(payload: LibraryConfig):
     db = load_db()
@@ -182,7 +222,7 @@ def require_library(db: dict) -> dict:
     return library
 
 
-def build_asset(file: UploadFile, source_note: str, copyright_note: str, library: dict) -> dict:
+def build_asset(file: UploadFile, source_note: str, copyright_note: str, source_page: str, library: dict) -> dict:
     original_path = file.filename or ""
     file_type = detect_file_type(original_path)
     if file_type == "unknown":
@@ -193,9 +233,10 @@ def build_asset(file: UploadFile, source_note: str, copyright_note: str, library
     target = ASSETS_DIR / stored_name
     with target.open("wb") as out:
         shutil.copyfileobj(file.file, out)
+    content_hash = hashlib.sha256(target.read_bytes()).hexdigest()
 
     now = datetime.now().isoformat(timespec="seconds")
-    return {
+    asset = {
         "id": asset_id,
         "library_id": library["id"],
         "file_name": safe_storage_name(original_path),
@@ -204,18 +245,22 @@ def build_asset(file: UploadFile, source_note: str, copyright_note: str, library
         "file_url": public_url(target),
         "thumbnail_url": public_url(target),
         "local_path": str(target),
+        "hash": content_hash,
         "object": [],
         "scene": [],
         "keywords": [],
         "analysis_status": "analyzing",
         "analysis_provider": "pending",
         "analysis_error": "",
+        "source_page": source_page.strip(),
         "source_note": source_note,
         "copyright_note": copyright_note,
         "is_available": True,
         "created_at": now,
         "updated_at": now,
     }
+    normalize_asset_source_fields(asset)
+    return asset
 
 
 def analyze_asset_background(asset_id: str, manual_tags: dict | None) -> None:
@@ -274,6 +319,7 @@ def upload_assets(
     files: list[UploadFile] = File(...),
     source_note: str = Form("用户上传"),
     copyright_note: str = Form("自用素材"),
+    source_page: str = Form(""),
     manual_tags: str = Form("{}"),
 ):
     db = load_db()
@@ -289,7 +335,7 @@ def upload_assets(
         if detect_file_type(file.filename or "") == "unknown":
             skipped.append({"file_name": file.filename, "reason": "unsupported"})
             continue
-        asset = build_asset(file, source_note, copyright_note, library)
+        asset = build_asset(file, source_note, copyright_note, source_page, library)
         db["assets"].append(asset)
         uploaded.append(asset)
         background_tasks.add_task(analyze_asset_background, asset["id"], parsed_manual_tags)
@@ -365,9 +411,10 @@ def update_asset(asset_id: str, patch: dict):
         raise HTTPException(404, "Asset not found")
     if "people" in patch and "object" not in patch:
         patch["object"] = patch["people"]
-    for key in ["object", "scene", "keywords", "source_note", "copyright_note", "is_available"]:
+    for key in ["object", "scene", "keywords", "source_page", "remote_url", "source_note", "copyright_note", "is_available"]:
         if key in patch:
             asset[key] = patch[key]
+    normalize_asset_source_fields(asset)
     asset["updated_at"] = datetime.now().isoformat(timespec="seconds")
     save_db(db)
     return {"asset": asset}

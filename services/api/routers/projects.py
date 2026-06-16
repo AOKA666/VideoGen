@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from services.store import PROJECTS_DIR, load_db, project_dir, save_db
-from services.text_service import RewriteQualityError, infer_title, rewrite_script
+from services.text_service import RewriteQualityError, generate_guozhijiliang_script, infer_title, rewrite_script
 from services.web_image_pipeline import DONE_STATUSES, recover_interrupted_searches
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
@@ -28,6 +28,11 @@ class ScriptUpdate(BaseModel):
     rewritten_script: str | None = None
     title_line1: str | None = None
     title_line2: str | None = None
+
+
+class AiScriptPayload(BaseModel):
+    person_name: str | None = None
+    event_angle: str | None = None
 
 
 @router.get("")
@@ -57,6 +62,18 @@ def create_project(payload: ProjectCreate):
     save_db(db)
     project_dir(project_id)
     return {"project_id": project_id, "status": "created", "project": project}
+
+
+@router.post("/generate-guozhijiliang-script")
+def generate_ai_script(payload: AiScriptPayload | None = None):
+    try:
+        result = generate_guozhijiliang_script(
+            (payload.person_name if payload else "") or "",
+            (payload.event_angle if payload else "") or "",
+        )
+    except Exception as exc:
+        raise HTTPException(502, f"AI script generation failed: {exc}") from exc
+    return {"status": "success", **result}
 
 
 @router.get("/{project_id}")
