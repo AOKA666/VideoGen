@@ -149,14 +149,51 @@ def extract_opening_hook(raw_script: str) -> str:
     return sentences[0].strip() if sentences else ""
 
 
-def preserve_opening_hook(raw_script: str, rewritten_script: str) -> str:
-    hook = extract_opening_hook(raw_script)
+def is_strong_opening_hook(text: str) -> bool:
+    cleaned = re.sub(r"\s+", "", text or "")
+    if not 8 <= len(cleaned) <= 70:
+        return False
+    weak_starts = (
+        "今天", "大家好", "你知道吗", "提起", "说起", "在中国", "在我国",
+        "他出生", "她出生", "他是", "她是", "这是一位", "有这样一位",
+    )
+    if cleaned.startswith(weak_starts):
+        return False
+    hook_keywords = (
+        "但是", "却", "竟", "只因", "没想到", "直到", "最后", "临终", "牺牲",
+        "失踪", "消失", "抹掉", "隐姓埋名", "不能回家", "生死", "绝密", "封锁",
+        "扣下", "拒绝", "放弃", "没人知道", "再也没有", "为什么", "凭什么", "谁能想到",
+    )
+    return any(keyword in cleaned for keyword in hook_keywords) or bool(re.search(r"[？！?!]", cleaned))
+
+
+def build_fallback_hook(raw_script: str, title: str) -> str:
+    original_hook = extract_opening_hook(raw_script)
+    if is_strong_opening_hook(original_hook):
+        return original_hook
+    short_title = title[:18].strip("，。！？、：； ")
+    if short_title:
+        return f"很多人记住了{short_title}，却不知道这个名字背后藏着多重的代价。"
+    return "很多人只看见了结果，却不知道背后那一次几乎没人能承受的选择。"
+
+
+def ensure_opening_hook(raw_script: str, rewritten_script: str, generated_hook: str = "") -> str:
+    raw_hook = extract_opening_hook(raw_script)
+    hook = generated_hook.strip() or raw_hook
+    if not hook:
+        return rewritten_script.strip()
+    if raw_hook and is_similar_text(hook, raw_hook) and not is_strong_opening_hook(raw_hook):
+        hook = build_fallback_hook(raw_script, infer_title(raw_script))
+
     rewritten = rewritten_script.strip()
     if not hook or rewritten.startswith(hook):
         return rewritten
 
     lines = [line.strip() for line in rewritten.splitlines() if line.strip()]
-    body_lines = lines[1:] if lines and is_similar_text(lines[0], hook) else lines
+    if lines and (is_similar_text(lines[0], hook) or is_similar_text(lines[0], raw_hook)):
+        body_lines = lines[1:]
+    else:
+        body_lines = lines
     body = "\n".join(body_lines).strip()
     return f"{hook}\n{body}" if body else hook
 
@@ -213,7 +250,7 @@ def bigmodel_model() -> str:
 def fallback_rewrite_script(raw_script: str, style: str = "纪实故事型") -> dict:
     sentences = split_sentences(raw_script)
     title = infer_title(raw_script)
-    hook = extract_opening_hook(raw_script) or f"{title}，为什么值得被今天的人重新看见？"
+    hook = build_fallback_hook(raw_script, title)
     body = []
     if sentences:
         body.append(hook)
@@ -241,12 +278,14 @@ def fallback_rewrite_script(raw_script: str, style: str = "纪实故事型") -> 
 
 def normalize_rewrite_result(result: dict, raw_script: str, style: str) -> dict:
     title = str(result.get("title") or infer_title(raw_script)).strip()
-    hook = str(result.get("hook") or f"{title}，为什么值得被今天的人重新看见？").strip()
+    hook = str(result.get("hook") or build_fallback_hook(raw_script, title)).strip()
+    if not is_strong_opening_hook(hook):
+        hook = build_fallback_hook(raw_script, title)
     rewritten_script = str(result.get("rewritten_script") or "").strip()
     if not rewritten_script:
         rewritten_script = fallback_rewrite_script(raw_script, style)["rewritten_script"]
     rewritten_script = clean_rewritten_script(raw_script, rewritten_script)
-    rewritten_script = preserve_opening_hook(raw_script, rewritten_script)
+    rewritten_script = ensure_opening_hook(raw_script, rewritten_script, hook)
     comparison = compare_scripts(raw_script, rewritten_script)
     return {
         "title": title[:MAX_AUTO_TITLE_LENGTH] or infer_title(raw_script),
@@ -281,9 +320,13 @@ def build_rewrite_prompt(raw_script: str, style: str, attempt: int, previous: di
         f"原文去除空白后的长度约 {raw_len} 个中文字符；二创稿不能写得太简略，"
         f"rewritten_script 去除空白后的长度必须控制在 {min_len} 到 {max_len} 个中文字符之间，"
         "信息量、叙事层次和关键细节要和原文案接近，禁止压缩成摘要、提纲或短版解说，也不要省略原文中的重要事实。"
-        "开头黄金三秒文案必须一个字、一个标点都不改，并放在 rewritten_script 最开头；"
-        f"需要原样保留的开头黄金三秒是：{opening_hook}"
-        f"除开头黄金三秒之外，剩余内容必须大改；系统会用字符相似度和语义相似度自动对比，最终总体差异度必须达到 {MIN_REWRITE_DIFFERENCE}% 以上。"
+        "开头黄金三秒必须重写成强钩子，并放在 rewritten_script 最开头。"
+        "强钩子只能从原文真实事实里提炼，必须先给冲突、反差、悬念、结果或危险瞬间，不要先讲背景。"
+        "禁止用平铺直叙开头，例如“今天我们讲”“提起某某”“他出生于”“他是我国”“有这样一位”。"
+        "优先使用这些开头方式：结果反差、生死瞬间、身份反差、亲情冲突、被抹掉/消失悬念、绝密任务、无法回家的代价。"
+        "第一句话建议 12 到 36 个字，必须让人想继续听第二句；不要空喊伟大、震撼、传奇。"
+        f"原文当前开头仅供理解，除非它已经有强冲突强悬念，否则不要原样照搬：{opening_hook}"
+        f"除事实、专名和必要年份之外，整体内容必须大改；系统会用字符相似度和语义相似度自动对比，最终总体差异度必须达到 {MIN_REWRITE_DIFFERENCE}% 以上。"
         "后文改写硬性规则："
         "1. 不要保留原文连续 8 个字以上的表达，专有名词、年份和固定称谓除外。"
         "2. 原文每个事实点都要覆盖，但可以换叙述顺序、换句式、换铺垫、换转折。"
@@ -416,6 +459,9 @@ def build_guozhijiliang_script_prompt(person_name: str = "", event_angle: str = 
 
 前三秒开头：
 开头必须直接抓人，用强反差、强悬念、强画面，不能平铺直叙。优先使用结果反差、生死瞬间、身份反差、亲情冲突、被抹掉/消失悬念。开头要先给冲突，不要先讲背景。
+第一段就是前三秒，必须像短视频开场一样把观众拽住：先写“最不正常的一幕”，再解释人物是谁。禁止用“今天我们讲”“提起某某”“他出生于”“他是我国著名”“有这样一位科学家”这类百科式开头。
+第一句话控制在 12 到 32 个汉字，必须包含一个具体冲突、反差或悬念；不要只写“他很伟大”“震惊世界”“感动无数人”这种空话。
+可学习这些开头逻辑但不要照搬：临终前他没有躺下，而是坐回电脑前；父亲去世那天，他连名字都不能告诉家里；飞机坠落前，他最后护住的不是自己；她主动要求，把自己的名字从工程里抹掉。
 
 故事结构：
 1. 暴击开头：先抛出最有冲突的场景或结果。
