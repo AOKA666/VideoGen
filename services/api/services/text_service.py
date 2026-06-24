@@ -16,6 +16,7 @@ MIN_REWRITE_LENGTH_RATIO = 0.85
 MAX_REWRITE_LENGTH_RATIO = 1.25
 MIN_REWRITE_DIFFERENCE = 45
 MAX_REWRITE_ATTEMPTS = 3
+MAX_AUTO_TITLE_LENGTH = 9
 RANDOM = random.SystemRandom()
 GUOZHIJILIANG_STORY_SEEDS = [
     ("钱学森", "美国海关扣下他的行李，硬说里面藏着国家机密"),
@@ -134,7 +135,7 @@ def paragraphize_script(text: str) -> str:
 
 def infer_title(raw_script: str) -> str:
     first = split_sentences(raw_script)[0] if raw_script.strip() else "未命名项目"
-    return first[:24].strip("，。！？ ") or "未命名项目"
+    return first[:MAX_AUTO_TITLE_LENGTH].strip("，。！？ ") or "未命名项目"
 
 
 def extract_opening_hook(raw_script: str) -> str:
@@ -248,7 +249,7 @@ def normalize_rewrite_result(result: dict, raw_script: str, style: str) -> dict:
     rewritten_script = preserve_opening_hook(raw_script, rewritten_script)
     comparison = compare_scripts(raw_script, rewritten_script)
     return {
-        "title": title[:40] or infer_title(raw_script),
+        "title": title[:MAX_AUTO_TITLE_LENGTH] or infer_title(raw_script),
         "hook": hook,
         "rewritten_script": rewritten_script,
         "script_style": str(result.get("script_style") or style),
@@ -484,7 +485,7 @@ def generate_guozhijiliang_script(person_name: str = "", event_angle: str = "") 
     if not script:
         raise RuntimeError("GLM response does not contain script")
     return {
-        "title": str(result.get("title") or infer_title(script)).strip()[:40],
+        "title": str(result.get("title") or infer_title(script)).strip()[:MAX_AUTO_TITLE_LENGTH],
         "person": str(result.get("person") or selected_person).strip(),
         "event_angle": str(result.get("event_angle") or selected_angle).strip(),
         "script": script,

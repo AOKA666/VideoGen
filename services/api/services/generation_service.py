@@ -229,7 +229,7 @@ def image_size_for_ratio(video_ratio: str | None) -> str:
     if video_ratio == "16:9":
         return "2560x1440"
     if video_ratio == "1:1":
-        return "1920x1920"
+        return "1024x1024"
     return "1440x2560"
 
 
