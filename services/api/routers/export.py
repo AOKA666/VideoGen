@@ -16,6 +16,7 @@ from services.generation_service import (
     generate_export_srt,
     write_timeline,
 )
+from services.r2_storage import ensure_asset_local
 from services.store import load_db, project_dir, public_url
 from services.video_export_service import (
     create_jianying_native_draft,
@@ -125,7 +126,11 @@ def export_assets(
         selected_id = shot.get("selected_asset_id")
         asset = next((a for a in db["assets"] if a["id"] == selected_id), None) if selected_id else None
         generated = next((a for a in db["generated_assets"] if a["id"] == selected_id), None) if selected_id else None
-        source_value = (asset or generated or {}).get("local_path", "")
+        source_value = (
+            str(ensure_asset_local(asset))
+            if asset
+            else (generated or {}).get("local_path", "")
+        )
         source = Path(source_value) if source_value else None
         scene_name = f"scene_{int(shot['shot_index']):02d}.png"
         target = media_dir / scene_name
