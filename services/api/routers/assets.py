@@ -9,10 +9,12 @@ from pathlib import Path
 from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from services.asset_source_service import normalize_asset_source_fields
 from services.asset_service import analyze_asset, detect_file_type, new_id, safe_storage_name
+from services.r2_storage import R2StorageError, delete_asset_object, ensure_asset_local, upload_asset
 from services.store import ASSETS_DIR, load_db, public_url, save_db
 
 router = APIRouter(prefix="/api/assets", tags=["assets"])
@@ -47,7 +49,7 @@ def asset_objects(asset: dict) -> list[str]:
 
 
 def rename_analyzed_asset(asset: dict) -> None:
-    local_path = Path(asset.get("local_path", ""))
+    local_path = ensure_asset_local(asset)
     if not local_path.exists() or ASSETS_DIR.resolve() not in local_path.resolve().parents:
         return
     subject = (asset_objects(asset) or ["object"])[0]
@@ -64,6 +66,7 @@ def rename_analyzed_asset(asset: dict) -> None:
     asset["file_url"] = public_url(target)
     asset["thumbnail_url"] = public_url(target)
     asset["local_path"] = str(target)
+    upload_asset(asset, target)
 
 
 @router.get("/library")
@@ -215,6 +218,21 @@ def list_assets(q: str = ""):
     return {"assets": assets}
 
 
+@router.get("/{asset_id}/content")
+def get_asset_content(asset_id: str):
+    db = load_db()
+    asset = next((a for a in db["assets"] if a["id"] == asset_id), None)
+    if not asset:
+        raise HTTPException(404, "Asset not found")
+    try:
+        path = ensure_asset_local(asset)
+    except R2StorageError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    if not path.is_file():
+        raise HTTPException(404, "Asset file not found")
+    return FileResponse(path)
+
+
 def require_library(db: dict) -> dict:
     library = db.get("asset_library")
     if not is_valid_library(library):
@@ -260,6 +278,11 @@ def build_asset(file: UploadFile, source_note: str, copyright_note: str, source_
         "updated_at": now,
     }
     normalize_asset_source_fields(asset)
+    try:
+        upload_asset(asset, target)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
     return asset
 
 
@@ -268,7 +291,10 @@ def analyze_asset_background(asset_id: str, manual_tags: dict | None) -> None:
     asset = next((a for a in db["assets"] if a["id"] == asset_id), None)
     if not asset:
         return
-    local_path = asset.get("local_path")
+    try:
+        local_path = str(ensure_asset_local(asset))
+    except R2StorageError:
+        local_path = asset.get("local_path")
     tags = analyze_asset(
         asset.get("original_path") or asset["file_name"],
         Path(local_path) if local_path else None,
@@ -335,7 +361,10 @@ def upload_assets(
         if detect_file_type(file.filename or "") == "unknown":
             skipped.append({"file_name": file.filename, "reason": "unsupported"})
             continue
-        asset = build_asset(file, source_note, copyright_note, source_page, library)
+        try:
+            asset = build_asset(file, source_note, copyright_note, source_page, library)
+        except R2StorageError as exc:
+            raise HTTPException(502, str(exc)) from exc
         db["assets"].append(asset)
         uploaded.append(asset)
         background_tasks.add_task(analyze_asset_background, asset["id"], parsed_manual_tags)
@@ -352,7 +381,7 @@ def retry_asset_analysis(background_tasks: BackgroundTasks):
         if (
             asset.get("file_type") != "image"
             or asset.get("analysis_status") not in {"analyzing", "failed"}
-            or not Path(str(asset.get("local_path") or "")).exists()
+            or not ensure_asset_local(asset).exists()
         ):
             continue
         shot = next(
@@ -389,7 +418,10 @@ def analyze(asset_id: str):
     asset = next((a for a in db["assets"] if a["id"] == asset_id), None)
     if not asset:
         raise HTTPException(404, "Asset not found")
-    local_path = asset.get("local_path")
+    try:
+        local_path = str(ensure_asset_local(asset))
+    except R2StorageError as exc:
+        raise HTTPException(502, str(exc)) from exc
     tags = analyze_asset(asset.get("original_path") or asset["file_name"], Path(local_path) if local_path else None, asset.get("file_type"))
     for key in ["era", "emotion", "visual_style"]:
         asset.pop(key, None)
@@ -437,6 +469,10 @@ def delete_asset(asset_id: str):
             shot["status"] = "no_match"
             shot["updated_at"] = datetime.now().isoformat(timespec="seconds")
 
+    try:
+        deleted_remote = delete_asset_object(asset)
+    except R2StorageError as exc:
+        raise HTTPException(502, str(exc)) from exc
     deleted_file = False
     local_path = Path(asset.get("local_path", ""))
     if local_path.exists() and ASSETS_DIR.resolve() in local_path.resolve().parents:
@@ -444,7 +480,12 @@ def delete_asset(asset_id: str):
         deleted_file = True
 
     save_db(db)
-    return {"status": "deleted", "asset_id": asset_id, "deleted_file": deleted_file}
+    return {
+        "status": "deleted",
+        "asset_id": asset_id,
+        "deleted_file": deleted_file,
+        "deleted_remote": deleted_remote,
+    }
 
 
 class BatchDeletePayload(BaseModel):
@@ -460,9 +501,14 @@ def batch_delete_assets(payload: BatchDeletePayload):
 
     deleted_ids = []
     deleted_files = 0
+    deleted_remote = 0
     for asset in db["assets"]:
         if asset["id"] not in ids_to_delete:
             continue
+        try:
+            deleted_remote += int(delete_asset_object(asset))
+        except R2StorageError as exc:
+            raise HTTPException(502, str(exc)) from exc
         local_path = Path(asset.get("local_path", ""))
         if local_path.exists() and ASSETS_DIR.resolve() in local_path.resolve().parents:
             local_path.unlink()
@@ -481,4 +527,9 @@ def batch_delete_assets(payload: BatchDeletePayload):
             shot["updated_at"] = now
 
     save_db(db)
-    return {"status": "deleted", "deleted_count": len(deleted_ids), "deleted_files": deleted_files}
+    return {
+        "status": "deleted",
+        "deleted_count": len(deleted_ids),
+        "deleted_files": deleted_files,
+        "deleted_remote": deleted_remote,
+    }

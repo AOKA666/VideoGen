@@ -8,6 +8,7 @@ from pathlib import Path
 from services.asset_source_service import asset_source_keys, normalize_asset_source_fields, url_key
 from services.asset_service import analyze_asset, new_id, safe_storage_name
 from services.match_service import score_asset
+from services.r2_storage import ensure_asset_local, upload_asset
 from services.store import ASSETS_DIR, load_db, public_url, save_db
 from services.text_service import keywords_from_text
 
@@ -134,7 +135,7 @@ def apply_library_match(db: dict, project_id: str, shot: dict, minimum_score: in
             continue
         if asset.get("hash") and str(asset["hash"]) in used_hashes:
             continue
-        if not Path(str(asset.get("local_path") or "")).exists():
+        if not ensure_asset_local(asset).exists():
             continue
         score, reason = score_asset(shot, asset)
         if score > best[1]:
@@ -169,7 +170,7 @@ def analyze_archived_asset(asset_id: str) -> None:
     asset = next((x for x in db.get("assets", []) if x.get("id") == asset_id), None)
     if not asset:
         return
-    path = Path(str(asset.get("local_path") or ""))
+    path = ensure_asset_local(asset)
     tags = analyze_asset(asset.get("file_name") or path.name, path, "image")
     db = load_db()
     asset = next((x for x in db.get("assets", []) if x.get("id") == asset_id), None)
@@ -306,6 +307,7 @@ def archive_project_images(db: dict, project_id: str) -> dict:
             "updated_at": now,
         }
         normalize_asset_source_fields(asset)
+        upload_asset(asset, target)
         db.setdefault("assets", []).append(asset)
         existing_hashes.add(content_hash)
         existing_source_keys.update(asset_source_keys(asset))

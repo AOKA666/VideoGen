@@ -13,6 +13,7 @@ from PIL import Image, ImageOps
 from pydantic import BaseModel
 
 from services.asset_service import new_id
+from services.r2_storage import ensure_asset_local
 from services.generation_service import (
     build_image_prompt,
     compose_uploaded_cover,
@@ -161,7 +162,7 @@ def crop_selected_images(project_id: str):
         )
         if not asset:
             library_asset = next((item for item in db.get("assets", []) if item.get("id") == selected_id), None)
-            source = Path(str((library_asset or {}).get("local_path") or ""))
+            source = ensure_asset_local(library_asset) if library_asset else Path()
             if not library_asset or not source.exists():
                 skipped += 1
                 continue
