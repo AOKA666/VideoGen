@@ -27,8 +27,9 @@ FORBIDDEN_KEYWORDS = {
     "威严",
     "强硬回击",
 }
-FRAGMENT_PREFIXES = ("时", "或", "的", "方", "其", "这", "那")
+FRAGMENT_PREFIXES = ("或", "的", "其")
 SENTENCE_MARKERS = ("为了", "体现", "展现", "展示", "表现", "强调", "画面")
+DESCRIPTIVE_SUFFIXES = ("画面", "场景", "镜头", "图片", "素材", "照片", "影像")
 
 
 class SearchIntentBatchError(RuntimeError):
@@ -68,8 +69,20 @@ def normalize_core_keyword(value: str) -> str:
     return keyword
 
 
-def validate_core_keyword(value: str) -> str:
+def _trim_descriptive_suffixes(value: str) -> str:
     keyword = normalize_core_keyword(value)
+    changed = True
+    while changed:
+        changed = False
+        for suffix in DESCRIPTIVE_SUFFIXES:
+            if keyword.endswith(suffix) and len(keyword) > len(suffix) + 1:
+                keyword = keyword[: -len(suffix)]
+                changed = True
+    return keyword
+
+
+def validate_core_keyword(value: str) -> str:
+    keyword = _trim_descriptive_suffixes(value)
     if not (MIN_KEYWORD_CHARS <= len(keyword) <= MAX_KEYWORD_CHARS):
         raise ValueError(f"核心关键词长度必须为 {MIN_KEYWORD_CHARS}-{MAX_KEYWORD_CHARS} 个字符")
     if re.search(r"[，。！？、；：,.!?;:]", keyword):
@@ -87,7 +100,42 @@ def validate_core_keyword(value: str) -> str:
     return keyword
 
 
-def sanitize_intent(result: dict, _shot_text: str = "") -> dict:
+def _candidate_values(result: dict, fallback_values: list[str] | None = None) -> list[str]:
+    values: list[str] = [_raw_core_keyword(result)]
+    legacy = result.get("search_keywords")
+    if isinstance(legacy, list):
+        values.extend(str(item or "") for item in legacy)
+    elif isinstance(legacy, str):
+        values.append(legacy)
+    values.extend(fallback_values or [])
+
+    candidates: list[str] = []
+    seen = set()
+    for value in values:
+        for part in re.split(r"[\s,，、。；;：:|/]+", str(value or "")):
+            candidate = normalize_core_keyword(part)
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            candidates.append(candidate)
+    return candidates
+
+
+def sanitize_intent(result: dict, _shot_text: str = "", fallback_values: list[str] | None = None) -> dict:
+    last_error: ValueError | None = None
+    for candidate in _candidate_values(result, fallback_values):
+        try:
+            keyword = validate_core_keyword(candidate)
+            return {
+                "core_keyword": keyword,
+                "search_keywords": [keyword],
+                "provider": result.get("provider") or "ai",
+                "error": "",
+            }
+        except ValueError as exc:
+            last_error = exc
+    if last_error:
+        raise last_error
     keyword = validate_core_keyword(_raw_core_keyword(result))
     return {
         "core_keyword": keyword,
@@ -168,9 +216,28 @@ def ai_search_intents(shots: list[dict], full_text: str, *, timeout: int = 90, r
             "shot_index": shot.get("shot_index"),
             "voice_text": str(shot.get("voice_text") or ""),
             "shot_description": str(shot.get("visual_need") or ""),
+            "existing_keywords": [str(k).strip() for k in (shot.get("search_keywords") or []) if str(k).strip()],
+            "person_names": [str(k).strip() for k in (shot.get("person_names") or []) if str(k).strip()],
+            "object_tags": [str(k).strip() for k in (shot.get("object_tags") or []) if str(k).strip()],
+            "scene_tags": [str(k).strip() for k in (shot.get("scene_tags") or []) if str(k).strip()],
+            "keywords": [str(k).strip() for k in (shot.get("keywords") or []) if str(k).strip()],
+            "required_object": [str(k).strip() for k in (shot.get("required_object") or []) if str(k).strip()],
+            "required_scene": [str(k).strip() for k in (shot.get("required_scene") or []) if str(k).strip()],
         }
         for shot in shots
     ]
+    fallback_by_id = {
+        str(item["id"]): (
+            item["existing_keywords"]
+            + item["person_names"]
+            + item["object_tags"]
+            + item["scene_tags"]
+            + item["keywords"]
+            + item["required_object"]
+            + item["required_scene"]
+        )
+        for item in shot_items
+    }
     prompt = f"""
 你是短视频分镜图片搜索关键词专家。
 请直接根据每个分镜的 voice_text 和 shot_description，分别选择一个最适合中文图片搜索的核心关键词。
@@ -231,7 +298,7 @@ def ai_search_intents(shots: list[dict], full_text: str, *, timeout: int = 90, r
                 if shot_id not in valid_ids:
                     continue
                 item["provider"] = bigmodel_model()
-                intents[shot_id] = sanitize_intent(item)
+                intents[shot_id] = sanitize_intent(item, fallback_values=fallback_by_id.get(shot_id, []))
             missing_ids = [shot["id"] for shot in shot_items if shot["id"] not in intents]
             if missing_ids:
                 raise SearchIntentBatchError(f"GLM 返回缺少 {len(missing_ids)} 个分镜核心关键词")

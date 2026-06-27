@@ -76,6 +76,8 @@ function App() {
   const [titleLine1, setTitleLine1] = useState('');
   const [titleLine2, setTitleLine2] = useState('');
   const [titleConfirmed, setTitleConfirmed] = useState(false);
+  const [publishShortTitle, setPublishShortTitle] = useState('');
+  const [publishDescription, setPublishDescription] = useState('');
   const [coverImage, setCoverImage] = useState(null);
   const [backgroundMusicId, setBackgroundMusicId] = useState('');
   const [backgroundMusicStart, setBackgroundMusicStart] = useState(0);
@@ -220,6 +222,8 @@ function App() {
     setTitleLine1(project.title_line1 || '');
     setTitleLine2(project.title_line2 || '');
     setTitleConfirmed(Boolean(project.title_line1 && project.title_line2) || Boolean(project.cover_url));
+    setPublishShortTitle(project.publish_short_title || '');
+    setPublishDescription(project.publish_description || '');
     setCoverImage(null);
     setBackgroundMusicId(project.background_music_id || '');
     setBackgroundMusicStart(Number(project.background_music_start_sec || 0));
@@ -228,6 +232,8 @@ function App() {
     project?.id,
     project?.title_line1,
     project?.title_line2,
+    project?.publish_short_title,
+    project?.publish_description,
     project?.cover_url,
     project?.background_music_id,
     project?.background_music_start_sec,
@@ -807,6 +813,17 @@ function App() {
     }));
     setTitleConfirmed(true);
     setMessage('标题已确认，可以生成封面');
+  }
+
+  async function generatePublishAssistant() {
+    const result = await run('生成发布助手', () => request(`/api/projects/${projectId}/generate-publish-assistant`, {
+      method: 'POST',
+    }));
+    if (!result) return;
+    setPublishShortTitle(result.short_title || '');
+    setPublishDescription(result.description || '');
+    await refreshAll(projectId);
+    setMessage('发布助手已生成，可以直接复制发布');
   }
 
   async function exportPackage(output) {
@@ -1410,6 +1427,36 @@ function App() {
               <button onClick={openExportFolder}><FolderOpen size={18} /> 打开导出文件夹</button>
               <button className="primary" onClick={() => exportPackage('mp4')}><Film size={18} /> 导出 MP4</button>
               <button className="primary" onClick={() => exportPackage('draft')}><Archive size={18} /> 导出剪映草稿</button>
+            </div>
+            <div className="publish-assistant">
+              <div className="publish-assistant-head">
+                <div>
+                  <h3>发布助手</h3>
+                  <p>生成平台发布时用的视频描述和一句话短标题。</p>
+                </div>
+                <button className="primary" onClick={generatePublishAssistant} disabled={busy}>
+                  <Wand2 size={18} /> {publishShortTitle ? '重新生成' : '生成发布文案'}
+                </button>
+              </div>
+              <div className="publish-fields">
+                <label>
+                  一句话短标题
+                  <input
+                    value={publishShortTitle}
+                    onChange={(e) => setPublishShortTitle(e.target.value)}
+                    placeholder="不带标点的短标题"
+                  />
+                </label>
+                <label>
+                  视频描述
+                  <textarea
+                    rows="5"
+                    value={publishDescription}
+                    onChange={(e) => setPublishDescription(e.target.value)}
+                    placeholder="吸引人的视频描述"
+                  />
+                </label>
+              </div>
             </div>
             {exportResult && (
               <div className="export-result-card">

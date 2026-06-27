@@ -23,7 +23,7 @@ from services.generation_service import (
     write_timeline,
 )
 from services.store import load_db, project_dir, public_url, save_db
-from services.text_service import generate_viral_title
+from services.text_service import generate_publish_assistant, generate_viral_title
 
 router = APIRouter(prefix="/api/projects", tags=["generation"])
 
@@ -376,6 +376,34 @@ def generate_title(project_id: str):
         "line1": result["line1"],
         "line2": result["line2"],
         "full_title": result["full_title"],
+    }
+
+
+@router.post("/{project_id}/generate-publish-assistant")
+def generate_publish(project_id: str):
+    db = load_db()
+    project = next((p for p in db["projects"] if p["id"] == project_id), None)
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    script = str(project.get("rewritten_script") or project.get("raw_script") or "").strip()
+    if not script:
+        raise HTTPException(400, "No script content available for publish assistant")
+
+    result = generate_publish_assistant(script)
+    if result.get("error"):
+        raise HTTPException(502, f"Publish assistant generation failed: {result['error']}")
+
+    now = datetime.now().isoformat(timespec="seconds")
+    project["publish_short_title"] = result["short_title"]
+    project["publish_description"] = result["description"]
+    project["updated_at"] = now
+    save_db(db)
+
+    return {
+        "status": "success",
+        "short_title": result["short_title"],
+        "description": result["description"],
     }
 
 

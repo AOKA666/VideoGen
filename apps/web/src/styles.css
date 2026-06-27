@@ -543,12 +543,48 @@ h3 { font-size: 16px; line-height: 1.48; }
 .result audio { width: 100%; margin: 16px 0 4px; }
 .export-actions {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) auto auto auto auto;
+  grid-template-columns: minmax(220px, 1fr) repeat(6, auto);
   align-items: end;
   gap: 10px;
   margin-top: 12px;
 }
 .export-actions > button { min-height: 40px; }
+.publish-assistant {
+  display: grid;
+  gap: 14px;
+  margin-top: 18px;
+  padding: 16px;
+  border: 1px solid rgba(49, 95, 143, .18);
+  border-radius: 8px;
+  background: rgba(246, 249, 250, .78);
+}
+.publish-assistant-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.publish-assistant h3 {
+  margin: 0 0 4px;
+  font-size: 16px;
+}
+.publish-assistant p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.6;
+}
+.publish-fields {
+  display: grid;
+  grid-template-columns: minmax(220px, .65fr) minmax(280px, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+.publish-fields input {
+  font-weight: 700;
+}
+.publish-fields textarea {
+  min-height: 124px;
+}
 .export-result-card {
   display: flex;
   align-items: center;
@@ -1469,6 +1505,8 @@ h3 { font-size: 16px; line-height: 1.48; }
   .cover-workspace { grid-template-columns: 1fr; }
   .cover-preview { min-height: 0; }
   .export-actions { grid-template-columns: 1fr; }
+  .publish-assistant-head { align-items: stretch; flex-direction: column; }
+  .publish-fields { grid-template-columns: 1fr; }
   .export-result-card { align-items: stretch; flex-direction: column; }
   .export-result-actions { align-items: stretch; flex-wrap: wrap; }
   .console-tools select { width: 100%; }

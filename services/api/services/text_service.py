@@ -747,6 +747,80 @@ def generate_viral_title(script: str) -> dict:
         return {"line1": "", "line2": "", "full_title": "", "error": str(exc)[:200]}
 
 
+def strip_title_punctuation(text: str) -> str:
+    punctuation = re.compile(r"[，。！？、；：“”‘’《》【】（）—…\-.!?,;:'\"()\[\]{}<>]")
+    return re.sub(r"\s+", "", punctuation.sub("", str(text or ""))).strip()
+
+
+def fallback_publish_assistant(script: str) -> dict:
+    sentences = split_sentences(script)
+    first = sentences[0] if sentences else script[:40]
+    short_title = strip_title_punctuation(first)[:22] or "这个故事值得被更多人看见"
+    description_source = " ".join(sentences[:3]) if sentences else script
+    description = re.sub(r"\s+", " ", description_source).strip()
+    if len(description) > 140:
+        description = description[:140].rstrip("，。！？、；： ")
+    return {"short_title": short_title, "description": description}
+
+
+def generate_publish_assistant(script: str) -> dict:
+    """Generate a platform-ready description and a punctuation-free short title."""
+    api_key = os.getenv("BIGMODEL_API_KEY", "").strip()
+    if not api_key:
+        return fallback_publish_assistant(script)
+
+    prompt = (
+        "你是短视频发布运营助手。请根据下面的中文口播文案，生成发布用内容。"
+        "\n\n要求："
+        "\n1. short_title 是一句话短标题，12 到 22 个汉字，不要任何标点符号。"
+        "\n2. short_title 要有悬念或反差，但必须忠于文案事实，不要标题党造假。"
+        "\n3. description 是视频描述，80 到 140 个汉字，适合发视频号/抖音/小红书。"
+        "\n4. description 开头要吸引人，点出故事冲突和人物精神，可以自然带一点情绪价值。"
+        "\n5. description 不要写成片头文案，不要写“本视频讲述”，不要堆砌空话。"
+        "\n6. 只返回 JSON，不要 Markdown，不要解释。"
+        "\n\n文案内容："
+        f"\n{script[:1200]}"
+        "\n\n返回格式："
+        '\n{"short_title": "一句话短标题", "description": "吸引人的视频描述"}'
+    )
+
+    payload = {
+        "model": bigmodel_model(),
+        "messages": [
+            {"role": "system", "content": "你只输出可解析 JSON。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.82,
+        "top_p": 0.9,
+        "max_tokens": 500,
+        "stream": False,
+        "thinking": {"type": "disabled"},
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{bigmodel_endpoint().rstrip('/')}/chat/completions",
+            data=data,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        content = body["choices"][0]["message"]["content"]
+        if isinstance(content, list):
+            content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+        result = json.loads(extract_json(str(content)))
+        short_title = strip_title_punctuation(result.get("short_title", ""))[:22]
+        description = re.sub(r"\s+", " ", str(result.get("description", "")).strip())[:180]
+        if not short_title or not description:
+            return fallback_publish_assistant(script)
+        return {"short_title": short_title, "description": description}
+    except Exception as exc:
+        return {"short_title": "", "description": "", "error": str(exc)[:200]}
+
+
 def generate_shots(script: str) -> list[dict]:
     lines = [line.strip() for line in script.splitlines() if is_meaningful_shot_text(line)]
     chunks: list[str] = lines if len(lines) > 1 else []
