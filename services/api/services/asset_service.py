@@ -17,12 +17,12 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg"}
 VIDEO_EXTS = {".mp4", ".mov", ".webm"}
 
 
-def bigmodel_endpoint() -> str:
-    return os.getenv("BIGMODEL_ENDPOINT", "https://open.bigmodel.cn/api/paas/v4")
+def minimax_endpoint() -> str:
+    return os.getenv("MINIMAX_ENDPOINT", "https://api.minimaxi.com/v1")
 
 
-def bigmodel_model() -> str:
-    return os.getenv("BIGMODEL_IMAGE_MODEL", "glm-4.6v")
+def minimax_image_model() -> str:
+    return os.getenv("MINIMAX_IMAGE_MODEL", "MiniMax-M3")
 
 
 def detect_file_type(filename: str) -> str:
@@ -70,7 +70,7 @@ def normalize_tags(tags: dict[str, Any], file_type: str) -> dict[str, Any]:
         "media_type": tags.get("media_type") or ("photo" if file_type == "image" else "video"),
         "visual_style": str(tags.get("visual_style") or "").strip(),
         "is_real_photo": tags.get("is_real_photo"),
-        "analysis_provider": tags.get("analysis_provider") or "glm",
+        "analysis_provider": tags.get("analysis_provider") or "minimax",
         "analysis_error": tags.get("analysis_error", ""),
     }
 
@@ -81,20 +81,20 @@ def analyze_asset(filename: str, file_path: Path | None = None, file_type: str |
     if detected_type != "image":
         return fallback
 
-    api_key = os.getenv("BIGMODEL_API_KEY", "").strip()
+    api_key = os.getenv("MINIMAX_API_KEY", "").strip()
     if not api_key or not file_path or not file_path.exists():
         return fallback
 
     try:
-        glm_tags = analyze_image_with_glm(filename, file_path, api_key)
-        merged = {**fallback, **glm_tags, "analysis_provider": bigmodel_model()}
+        minimax_tags = analyze_image_with_minimax(filename, file_path, api_key)
+        merged = {**fallback, **minimax_tags, "analysis_provider": minimax_image_model()}
         return normalize_tags(merged, detected_type)
     except Exception as exc:
         fallback["analysis_error"] = str(exc)[:300]
         return fallback
 
 
-def analyze_image_with_glm(filename: str, file_path: Path, api_key: str) -> dict[str, Any]:
+def analyze_image_with_minimax(filename: str, file_path: Path, api_key: str) -> dict[str, Any]:
     mime = mimetypes.guess_type(filename)[0] or "image/jpeg"
     image_b64 = base64.b64encode(file_path.read_bytes()).decode("ascii")
     prompt = (
@@ -119,7 +119,7 @@ def analyze_image_with_glm(filename: str, file_path: Path, api_key: str) -> dict
     )
     prompt += "\n一页书、文章截图、帖子截图、评论截图、聊天记录、大段文字图片也不是可用分镜照片，is_real_photo 必须为 false。"
     payload = {
-        "model": bigmodel_model(),
+        "model": minimax_image_model(),
         "messages": [
             {"role": "system", "content": "你只输出可解析 JSON。"},
             {
@@ -137,7 +137,7 @@ def analyze_image_with_glm(filename: str, file_path: Path, api_key: str) -> dict
     }
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        f"{bigmodel_endpoint()}/chat/completions",
+        f"{minimax_endpoint().rstrip('/')}/chat/completions",
         data=data,
         headers={
             "Authorization": f"Bearer {api_key}",
@@ -150,7 +150,7 @@ def analyze_image_with_glm(filename: str, file_path: Path, api_key: str) -> dict
             body = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         error_body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"GLM API {exc.code}: {error_body}") from exc
+        raise RuntimeError(f"MiniMax API {exc.code}: {error_body}") from exc
 
     content = body["choices"][0]["message"]["content"]
     if isinstance(content, list):
@@ -161,5 +161,5 @@ def analyze_image_with_glm(filename: str, file_path: Path, api_key: str) -> dict
 def extract_json(text: str) -> str:
     match = re.search(r"\{.*\}", text, flags=re.S)
     if not match:
-        raise ValueError("GLM response does not contain JSON")
+        raise ValueError("MiniMax response does not contain JSON")
     return match.group(0)
