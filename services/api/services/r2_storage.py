@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import mimetypes
 import os
 from functools import lru_cache
@@ -54,16 +55,56 @@ def _bucket() -> str:
     return _required_env()["R2_BUCKET_NAME"]
 
 
+def _asset_object_name(asset: dict[str, Any], path: Path | None = None) -> str:
+    file_name = Path(str(asset.get("file_name") or "")).name.strip()
+    if file_name:
+        return file_name
+    suffix = (path.suffix if path else Path(str(asset.get("object_key") or "")).suffix).lower()
+    return f"{asset['id']}{suffix or '.asset'}"
+
+
 def asset_object_key(asset: dict[str, Any], path: Path | None = None) -> str:
-    existing = str(asset.get("object_key") or "").strip()
-    if existing:
-        return existing
-    suffix = (path.suffix if path else Path(str(asset.get("file_name") or "")).suffix).lower()
-    return f"assets/{asset['id']}{suffix or '.asset'}"
+    return f"assets/{_asset_object_name(asset, path)}"
+
+
+def asset_metadata_object_key(asset: dict[str, Any], path: Path | None = None) -> str:
+    return str(Path(asset_object_key(asset, path)).with_suffix(".json")).replace("\\", "/")
 
 
 def asset_content_url(asset_id: str) -> str:
     return f"/api/assets/{asset_id}/content"
+
+
+def asset_metadata_payload(asset: dict[str, Any]) -> dict[str, Any]:
+    excluded = {"local_path"}
+    return {
+        key: value
+        for key, value in asset.items()
+        if key not in excluded and not key.startswith("_")
+    }
+
+
+def upload_asset_metadata(asset: dict[str, Any], path: Path | None = None) -> None:
+    if not r2_enabled():
+        return
+    previous_key = str(asset.get("metadata_object_key") or "").strip()
+    key = asset_metadata_object_key(asset, path)
+    asset["metadata_object_key"] = key
+    body = json.dumps(asset_metadata_payload(asset), ensure_ascii=False, indent=2).encode("utf-8")
+    try:
+        _client().put_object(
+            Bucket=_bucket(),
+            Key=key,
+            Body=body,
+            ContentType="application/json; charset=utf-8",
+        )
+    except Exception as exc:
+        raise R2StorageError(f"Failed to upload asset metadata to R2: {exc}") from exc
+    if previous_key and previous_key != key:
+        try:
+            _client().delete_object(Bucket=_bucket(), Key=previous_key)
+        except Exception:
+            pass
 
 
 def upload_asset(asset: dict[str, Any], path: Path) -> None:
@@ -71,6 +112,7 @@ def upload_asset(asset: dict[str, Any], path: Path) -> None:
         return
     if not path.is_file():
         raise R2StorageError(f"Local asset file does not exist: {path}")
+    previous_key = str(asset.get("object_key") or "").strip()
     key = asset_object_key(asset, path)
     content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     try:
@@ -86,6 +128,12 @@ def upload_asset(asset: dict[str, Any], path: Path) -> None:
     asset["object_key"] = key
     asset["file_url"] = asset_content_url(str(asset["id"]))
     asset["thumbnail_url"] = asset["file_url"]
+    upload_asset_metadata(asset, path)
+    if previous_key and previous_key != key:
+        try:
+            _client().delete_object(Bucket=_bucket(), Key=previous_key)
+        except Exception:
+            pass
 
 
 def ensure_asset_local(asset: dict[str, Any]) -> Path:
@@ -121,6 +169,9 @@ def delete_asset_object(asset: dict[str, Any]) -> bool:
         return False
     try:
         _client().delete_object(Bucket=_bucket(), Key=key)
+        metadata_key = str(asset.get("metadata_object_key") or asset_metadata_object_key(asset)).strip()
+        if metadata_key:
+            _client().delete_object(Bucket=_bucket(), Key=metadata_key)
     except Exception as exc:
         raise R2StorageError(f"Failed to delete asset from R2: {exc}") from exc
     return True

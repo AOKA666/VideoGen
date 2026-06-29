@@ -446,11 +446,14 @@ function App() {
   }
 
   async function saveAssetTags(assetId, payload) {
-    await run('保存标签', () => request(`/api/assets/${assetId}`, {
+    const result = await run('保存标签', () => request(`/api/assets/${assetId}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     }));
+    if (payload.sync_remote) {
+      setMessage(result?.remote_synced ? '标签已保存并同步远程素材库' : '标签已保存，远程素材库未同步');
+    }
     setEditingAsset(null);
     await refreshAll(projectId);
   }
@@ -1819,6 +1822,7 @@ function AssetEditor({ asset, onClose, onSave, onDelete }) {
     source_note: asset.source_note || '',
     copyright_note: asset.copyright_note || '',
     is_available: asset.is_available !== false,
+    sync_remote: asset.storage_provider === 'cloudflare_r2',
   });
 
   function update(key, value) {
@@ -1835,6 +1839,7 @@ function AssetEditor({ asset, onClose, onSave, onDelete }) {
       source_note: form.source_note,
       copyright_note: form.copyright_note,
       is_available: form.is_available,
+      sync_remote: form.sync_remote,
     });
   }
 
@@ -1851,6 +1856,10 @@ function AssetEditor({ asset, onClose, onSave, onDelete }) {
         </div>
         <TagFields form={form} update={update} />
         <label className="check-row"><input type="checkbox" checked={form.is_available} onChange={(e) => update('is_available', e.target.checked)} /> 可用于项目匹配</label>
+        <label className="check-row">
+          <input type="checkbox" checked={form.sync_remote} onChange={(e) => update('sync_remote', e.target.checked)} />
+          同步远程素材库
+        </label>
         <div className="actions">
           <button type="button" className="danger" onClick={() => onDelete(asset)}><Trash2 size={18} /> 删除素材</button>
           <button type="button" onClick={onClose}>取消</button>

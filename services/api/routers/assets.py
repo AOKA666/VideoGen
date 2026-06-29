@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 from services.asset_source_service import normalize_asset_source_fields
 from services.asset_service import analyze_asset, detect_file_type, new_id, safe_storage_name
-from services.r2_storage import R2StorageError, delete_asset_object, ensure_asset_local, upload_asset
+from services.r2_storage import R2StorageError, delete_asset_object, ensure_asset_local, upload_asset, upload_asset_metadata
 from services.store import ASSETS_DIR, load_db, public_url, save_db
 
 router = APIRouter(prefix="/api/assets", tags=["assets"])
@@ -448,8 +448,18 @@ def update_asset(asset_id: str, patch: dict):
             asset[key] = patch[key]
     normalize_asset_source_fields(asset)
     asset["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    remote_synced = False
+    if patch.get("sync_remote"):
+        try:
+            if asset.get("storage_provider") == "cloudflare_r2" and asset.get("object_key"):
+                upload_asset_metadata(asset)
+            else:
+                upload_asset(asset, ensure_asset_local(asset))
+            remote_synced = True
+        except R2StorageError as exc:
+            raise HTTPException(502, str(exc)) from exc
     save_db(db)
-    return {"asset": asset}
+    return {"asset": asset, "remote_synced": remote_synced}
 
 
 @router.delete("/{asset_id}")

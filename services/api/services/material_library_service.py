@@ -8,7 +8,7 @@ from pathlib import Path
 from services.asset_source_service import asset_source_keys, normalize_asset_source_fields, url_key
 from services.asset_service import analyze_asset, new_id, safe_storage_name
 from services.match_service import score_asset
-from services.r2_storage import ensure_asset_local, upload_asset
+from services.r2_storage import R2StorageError, ensure_asset_local, upload_asset, upload_asset_metadata
 from services.store import ASSETS_DIR, load_db, public_url, save_db
 from services.text_service import keywords_from_text
 
@@ -18,6 +18,7 @@ MAX_TAG_LENGTH = {
     "scene": 8,
     "keywords": 10,
 }
+LIBRARY_ASSET_SOURCES = {"local", "library_upload", "library_crop"}
 
 
 def clean_asset_tags(key: str, values: list) -> list[str]:
@@ -199,6 +200,10 @@ def analyze_archived_asset(asset_id: str) -> None:
     has_tags = any(tags.get(key) for key in ("object", "scene", "keywords"))
     asset["analysis_status"] = "ready" if has_tags or not tags.get("analysis_error") else "failed"
     asset["updated_at"] = now_iso()
+    try:
+        upload_asset_metadata(asset)
+    except R2StorageError:
+        pass
     save_db(db)
 
 
@@ -232,7 +237,10 @@ def archive_project_images(db: dict, project_id: str) -> dict:
     for shot in shots:
         candidates = [x for x in generated if x.get("shot_id") == shot.get("id")]
         selected_id = shot.get("selected_asset_id")
-        if selected_id and any(x.get("id") == selected_id for x in db.get("assets", [])):
+        if (
+            str(shot.get("asset_source") or "") in LIBRARY_ASSET_SOURCES
+            or (selected_id and any(x.get("id") == selected_id for x in db.get("assets", [])))
+        ):
             skipped += 1
             continue
         selected = next((x for x in candidates if x.get("id") == selected_id), None)

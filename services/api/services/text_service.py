@@ -14,7 +14,7 @@ SCENE_HINTS = ["实验室", "会议", "档案", "照片", "火箭", "导弹", "�
 ERA_HINTS = ["1950", "1960", "1970", "上世纪", "建国", "抗战"]
 MIN_REWRITE_LENGTH_RATIO = 0.85
 MAX_REWRITE_LENGTH_RATIO = 1.25
-MIN_REWRITE_DIFFERENCE = 45
+MIN_REWRITE_DIFFERENCE = 40
 MAX_REWRITE_ATTEMPTS = 3
 MAX_AUTO_TITLE_LENGTH = 9
 RANDOM = random.SystemRandom()
@@ -177,25 +177,22 @@ def build_fallback_hook(raw_script: str, title: str) -> str:
     return "很多人只看见了结果，却不知道背后那一次几乎没人能承受的选择。"
 
 
-def ensure_opening_hook(raw_script: str, rewritten_script: str, generated_hook: str = "") -> str:
+def ensure_original_opening(raw_script: str, rewritten_script: str) -> str:
     raw_hook = extract_opening_hook(raw_script)
-    hook = generated_hook.strip() or raw_hook
-    if not hook:
+    if not raw_hook:
         return rewritten_script.strip()
-    if raw_hook and is_similar_text(hook, raw_hook) and not is_strong_opening_hook(raw_hook):
-        hook = build_fallback_hook(raw_script, infer_title(raw_script))
 
     rewritten = rewritten_script.strip()
-    if not hook or rewritten.startswith(hook):
+    if rewritten.startswith(raw_hook):
         return rewritten
 
     lines = [line.strip() for line in rewritten.splitlines() if line.strip()]
-    if lines and (is_similar_text(lines[0], hook) or is_similar_text(lines[0], raw_hook)):
+    if lines and is_similar_text(lines[0], raw_hook):
         body_lines = lines[1:]
     else:
         body_lines = lines
     body = "\n".join(body_lines).strip()
-    return f"{hook}\n{body}" if body else hook
+    return f"{raw_hook}\n{body}" if body else raw_hook
 
 
 def compact_text(text: str) -> str:
@@ -250,7 +247,7 @@ def bigmodel_model() -> str:
 def fallback_rewrite_script(raw_script: str, style: str = "纪实故事型") -> dict:
     sentences = split_sentences(raw_script)
     title = infer_title(raw_script)
-    hook = build_fallback_hook(raw_script, title)
+    hook = extract_opening_hook(raw_script) or build_fallback_hook(raw_script, title)
     body = []
     if sentences:
         body.append(hook)
@@ -276,16 +273,25 @@ def fallback_rewrite_script(raw_script: str, style: str = "纪实故事型") -> 
     }
 
 
+def ensure_min_rewrite_difference(result: dict) -> dict:
+    comparison = result.get("rewrite_comparison") or {}
+    difference = comparison.get("overall_difference", 0)
+    if difference < MIN_REWRITE_DIFFERENCE:
+        result["rewrite_error"] = (
+            f"rewrite difference {difference}% below {MIN_REWRITE_DIFFERENCE}%"
+        )
+        raise RewriteQualityError(result)
+    return result
+
+
 def normalize_rewrite_result(result: dict, raw_script: str, style: str) -> dict:
     title = str(result.get("title") or infer_title(raw_script)).strip()
-    hook = str(result.get("hook") or build_fallback_hook(raw_script, title)).strip()
-    if not is_strong_opening_hook(hook):
-        hook = build_fallback_hook(raw_script, title)
+    hook = extract_opening_hook(raw_script) or str(result.get("hook") or build_fallback_hook(raw_script, title)).strip()
     rewritten_script = str(result.get("rewritten_script") or "").strip()
     if not rewritten_script:
         rewritten_script = fallback_rewrite_script(raw_script, style)["rewritten_script"]
     rewritten_script = clean_rewritten_script(raw_script, rewritten_script)
-    rewritten_script = ensure_opening_hook(raw_script, rewritten_script, hook)
+    rewritten_script = ensure_original_opening(raw_script, rewritten_script)
     comparison = compare_scripts(raw_script, rewritten_script)
     return {
         "title": title[:MAX_AUTO_TITLE_LENGTH] or infer_title(raw_script),
@@ -312,40 +318,87 @@ def build_rewrite_prompt(raw_script: str, style: str, attempt: int, previous: di
             f"字符相似度 {comparison.get('character_similarity', 0)}%，语义相似度 {comparison.get('semantic_similarity', 0)}%。"
             "这说明上一版仍然太像原文。请不要继续做同义词替换，必须重新组织正文：改变叙述视角、句子顺序、铺垫方式、转折方式和情绪推进。"
         )
-    prompt = (
-        "你是历史纪实短视频二创编剧，不是润色编辑。你的任务是把原始文案重写成另一版完整口播稿。"
-        "你只能改写 <raw_script> 标签内的内容，禁止替换主题，禁止改成其他历史事件。"
-        "事实边界：不虚构；不添加没有依据的具体时间、地点、人物关系；人物、年代、事件、因果关系必须保留。"
-        "改写目标：保留事实点和信息量，但重建表达方式。不要逐句翻译、不要逐句扩写、不要只做同义词替换。"
-        f"原文去除空白后的长度约 {raw_len} 个中文字符；二创稿不能写得太简略，"
-        f"rewritten_script 去除空白后的长度必须控制在 {min_len} 到 {max_len} 个中文字符之间，"
-        "信息量、叙事层次和关键细节要和原文案接近，禁止压缩成摘要、提纲或短版解说，也不要省略原文中的重要事实。"
-        "开头黄金三秒必须重写成强钩子，并放在 rewritten_script 最开头。"
-        "强钩子只能从原文真实事实里提炼，必须先给冲突、反差、悬念、结果或危险瞬间，不要先讲背景。"
-        "禁止用平铺直叙开头，例如“今天我们讲”“提起某某”“他出生于”“他是我国”“有这样一位”。"
-        "优先使用这些开头方式：结果反差、生死瞬间、身份反差、亲情冲突、被抹掉/消失悬念、绝密任务、无法回家的代价。"
-        "第一句话建议 12 到 36 个字，必须让人想继续听第二句；不要空喊伟大、震撼、传奇。"
-        f"原文当前开头仅供理解，除非它已经有强冲突强悬念，否则不要原样照搬：{opening_hook}"
-        f"除事实、专名和必要年份之外，整体内容必须大改；系统会用字符相似度和语义相似度自动对比，最终总体差异度必须达到 {MIN_REWRITE_DIFFERENCE}% 以上。"
-        "后文改写硬性规则："
-        "1. 不要保留原文连续 8 个字以上的表达，专有名词、年份和固定称谓除外。"
-        "2. 原文每个事实点都要覆盖，但可以换叙述顺序、换句式、换铺垫、换转折。"
-        "3. 把原文的直述句尽量改成悬念句、因果句、补充说明句或镜头化描述。"
-        "4. 能换表达就换表达，例如“远赴重洋赴美留学”不要照抄，可改成“踏上去美国求学的路”。"
-        "5. 不要连续沿用原文的段落结构；可以把一个长句拆成两段，也可以把相邻短句重组为一段。"
-        "6. 不要为了差异度删除内容，必须用新的说法把信息补回来。"
-        "二创写法建议：先在心里提取事实清单，再用新的叙事路径重写；可以从人物选择、时代压力、行动细节、结果意义等角度重新组织。"
-        "全面校对错别字、语病和标点错误，输出必须是通顺、干净的成稿。"
-        "原文案中如果有呼吁点赞互动的钩子，不要删除掉。"
-        "必须根据语义分段，一个完整意思一段；每段就是后续一个分镜，不要把多个意思放在同一段，同样的意思也不要分段；"
-        "每段尽量 20 到 50 个中文字符，适合配音；如果为了保持总字数需要，可以保留更多分段，不要删减事实细节。不要输出 Markdown。"
-        f"文案风格：{style}。"
-        f"这是第 {attempt} 次生成。{retry_instruction}"
-        "rewritten_script 字段里只能放最终二创口播稿正文，禁止包含原文、原始文案、对照稿、解释、标题标签或“二创口播稿：”这类前缀。"
-        "不要先输出一遍原文再输出二创稿，也不要把原文和二创内容混在一起。"
-        "只返回 JSON，字段必须包含 title, hook, rewritten_script, script_style。"
-        f"<raw_script>{raw_script}</raw_script>"
-    )
+    prompt = f"""
+你是一名视频号爆款短视频文案改写专家，擅长改写卖书类、历史人物类、大国情绪类、爱国教育类短视频口播文案。
+
+我要你改写下面这篇文案，目标是在视频号发布，用于提高播放量、完播率和带书转化。
+
+【最重要要求】
+原文前三秒文案必须一字不改保留。
+也就是说，原文开头最前面的 1～3 句话，如果已经承担前三秒钩子作用，必须完整保留，不允许改字、不允许换词、不允许调整顺序、不允许删减。
+你只能从前三秒之后开始优化。
+如果你判断原文前三秒不够好，也不能擅自改动，只能在正文后额外给出“【前三秒优化建议】”，但正文里必须保留原前三秒不变。
+必须原样保留的前三秒开头是：{opening_hook}
+
+【改写目标】
+保留原文的短视频味道，不要改成书面文章。
+改写后的文案要像一个懂视频号的人在口播，而不是像公众号社论、新闻评论、AI润色稿、学生作文。
+整体风格要：口语化、有网感、有情绪、有画面、有节奏、有冲突。
+不要追求文采高级，要追求用户愿意听下去、愿意点赞、愿意评论、愿意转发。
+
+【必须保留的东西】
+1. 保留原文前三秒钩子不变。
+2. 保留原文的核心观点。
+3. 保留原文的情绪曲线。
+4. 保留原文中有流量感的短句、狠话、网感表达。
+5. 保留原文中已经很顺口的金句，不要为了改写而强行换词。
+6. 保留原文中能形成画面的具体细节。
+7. 保留原文的带书逻辑，如果原文提到了《国之脊梁》，要保留并自然优化。
+
+【禁止事项】
+不要做简单同义词替换。
+不要把口语改成书面语。
+不要把“咱妈、塞铁、刷666、小鱼小虾、你可以试试、护筷子”这类短视频表达全部洗掉。
+不要使用过多书面词，例如：悍然、方知、伟岸、至此、乃、赴汤蹈火、径直、再至、苍生、星光、抉择、壮烈史诗、强国气场、脱胎换骨、恩重如山。
+不要频繁使用空泛大词，例如：伟大、震撼、辉煌、底蕴、史诗、精神源泉、民族脊梁、大国情怀。这些词可以少量使用，但不能堆。
+不要把文案改成端着的播音腔。
+不要一上来介绍背景，不要平铺直叙。
+不要削弱原文的爽感、反差感和情绪冲击。
+
+【短视频改写原则】
+一、句子要短。适合真人口播。能用短句就不要用长句。能用人话就不要用书面话。
+二、表达要狠。该硬的地方要硬。比如：“你可以试试敢不敢将它击落。”这种句子不要改成：“那便试试看是否敢于动用武力击落。”
+三、要有画面。多保留或强化具体画面：飞机起飞、国旗铺满街道、地图包围、旧照片、病房电脑、公文包、胶鞋、行李箱、实验室灯光、戈壁风沙。少写抽象评价。
+四、要有情绪递进。文案结构尽量按照：前三秒钩子不变 → 具体事件 → 背景解释 → 历史伤痛/现实困境 → 今日反转 → 情绪爆发 → 英雄群像/人物承接 → 自然带书 → 家长转化。
+五、带书要自然。如果文案是为了卖《国之脊梁》，不要硬广，不要写“赶紧点击小黄车购买”。可以写：“翻开《国之脊梁》才知道，今天的底气不是凭空来的。”“如果家里有孩子，真希望他们认识这些真正值得追的星。”“他们不是热搜里的明星，却是孩子最该知道的人。”
+
+【分段要求】
+请按短视频分镜逻辑分段。
+一个镜头一段。
+同一个镜头内部不要换行。
+每段必须能对应一个完整画面，方便后续 AI 配图、素材搜索和剪映剪辑。
+不要出现只有几个字的空段。
+每段建议 30～80 字左右。
+换段标准是：时间变化、地点变化、人物动作变化、画面主体变化、情绪节点变化。
+不要按朗读断句分段，而要按画面分段。
+
+【改写尺度】
+不是洗稿式同义替换，而是保留爆点后重新优化节奏。
+可以删掉重复啰嗦的句子。
+可以强化画面感和冲突感。
+可以调整后半部分结构。
+可以让带书更自然。
+但不能改动前三秒原文。
+
+【长度和质量约束】
+原文去除空白后的长度约 {raw_len} 个中文字符。
+rewritten_script 去除空白后的长度必须控制在 {min_len} 到 {max_len} 个中文字符之间。
+不要压缩成摘要、提纲或短版解说，也不要省略原文中的重要事实。
+事实边界：不虚构；不添加没有依据的具体时间、地点、人物关系；人物、年代、事件、因果关系必须保留。
+除必须原样保留的前三秒开头、专有名词、年份、固定称谓、顺口金句、流量感短句之外，整体内容必须重新组织。
+系统会用字符相似度和语义相似度自动对比，最终总体差异度必须达到 {MIN_REWRITE_DIFFERENCE}% 以上。
+
+【本次生成信息】
+文案风格：{style}。
+这是第 {attempt} 次生成。{retry_instruction}
+
+【输出要求】
+只返回可解析 JSON，字段必须包含 title, hook, rewritten_script, script_style。
+rewritten_script 字段里只能放改写后的完整文案正文，禁止包含原文、原始文案、对照稿、解释、标题标签或“二创口播稿：”这类前缀。
+不要先输出一遍原文再输出二创稿，也不要把原文和二创内容混在一起。
+
+<raw_script>{raw_script}</raw_script>
+"""
     return prompt
 
 
@@ -416,14 +469,14 @@ def rewrite_script(raw_script: str, style: str = "纪实故事型") -> dict:
     fallback = fallback_rewrite_script(raw_script, style)
     api_key = os.getenv("BIGMODEL_API_KEY", "").strip()
     if not api_key:
-        return fallback
+        return ensure_min_rewrite_difference(fallback)
     try:
         return rewrite_script_with_glm(raw_script, style, api_key)
     except RewriteQualityError:
         raise
     except Exception as exc:
         fallback["rewrite_error"] = str(exc)[:300]
-        return fallback
+        return ensure_min_rewrite_difference(fallback)
 
 
 def choose_guozhijiliang_seed(person_name: str = "", event_angle: str = "") -> tuple[str, str]:
