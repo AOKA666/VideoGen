@@ -33,10 +33,10 @@ def archive_selected_images(project_id: str, background_tasks: BackgroundTasks):
         raise HTTPException(400, "Please choose an asset library folder first")
     result = archive_project_images(db, project_id)
     save_db(db)
-    if result["created_ids"]:
-        background_tasks.add_task(analyze_archived_assets, result["created_ids"])
+    if result["analyze_ids"]:
+        background_tasks.add_task(analyze_archived_assets, result["analyze_ids"])
     return {
-        "status": "analyzing" if result["created"] else "completed",
+        "status": "analyzing" if result["analyzing"] else "completed",
         **result,
     }
 

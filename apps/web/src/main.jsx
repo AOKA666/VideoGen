@@ -630,7 +630,7 @@ function App() {
       { method: 'POST' },
     ));
     if (!result) return;
-    setMessage(`素材入库：新增 ${result.created}，跳过重复 ${result.skipped_duplicates}，无图片 ${result.missing}`);
+    setMessage(`素材入库：新增 ${result.created}，二次识别 ${result.analyzing || 0}，跳过重复 ${result.skipped_duplicates}，无图片 ${result.missing}`);
     await refreshAll(projectId);
   }
 
@@ -679,6 +679,14 @@ function App() {
     if (!coverImage) {
       setMessage('请先上传一张人物图片');
       return;
+    }
+    if (!titleLine1.trim() || !titleLine2.trim()) {
+      setMessage('请填写两行标题');
+      return;
+    }
+    if (!titleConfirmed) {
+      const saved = await confirmTitle({ silent: true });
+      if (!saved) return;
     }
     const data = new FormData();
     data.append('file', coverImage, coverImage.name);
@@ -801,12 +809,12 @@ function App() {
     setMessage('爆款标题生成完成，请确认或编辑');
   }
 
-  async function confirmTitle() {
+  async function confirmTitle(options = {}) {
     if (!titleLine1.trim() || !titleLine2.trim()) {
       setMessage('请填写两行标题');
-      return;
+      return false;
     }
-    await run('保存标题', () => request(`/api/projects/${projectId}/script`, {
+    const result = await run('保存标题', () => request(`/api/projects/${projectId}/script`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -814,8 +822,10 @@ function App() {
         title_line2: titleLine2.trim(),
       }),
     }));
+    if (!result) return false;
     setTitleConfirmed(true);
-    setMessage('标题已确认，可以生成封面');
+    if (!options.silent) setMessage('标题已确认，可以生成封面');
+    return true;
   }
 
   async function generatePublishAssistant() {
@@ -1268,7 +1278,7 @@ function App() {
                 <div className="actions">
                   <button
                     className="primary"
-                    disabled={busy || !titleConfirmed || !coverImage}
+                    disabled={busy || !titleLine1.trim() || !titleLine2.trim() || !coverImage}
                     onClick={generateCover}
                   >
                     <ImagePlus size={18} /> {project.cover_url ? '重新合成封面' : '生成 9:16 封面'}

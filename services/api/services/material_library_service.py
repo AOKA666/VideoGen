@@ -232,6 +232,7 @@ def archive_project_images(db: dict, project_id: str) -> dict:
             existing_hashes.add(content_hash)
         existing_source_keys.update(asset_source_keys(asset))
     created_ids: list[str] = []
+    analyze_ids: list[str] = []
     skipped = 0
     missing = 0
     for shot in shots:
@@ -249,6 +250,11 @@ def archive_project_images(db: dict, project_id: str) -> dict:
         if not selected:
             missing += 1
             continue
+        should_analyze = (
+            selected.get("asset_source") == "manual_upload"
+            or shot.get("asset_source") == "manual_upload"
+            or shot.get("status") == "uploaded"
+        )
         source = Path(str(selected.get("local_path") or ""))
         if not source.exists():
             missing += 1
@@ -303,8 +309,8 @@ def archive_project_images(db: dict, project_id: str) -> dict:
             "scene": clean_asset_tags("scene", list(intent.get("scenes") or [])),
             "keywords": intent_keywords,
             "visual_style": "新闻纪实",
-            "analysis_status": "analyzing",
-            "analysis_provider": "pending",
+            "analysis_status": "analyzing" if should_analyze else "ready",
+            "analysis_provider": "pending" if should_analyze else "storyboard_tags",
             "analysis_error": "",
             "source_note": selected.get("source_page") or selected.get("provider") or "分镜批量入库",
             "copyright_note": "来源与使用权需人工确认",
@@ -320,9 +326,13 @@ def archive_project_images(db: dict, project_id: str) -> dict:
         existing_hashes.add(content_hash)
         existing_source_keys.update(asset_source_keys(asset))
         created_ids.append(asset_id)
+        if should_analyze:
+            analyze_ids.append(asset_id)
     return {
         "created_ids": created_ids,
+        "analyze_ids": analyze_ids,
         "created": len(created_ids),
+        "analyzing": len(analyze_ids),
         "skipped_duplicates": skipped,
         "missing": missing,
     }

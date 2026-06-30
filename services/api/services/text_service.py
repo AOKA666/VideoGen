@@ -17,6 +17,7 @@ MAX_REWRITE_LENGTH_RATIO = 1.25
 MIN_REWRITE_DIFFERENCE = 40
 MAX_REWRITE_ATTEMPTS = 3
 MAX_AUTO_TITLE_LENGTH = 9
+TITLE_PUNCTUATION = re.compile(r"""[，。！？、；："'“”‘’《》【】（）—…\-.!?,;:()\[\]{}<>\s]""")
 RANDOM = random.SystemRandom()
 GUOZHIJILIANG_STORY_SEEDS = [
     ("钱学森", "美国海关扣下他的行李，硬说里面藏着国家机密"),
@@ -133,9 +134,114 @@ def paragraphize_script(text: str) -> str:
     return text.strip()
 
 
+def clean_auto_title(text: str) -> str:
+    title = re.sub(r"^(标题|项目名称|短标题|片名)[:：]", "", str(text or "").strip())
+    return TITLE_PUNCTUATION.sub("", title).strip()
+
+
+def looks_like_truncated_sentence(title: str, raw_script: str) -> bool:
+    if not title or not raw_script:
+        return False
+    sentences = split_sentences(raw_script)
+    first = clean_auto_title(sentences[0] if sentences else raw_script)
+    return len(first) > len(title) + 3 and first.startswith(title)
+
+
+def fallback_infer_title(raw_script: str) -> str:
+    text = re.sub(r"\s+", "", raw_script or "")
+    if not text:
+        return "未命名项目"
+    people = [
+        "钱学森", "邓稼先", "于敏", "黄旭华", "郭永怀", "袁隆平", "王淦昌",
+        "孙家栋", "屠呦呦", "王承书", "彭士禄", "林俊德",
+    ]
+    themes = [
+        ("两弹一星", "两弹一星"),
+        ("回国", "归国"),
+        ("归国", "归国"),
+        ("隐姓埋名", "隐姓埋名"),
+        ("核潜艇", "核潜艇"),
+        ("青蒿素", "青蒿素"),
+        ("杂交水稻", "稻田传奇"),
+        ("卫星", "卫星时刻"),
+        ("导弹", "导弹往事"),
+        ("绝密", "绝密往事"),
+        ("牺牲", "最后时刻"),
+        ("母亲", "家书背后"),
+        ("父亲", "家书背后"),
+        ("国家", "国家选择"),
+    ]
+    person = next((item for item in people if item in text), "")
+    theme = next((label for needle, label in themes if needle in text), "")
+    candidates: list[str] = []
+    if person and theme:
+        candidates.append(f"{person}{theme}")
+    if person:
+        candidates.extend([f"{person}往事", f"{person}故事", person])
+    if theme:
+        candidates.append(theme)
+    for candidate in candidates:
+        cleaned = clean_auto_title(candidate)
+        if 2 <= len(cleaned) <= MAX_AUTO_TITLE_LENGTH:
+            return cleaned
+    chunks = re.findall(r"[\u4e00-\u9fff]{2,6}", text)
+    weak_chunks = {"今天我们", "很多人", "大家好", "你知道", "这个故事", "一个"}
+    for chunk in chunks:
+        if chunk not in weak_chunks and not looks_like_truncated_sentence(chunk, raw_script):
+            return chunk
+    return "未命名项目"
+
+
+def normalize_auto_title(title: str, raw_script: str) -> str:
+    cleaned = clean_auto_title(title)
+    if 2 <= len(cleaned) <= MAX_AUTO_TITLE_LENGTH and not looks_like_truncated_sentence(cleaned, raw_script):
+        return cleaned
+    return fallback_infer_title(raw_script)
+
+
 def infer_title(raw_script: str) -> str:
-    first = split_sentences(raw_script)[0] if raw_script.strip() else "未命名项目"
-    return first[:MAX_AUTO_TITLE_LENGTH].strip("，。！？ ") or "未命名项目"
+    api_key = os.getenv("BIGMODEL_API_KEY", "").strip()
+    if not api_key:
+        return fallback_infer_title(raw_script)
+    prompt = (
+        "请根据下面的中文短视频文案，生成一个项目标题。\n"
+        "要求：1. 必须根据文案主题提炼，不要直接截取原文开头。"
+        "2. 不超过9个汉字。3. 不要标点符号。"
+        "4. 必须是完整短标题，不要像一句话被截断。"
+        "5. 只返回JSON，不要解释。\n\n"
+        f"文案：\n{(raw_script or '')[:900]}\n\n"
+        '{"title": "项目标题"}'
+    )
+    payload = {
+        "model": bigmodel_model(),
+        "messages": [
+            {"role": "system", "content": "你只输出可解析JSON。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.55,
+        "top_p": 0.85,
+        "max_tokens": 120,
+        "stream": False,
+        "thinking": {"type": "disabled"},
+        "response_format": {"type": "json_object"},
+    }
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{bigmodel_endpoint().rstrip('/')}/chat/completions",
+            data=data,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=20) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        content = body["choices"][0]["message"]["content"]
+        if isinstance(content, list):
+            content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+        result = json.loads(extract_json(str(content)))
+        return normalize_auto_title(str(result.get("title") or ""), raw_script)
+    except Exception:
+        return fallback_infer_title(raw_script)
 
 
 def extract_opening_hook(raw_script: str) -> str:
@@ -294,7 +400,7 @@ def normalize_rewrite_result(result: dict, raw_script: str, style: str) -> dict:
     rewritten_script = ensure_original_opening(raw_script, rewritten_script)
     comparison = compare_scripts(raw_script, rewritten_script)
     return {
-        "title": title[:MAX_AUTO_TITLE_LENGTH] or infer_title(raw_script),
+        "title": normalize_auto_title(title, raw_script),
         "hook": hook,
         "rewritten_script": rewritten_script,
         "script_style": str(result.get("script_style") or style),
@@ -584,7 +690,7 @@ def generate_guozhijiliang_script(person_name: str = "", event_angle: str = "") 
     if not script:
         raise RuntimeError("GLM response does not contain script")
     return {
-        "title": str(result.get("title") or infer_title(script)).strip()[:MAX_AUTO_TITLE_LENGTH],
+        "title": normalize_auto_title(str(result.get("title") or ""), script),
         "person": str(result.get("person") or selected_person).strip(),
         "event_angle": str(result.get("event_angle") or selected_angle).strip(),
         "script": script,
