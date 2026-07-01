@@ -17,6 +17,7 @@ MAX_REWRITE_LENGTH_RATIO = 1.25
 MIN_REWRITE_DIFFERENCE = 40
 MAX_REWRITE_ATTEMPTS = 3
 MAX_AUTO_TITLE_LENGTH = 9
+MAX_PUBLISH_SHORT_TITLE_LENGTH = 16
 TITLE_PUNCTUATION = re.compile(r"""[，。！？、；："'“”‘’《》【】（）—…\-.!?,;:()\[\]{}<>\s]""")
 RANDOM = random.SystemRandom()
 GUOZHIJILIANG_STORY_SEEDS = [
@@ -912,14 +913,29 @@ def strip_title_punctuation(text: str) -> str:
     return re.sub(r"\s+", "", punctuation.sub("", str(text or ""))).strip()
 
 
+def clean_publish_description(text: str, limit: int = 140) -> str:
+    description = re.sub(r"\s+", " ", str(text or "")).strip()
+    description = re.sub(r"《[^》]{1,30}》", "", description)
+    description = re.sub(
+        r"(这本书|那本书|本书|书里|书中|翻开|读完|买给孩子|下单|购买|小黄车|带书|卖书|推荐给家长)",
+        "",
+        description,
+    )
+    description = re.sub(r"\s+", " ", description).strip(" ，。！？、；： ")
+    if len(description) > limit:
+        description = description[:limit].rstrip("，。！？、；： ")
+    return description
+
+
 def fallback_publish_assistant(script: str) -> dict:
     sentences = split_sentences(script)
     first = sentences[0] if sentences else script[:40]
-    short_title = strip_title_punctuation(first)[:22] or "这个故事值得被更多人看见"
+    short_title = (
+        strip_title_punctuation(first)[:MAX_PUBLISH_SHORT_TITLE_LENGTH]
+        or "这个故事值得被看见"
+    )
     description_source = " ".join(sentences[:3]) if sentences else script
-    description = re.sub(r"\s+", " ", description_source).strip()
-    if len(description) > 140:
-        description = description[:140].rstrip("，。！？、；： ")
+    description = clean_publish_description(description_source)
     return {"short_title": short_title, "description": description}
 
 
@@ -932,12 +948,13 @@ def generate_publish_assistant(script: str) -> dict:
     prompt = (
         "你是短视频发布运营助手。请根据下面的中文口播文案，生成发布用内容。"
         "\n\n要求："
-        "\n1. short_title 是一句话短标题，12 到 22 个汉字，不要任何标点符号。"
+        "\n1. short_title 是一句话短标题，8 到 16 个汉字，不要任何标点符号，绝对不能超过16个字。"
         "\n2. short_title 要有悬念或反差，但必须忠于文案事实，不要标题党造假。"
         "\n3. description 是视频描述，80 到 140 个汉字，适合发视频号/抖音/小红书。"
-        "\n4. description 开头要吸引人，点出故事冲突和人物精神，可以自然带一点情绪价值。"
-        "\n5. description 不要写成片头文案，不要写“本视频讲述”，不要堆砌空话。"
-        "\n6. 只返回 JSON，不要 Markdown，不要解释。"
+        "\n4. description 开头要吸引人，点出故事冲突、反差、情绪爆点或评论点，让人想点开看完。"
+        "\n5. description 只写视频内容本身，不要介绍书，不要提书名，不要写读书感受，不要出现买书、带书、小黄车、家长购买等表达。"
+        "\n6. description 不要写成片头文案，不要写“本视频讲述”，不要堆砌空话。"
+        "\n7. 只返回 JSON，不要 Markdown，不要解释。"
         "\n\n文案内容："
         f"\n{script[:1200]}"
         "\n\n返回格式："
@@ -972,8 +989,8 @@ def generate_publish_assistant(script: str) -> dict:
         if isinstance(content, list):
             content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
         result = json.loads(extract_json(str(content)))
-        short_title = strip_title_punctuation(result.get("short_title", ""))[:22]
-        description = re.sub(r"\s+", " ", str(result.get("description", "")).strip())[:180]
+        short_title = strip_title_punctuation(result.get("short_title", ""))[:MAX_PUBLISH_SHORT_TITLE_LENGTH]
+        description = clean_publish_description(result.get("description", ""))
         if not short_title or not description:
             return fallback_publish_assistant(script)
         return {"short_title": short_title, "description": description}
