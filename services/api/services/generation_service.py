@@ -1051,6 +1051,11 @@ def _whisperx_json_path(output_dir: Path, audio_path: Path) -> Path:
 
 
 def _extract_whisperx_words(data: dict) -> list[dict]:
+    if isinstance(data.get("output"), dict):
+        nested_words = _extract_whisperx_words(data["output"])
+        if nested_words:
+            return nested_words
+
     words: list[dict] = []
     for item in data.get("word_segments") or []:
         text = item.get("word") or item.get("text") or ""
@@ -1060,7 +1065,13 @@ def _extract_whisperx_words(data: dict) -> list[dict]:
             words.append({"text": str(text), "start": float(start), "end": float(end)})
     if words:
         return words
-    for segment in data.get("segments") or []:
+
+    segments = data.get("segments") or []
+    if isinstance(segments, dict):
+        segments = segments.values()
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
         for item in segment.get("words") or []:
             text = item.get("word") or item.get("text") or ""
             start = item.get("start")
@@ -1068,6 +1079,94 @@ def _extract_whisperx_words(data: dict) -> list[dict]:
             if text and start is not None and end is not None:
                 words.append({"text": str(text), "start": float(start), "end": float(end)})
     return words
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _int_env(name: str, default: int) -> int:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _float_env(name: str, default: float) -> float:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def _load_replicate_output(output) -> dict:
+    if isinstance(output, dict):
+        return output
+    if isinstance(output, list):
+        if output and all(isinstance(item, dict) for item in output):
+            return {"segments": output}
+        for item in output:
+            try:
+                return _load_replicate_output(item)
+            except RuntimeError:
+                continue
+    if hasattr(output, "read"):
+        raw = output.read()
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        return _load_replicate_output(raw)
+
+    text = str(output or "").strip()
+    if not text:
+        raise RuntimeError("Replicate WhisperX returned an empty output")
+    if text.startswith(("http://", "https://")):
+        with urllib.request.urlopen(text, timeout=60) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+        return _load_replicate_output(raw)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Replicate WhisperX returned an unsupported output format") from exc
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, list):
+        return _load_replicate_output(data)
+    raise RuntimeError("Replicate WhisperX returned an unsupported output format")
+
+
+def _replicate_versioned_model_identifier(model: str, token: str) -> str:
+    model = model.strip()
+    if not model or ":" in model:
+        return model
+    parts = model.split("/")
+    if len(parts) != 2 or not all(parts):
+        return model
+    request = urllib.request.Request(
+        f"https://api.replicate.com/v1/models/{parts[0]}/{parts[1]}",
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "VideoGen/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            data = json.loads(response.read().decode("utf-8", errors="replace"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Replicate model lookup failed for {model}: {exc}") from exc
+    version_id = ((data.get("latest_version") or {}).get("id") or "").strip()
+    if not version_id:
+        raise RuntimeError(f"Replicate model lookup did not return a latest version for {model}")
+    return f"{model}:{version_id}"
 
 
 def _lines_from_character_timeline(expected_lines: list[str], characters: list[dict]) -> list[dict]:
@@ -1151,6 +1250,80 @@ def align_lyrics_with_whisperx(audio_path: Path, expected_lines: list[str], dura
         "lrc": lrc_from_lines(lines),
         "word_count": len(words),
     }
+
+
+def align_lyrics_with_replicate_whisperx(audio_path: Path, expected_lines: list[str], duration: float | None = None) -> dict:
+    if not expected_lines:
+        raise RuntimeError("No project lyrics are available for alignment")
+    token = os.getenv("REPLICATE_API_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("REPLICATE_API_TOKEN is not configured")
+    if duration is None:
+        duration = audio_duration(audio_path)
+
+    try:
+        import replicate
+    except ImportError as exc:
+        raise RuntimeError("Python package 'replicate' is not installed. Run pip install -r services/api/requirements.txt") from exc
+
+    os.environ["REPLICATE_API_TOKEN"] = token
+    model = os.getenv("REPLICATE_WHISPERX_MODEL", "victor-upmeet/whisperx").strip() or "victor-upmeet/whisperx"
+    model_identifier = _replicate_versioned_model_identifier(model, token)
+    language = os.getenv("REPLICATE_WHISPERX_LANGUAGE", os.getenv("WHISPERX_LANGUAGE", "zh")).strip()
+    prompt = os.getenv("REPLICATE_WHISPERX_INITIAL_PROMPT", "").strip()
+
+    input_payload = {
+        "align_output": True,
+        "batch_size": _int_env("REPLICATE_WHISPERX_BATCH_SIZE", 64),
+        "diarization": _bool_env("REPLICATE_WHISPERX_DIARIZATION", False),
+        "temperature": _float_env("REPLICATE_WHISPERX_TEMPERATURE", 0.0),
+        "task": os.getenv("REPLICATE_WHISPERX_TASK", "transcribe").strip() or "transcribe",
+    }
+    if language:
+        input_payload["language"] = language
+    if prompt:
+        input_payload["initial_prompt"] = prompt
+
+    extra_input = os.getenv("REPLICATE_WHISPERX_INPUT_JSON", "").strip()
+    if extra_input:
+        try:
+            parsed_extra = json.loads(extra_input)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("REPLICATE_WHISPERX_INPUT_JSON is not valid JSON") from exc
+        if not isinstance(parsed_extra, dict):
+            raise RuntimeError("REPLICATE_WHISPERX_INPUT_JSON must be a JSON object")
+        input_payload.update(parsed_extra)
+
+    with audio_path.open("rb") as audio_file:
+        input_payload["audio_file"] = audio_file
+        output = replicate.run(model_identifier, input=input_payload)
+
+    data = _load_replicate_output(output)
+    words = _extract_whisperx_words(data)
+    if not words:
+        raise RuntimeError("Replicate WhisperX did not return word-level timestamps")
+    source_text = "".join(expected_lines)
+    characters = _character_timeline_from_words(words, source_text, float(duration))
+    lines = _lines_from_character_timeline(expected_lines, characters)
+    if not lines:
+        raise RuntimeError("Replicate WhisperX timestamps could not be matched to the project lyrics")
+    return {
+        "provider": "replicate_whisperx",
+        "model": model_identifier,
+        "language": data.get("detected_language") or language,
+        "lines": lines,
+        "lrc": lrc_from_lines(lines),
+        "word_count": len(words),
+    }
+
+
+def align_lyrics(audio_path: Path, expected_lines: list[str], duration: float | None = None) -> dict:
+    provider = os.getenv("LYRIC_ALIGNMENT_PROVIDER", "whisperx").strip().lower()
+    if provider in {"replicate", "replicate_whisperx", "cloud_whisperx"}:
+        return align_lyrics_with_replicate_whisperx(audio_path, expected_lines, duration)
+    if provider in {"whisperx", "local", "local_whisperx"}:
+        return align_lyrics_with_whisperx(audio_path, expected_lines, duration)
+    raise RuntimeError(f"Unsupported LYRIC_ALIGNMENT_PROVIDER: {provider}")
 
 
 def _parse_lrc_seconds(value) -> float | None:
@@ -1278,13 +1451,17 @@ def align_lyrics_to_shots(lines: list[dict], shots: list[dict], duration: float,
     if not adjusted:
         raise RuntimeError("No lyric lines fall inside the selected music range")
 
-    shot_count = len(shots)
-    line_count = len(adjusted)
+    shot_count = max(len(shots), 1)
+    expected_counts = [len(expected_lyrics_from_shots([shot])) for shot in shots]
+    line_cursor = 0
     shot_timings: list[dict] = []
     for shot_index, shot in enumerate(shots):
-        start_index = line_count * shot_index // shot_count
-        end_index = line_count * (shot_index + 1) // shot_count
-        own_lines = adjusted[start_index:end_index]
+        expected_count = expected_counts[shot_index] if shot_index < len(expected_counts) else 0
+        if shot_index == len(shots) - 1:
+            own_lines = adjusted[line_cursor:]
+        else:
+            own_lines = adjusted[line_cursor:line_cursor + expected_count]
+        line_cursor += expected_count
         if not own_lines:
             start = duration * shot_index / shot_count
             end = duration * (shot_index + 1) / shot_count
@@ -1424,24 +1601,53 @@ def split_subtitle_text(text: str, max_hanzi: int = 9) -> list[str]:
     return normalized
 
 
+def _timed_export_subtitle_chunks(timing: dict, max_hanzi: int) -> list[dict]:
+    raw_text = str(timing.get("text") or "")
+    chunks = split_subtitle_text(raw_text, max_hanzi=max_hanzi)
+    if not chunks:
+        cleaned = subtitle_display_text(raw_text)
+        chunks = [cleaned] if cleaned else []
+    start = float(timing.get("start_time") or 0)
+    end = float(timing.get("end_time") or start)
+    if end <= start:
+        end = start + 0.08
+    weights = [max(chinese_char_count(chunk), 1) for chunk in chunks]
+    total_weight = sum(weights) or 1
+    elapsed_weight = 0
+    subtitles: list[dict] = []
+    for index, (chunk, weight) in enumerate(zip(chunks, weights)):
+        chunk_text = subtitle_display_text(chunk)
+        if not chunk_text:
+            elapsed_weight += weight
+            continue
+        chunk_start = start + (end - start) * elapsed_weight / total_weight
+        elapsed_weight += weight
+        chunk_end = (
+            end
+            if index == len(chunks) - 1
+            else start + (end - start) * elapsed_weight / total_weight
+        )
+        subtitles.append({
+            "start_time": round(chunk_start, 3),
+            "end_time": round(chunk_end, 3),
+            "text": chunk_text,
+            "hanzi_count": chinese_char_count(chunk_text),
+        })
+    return subtitles
+
+
 def build_export_subtitles(shots: list[dict], max_hanzi: int = 9) -> list[dict]:
     subtitles: list[dict] = []
     for shot in shots:
         exact_timings = shot.get("subtitle_timings") or []
         if exact_timings:
             for timing in exact_timings:
-                text = str(timing.get("text") or "")
-                text = subtitle_display_text(text)
-                if not text:
-                    continue
-                subtitles.append({
-                    "shot_id": shot.get("id"),
-                    "shot_index": shot.get("shot_index"),
-                    "start_time": round(float(timing["start_time"]), 3),
-                    "end_time": round(float(timing["end_time"]), 3),
-                    "text": text,
-                    "hanzi_count": chinese_char_count(text),
-                })
+                for chunk in _timed_export_subtitle_chunks(timing, max_hanzi):
+                    subtitles.append({
+                        "shot_id": shot.get("id"),
+                        "shot_index": shot.get("shot_index"),
+                        **chunk,
+                    })
             continue
         shot_start = float(shot.get("start_time") or 0)
         shot_end = float(shot.get("end_time") or 0)
@@ -1469,7 +1675,30 @@ def build_export_subtitles(shots: list[dict], max_hanzi: int = 9) -> list[dict]:
                 "text": subtitle_display_text(chunk),
                 "hanzi_count": chinese_char_count(chunk),
             })
-    return subtitles
+    return _normalize_export_subtitle_timings(subtitles)
+
+
+def _normalize_export_subtitle_timings(subtitles: list[dict]) -> list[dict]:
+    normalized: list[dict] = []
+    previous_end = 0.0
+    for subtitle in sorted(subtitles, key=lambda item: (float(item.get("start_time") or 0), float(item.get("end_time") or 0))):
+        text = str(subtitle.get("text") or "").strip()
+        if not text:
+            continue
+        start = round(max(float(subtitle.get("start_time") or 0), 0.0), 3)
+        end = round(max(float(subtitle.get("end_time") or 0), start + 0.08), 3)
+        if normalized and start <= previous_end:
+            start = round(previous_end + 0.001, 3)
+        if end <= start:
+            end = round(start + 0.08, 3)
+        item = {
+            **subtitle,
+            "start_time": start,
+            "end_time": end,
+        }
+        normalized.append(item)
+        previous_end = end
+    return normalized
 
 
 def generate_export_srt(shots: list[dict], max_hanzi: int = 9) -> str:

@@ -216,28 +216,10 @@ def ai_search_intents(shots: list[dict], full_text: str, *, timeout: int = 90, r
             "shot_index": shot.get("shot_index"),
             "voice_text": str(shot.get("voice_text") or ""),
             "shot_description": str(shot.get("visual_need") or ""),
-            "existing_keywords": [str(k).strip() for k in (shot.get("search_keywords") or []) if str(k).strip()],
             "person_names": [str(k).strip() for k in (shot.get("person_names") or []) if str(k).strip()],
-            "object_tags": [str(k).strip() for k in (shot.get("object_tags") or []) if str(k).strip()],
-            "scene_tags": [str(k).strip() for k in (shot.get("scene_tags") or []) if str(k).strip()],
-            "keywords": [str(k).strip() for k in (shot.get("keywords") or []) if str(k).strip()],
-            "required_object": [str(k).strip() for k in (shot.get("required_object") or []) if str(k).strip()],
-            "required_scene": [str(k).strip() for k in (shot.get("required_scene") or []) if str(k).strip()],
         }
         for shot in shots
     ]
-    fallback_by_id = {
-        str(item["id"]): (
-            item["existing_keywords"]
-            + item["person_names"]
-            + item["object_tags"]
-            + item["scene_tags"]
-            + item["keywords"]
-            + item["required_object"]
-            + item["required_scene"]
-        )
-        for item in shot_items
-    }
     prompt = f"""
 你是短视频分镜图片搜索关键词专家。
 请直接根据每个分镜的 voice_text 和 shot_description，分别选择一个最适合中文图片搜索的核心关键词。
@@ -298,7 +280,9 @@ def ai_search_intents(shots: list[dict], full_text: str, *, timeout: int = 90, r
                 if shot_id not in valid_ids:
                     continue
                 item["provider"] = bigmodel_model()
-                intents[shot_id] = sanitize_intent(item, fallback_values=fallback_by_id.get(shot_id, []))
+                source = next((shot for shot in shot_items if shot["id"] == shot_id), {})
+                shot_text = f"{source.get('voice_text', '')} {source.get('shot_description', '')}"
+                intents[shot_id] = sanitize_intent(item, shot_text)
             missing_ids = [shot["id"] for shot in shot_items if shot["id"] not in intents]
             if missing_ids:
                 raise SearchIntentBatchError(f"GLM 返回缺少 {len(missing_ids)} 个分镜核心关键词")

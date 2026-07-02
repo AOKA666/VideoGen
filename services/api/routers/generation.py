@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from services.asset_service import new_id
 from services.r2_storage import ensure_asset_local
 from services.generation_service import (
+    align_lyrics,
     align_lyrics_to_shots,
     build_image_prompt,
     compose_uploaded_cover,
@@ -22,7 +23,6 @@ from services.generation_service import (
     expected_lyrics_from_shots,
     generate_doubao_image,
     generate_export_srt,
-    align_lyrics_with_whisperx,
     lrc_from_lines,
     remove_watermark_with_seedream,
     synthesize_project_voice,
@@ -195,15 +195,19 @@ def crop_generated_image_square_region(project_id: str, asset_id: str, payload: 
     db = load_db()
     asset, path = _generated_image(db, project_id, asset_id)
     try:
-        crop_region = _read_crop_region(path, payload.x, payload.y, payload.size)
+        _crop_square_region(path, payload.x, payload.y, payload.size)
+        with Image.open(path) as image:
+            width, height = image.size
     except Exception as exc:
-        raise HTTPException(500, f"Save crop region failed: {exc}") from exc
-    asset["crop_region"] = crop_region
-    asset["updated_at"] = datetime.now().isoformat(timespec="seconds")
-    asset.setdefault("image_operations", []).append({
-        "operation": "set_crop_region",
-        "created_at": asset["updated_at"],
-    })
+        raise HTTPException(500, f"Crop image region failed: {exc}") from exc
+    _refresh_image_metadata(asset, path, "crop_square_region")
+    asset["crop_region"] = {
+        "x": 0,
+        "y": 0,
+        "size": min(width, height),
+        "image_width": width,
+        "image_height": height,
+    }
     save_db(db)
     return {"status": "success", "asset": asset}
 
@@ -627,7 +631,7 @@ def generate_music_voice(project_id: str, payload: MusicVoicePayload):
     except Exception as exc:
         raise HTTPException(502, str(exc)) from exc
     try:
-        lyric_result = align_lyrics_with_whisperx(audio_path, expected_lyrics_from_shots(shots), duration)
+        lyric_result = align_lyrics(audio_path, expected_lyrics_from_shots(shots), duration)
         shot_timings = align_lyrics_to_shots(
             lyric_result["lines"],
             shots,

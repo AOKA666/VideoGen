@@ -18,7 +18,7 @@ R2 API 令牌应限制为 `autogen` 存储桶的 Object Read & Write 权限。
 安装新增依赖：
 
 ```powershell
-.\services\api\.venv\Scripts\pip.exe install -r .\services\api\requirements.txt
+.\services\api\.venv\Scripts\python.exe -m pip install -r .\services\api\requirements.txt
 ```
 
 迁移现有素材：

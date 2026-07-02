@@ -1332,13 +1332,34 @@ h3 { font-size: 16px; line-height: 1.48; }
   cursor: grab;
   touch-action: none;
   border: 2px solid #f8fafc;
-  background:
-    linear-gradient(rgba(255,255,255,.44), rgba(255,255,255,.44)) padding-box,
-    rgba(12, 21, 25, .08);
+  background: transparent;
   box-shadow:
-    0 0 0 9999px rgba(12, 21, 25, .48),
-    0 12px 28px rgba(0, 0, 0, .24),
+    0 0 0 1px rgba(12, 21, 25, .72),
+    0 8px 20px rgba(0, 0, 0, .2),
     inset 0 0 0 1px rgba(36, 103, 91, .78);
+}
+.crop-box::before,
+.crop-box::after,
+.crop-box span::before,
+.crop-box span::after {
+  content: "";
+  position: absolute;
+  width: 22px;
+  height: 22px;
+  border-color: #18a66f;
+  pointer-events: none;
+}
+.crop-box::before {
+  top: -3px;
+  left: -3px;
+  border-top: 4px solid #18a66f;
+  border-left: 4px solid #18a66f;
+}
+.crop-box::after {
+  top: -3px;
+  right: -3px;
+  border-top: 4px solid #18a66f;
+  border-right: 4px solid #18a66f;
 }
 .crop-box:active {
   cursor: grabbing;
@@ -1349,9 +1370,20 @@ h3 { font-size: 16px; line-height: 1.48; }
 }
 .crop-box span {
   position: absolute;
-  inset: 33.333%;
-  border: 1px solid rgba(255, 255, 255, .7);
+  inset: 0;
   pointer-events: none;
+}
+.crop-box span::before {
+  bottom: -3px;
+  left: -3px;
+  border-bottom: 4px solid #18a66f;
+  border-left: 4px solid #18a66f;
+}
+.crop-box span::after {
+  right: -3px;
+  bottom: -3px;
+  border-right: 4px solid #18a66f;
+  border-bottom: 4px solid #18a66f;
 }
 .image-preview a {
   color: var(--brand);

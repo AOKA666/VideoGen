@@ -295,13 +295,12 @@ def search_keywords_for_shot(shot: dict) -> list[str]:
     ]
     if override_queries:
         return override_queries
-    explicit_keywords = [str(x).strip() for x in shot.get("search_keywords") or [] if str(x).strip()]
-    if not explicit_keywords:
-        return []
-    try:
-        return [validate_core_keyword(explicit_keywords[0])]
-    except ValueError:
-        return []
+    for candidate in [str(x).strip() for x in shot.get("search_keywords") or [] if str(x).strip()]:
+        try:
+            return [validate_core_keyword(candidate)]
+        except ValueError:
+            continue
+    return []
 
 
 def search_query_for_shot(shot: dict) -> str:

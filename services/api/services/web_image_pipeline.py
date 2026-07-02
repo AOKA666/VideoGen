@@ -80,6 +80,24 @@ def _intent_batches(shots: list[dict], batch_size: int = INTENT_BATCH_SIZE) -> l
     return [shots[index:index + size] for index in range(0, len(shots), size)]
 
 
+def _project_full_text(project: dict | None) -> str:
+    project = project or {}
+    return f"{project.get('raw_script', '')}\n{project.get('rewritten_script', '')}".strip()
+
+
+def _regenerate_search_intents_for_retry(project: dict | None, shots: list[dict]) -> None:
+    if not shots:
+        return
+    full_text = _project_full_text(project)
+    intents = ai_search_intents(shots, full_text)
+    for shot in shots:
+        shot_id = str(shot.get("id") or shot.get("shot_index"))
+        intent = intents.get(shot_id) or intents.get(str(shot.get("shot_index")))
+        if intent:
+            apply_intent_to_shot(shot, intent)
+            apply_material_intent(shot)
+
+
 def _completed_count(shots: list[dict], project_id: str) -> int:
     return sum(
         1 for item in shots
@@ -1040,12 +1058,31 @@ def rerun_failed_shots_web_image_search(
         shot["status"] = "pending_search"
         shot["downloaded_image_count"] = 0
         shot.pop("_search_query_overrides", None)
-        if image_search_provider == "tencent":
-            shot["_search_query_overrides"] = _tencent_retry_queries(shot)
         shot["_image_search_provider"] = image_search_provider
-        shot["current_search_keyword"] = search_query_for_shot(shot)
         shot["updated_at"] = now
         retry_shots.append(shot)
+
+    try:
+        _regenerate_search_intents_for_retry(project, retry_shots)
+    except SearchIntentBatchError as exc:
+        for shot in retry_shots:
+            shot["status"] = "intent_failed"
+            shot["search_intent_error"] = str(exc)[:300]
+            shot["current_search_keyword"] = ""
+            shot["updated_at"] = _now()
+        project["status"] = "search_failed"
+        project["search_stage"] = "intent_failed"
+        project["search_error"] = str(exc)[:500]
+        project["updated_at"] = _now()
+        save_db(db)
+        return
+    for shot in retry_shots:
+        if image_search_provider == "tencent":
+            shot["_search_query_overrides"] = _tencent_retry_queries(shot)
+        else:
+            shot.pop("_search_query_overrides", None)
+        shot["current_search_keyword"] = search_query_for_shot(shot)
+        shot["updated_at"] = _now()
 
     project["status"] = "searching_images"
     project["search_stage"] = "retrying_failed"
@@ -1119,7 +1156,19 @@ def rerun_shot_web_image_search(project_id: str, shot_id: str, image_search_prov
     shot["status"] = "searching"
     shot["downloaded_image_count"] = 0
     shot.pop("_search_query_overrides", None)
-    shot["search_keywords"] = search_keywords_for_shot(shot)
+    try:
+        _regenerate_search_intents_for_retry(project, [shot])
+    except SearchIntentBatchError as exc:
+        shot["status"] = "intent_failed"
+        shot["search_intent_error"] = str(exc)[:300]
+        shot["current_search_keyword"] = ""
+        project["status"] = "search_failed"
+        project["search_stage"] = "intent_failed"
+        project["search_error"] = str(exc)[:500]
+        shot["updated_at"] = now
+        project["updated_at"] = now
+        save_db(db)
+        return
     if image_search_provider == "tencent":
         shot["_search_query_overrides"] = _tencent_retry_queries(shot)
     else:

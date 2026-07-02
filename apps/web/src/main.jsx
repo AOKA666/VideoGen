@@ -1317,7 +1317,7 @@ function App() {
                       value={titleLine1}
                       maxLength={9}
                       onChange={(event) => { setTitleLine1(event.target.value); setTitleConfirmed(false); }}
-                      placeholder="5-9字，制造悬念"
+                      placeholder="1-9字，制造悬念"
                     />
                   </label>
                   <label>
@@ -1326,7 +1326,7 @@ function App() {
                       value={titleLine2}
                       maxLength={9}
                       onChange={(event) => { setTitleLine2(event.target.value); setTitleConfirmed(false); }}
-                      placeholder="5-9字，揭示反差"
+                      placeholder="1-9字，揭示反差"
                     />
                   </label>
                 </div>

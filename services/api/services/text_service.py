@@ -207,7 +207,7 @@ def infer_title(raw_script: str) -> str:
     prompt = (
         "请根据下面的中文短视频文案，生成一个项目标题。\n"
         "要求：1. 必须根据文案主题提炼，不要直接截取原文开头。"
-        "2. 不超过9个汉字。3. 不要标点符号。"
+        "2. 不要截断句子，优先使用完整短语。3. 不要标点符号。"
         "4. 必须是完整短标题，不要像一句话被截断。"
         "5. 只返回JSON，不要解释。\n\n"
         f"文案：\n{(raw_script or '')[:900]}\n\n"
@@ -851,7 +851,7 @@ def generate_viral_title(script: str) -> dict:
     prompt = (
         "你是爆款短视频标题专家。请根据以下文案内容，生成一个两行式爆款标题。"
         "\n\n标题规则："
-        "\n1. 必须生成两行文字，每行5-9字，任何一行都不能超过9个字。"
+        "\n1. 必须生成两行文字，每行使用完整短句，不要为了字数截断一句话。"
         "\n2. 标题要制造悬念或反差，让用户忍不住点开。"
         "\n3. 以下是爆款标题示范格式，请学习其逻辑但不要照搬："
         "\n   - 第一行：飞机坠毁前 / 第二行：他用身体护住了国家机密"
@@ -901,8 +901,6 @@ def generate_viral_title(script: str) -> dict:
         _punct_pat = re.compile(r"[，。！？、；：“”‘’《》【】（）—…\-.!?,;:'\"()\[\]{}<>]")
         line1 = _punct_pat.sub("", line1).strip()
         line2 = _punct_pat.sub("", line2).strip()
-        line1 = line1[:9]
-        line2 = line2[:9]
         return {"line1": line1, "line2": line2, "full_title": f"{line1} {line2}"}
     except Exception as exc:
         return {"line1": "", "line2": "", "full_title": "", "error": str(exc)[:200]}
@@ -911,6 +909,68 @@ def generate_viral_title(script: str) -> dict:
 def strip_title_punctuation(text: str) -> str:
     punctuation = re.compile(r"[，。！？、；：“”‘’《》【】（）—…\-.!?,;:'\"()\[\]{}<>]")
     return re.sub(r"\s+", "", punctuation.sub("", str(text or ""))).strip()
+
+
+def generate_viral_title(script: str) -> dict:
+    """Generate a two-line cover title; retry instead of truncating overlong lines."""
+    api_key = os.getenv("BIGMODEL_API_KEY", "").strip()
+    if not api_key:
+        return {"line1": "", "line2": "", "full_title": ""}
+
+    base_prompt = (
+        "你是爆款短视频标题专家。请根据以下文案内容，生成一个两行式爆款标题。"
+        "\n\n标题规则："
+        "\n1. 必须生成两行文字，每行1-9个字，任何一行都不能超过9个字。"
+        "\n2. 如果一句话超过9个字，必须重新概括成更短的完整表达，严禁直接截断。"
+        "\n3. 标题要制造悬念或反差，让用户忍不住点开。"
+        "\n4. 标题必须忠于文案事实，不能编造信息。"
+        "\n5. 不要用「震惊」「惊人」「不可思议」等空洞词汇。"
+        "\n6. 标题中禁止出现任何标点符号，包括逗号、句号、感叹号、问号、冒号、破折号等。"
+        "\n7. 只返回JSON，不要Markdown，不要解释。"
+        "\n\n文案内容："
+        f"\n{script[:600]}"
+        "\n\n返回格式："
+        '\n{"line1": "第一行标题", "line2": "第二行标题"}'
+    )
+
+    last_error = ""
+    try:
+        for _ in range(3):
+            retry_note = f"\n\n上一版不合格：{last_error}。请重新生成，不要截断原句。" if last_error else ""
+            payload = {
+                "model": bigmodel_model(),
+                "messages": [
+                    {"role": "system", "content": "你只输出可解析JSON。"},
+                    {"role": "user", "content": base_prompt + retry_note},
+                ],
+                "temperature": 0.8,
+                "top_p": 0.9,
+                "max_tokens": 200,
+                "stream": False,
+                "thinking": {"type": "disabled"},
+                "response_format": {"type": "json_object"},
+            }
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                f"{bigmodel_endpoint().rstrip('/')}/chat/completions",
+                data=data,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as response:
+                body = json.loads(response.read().decode("utf-8"))
+            content = body["choices"][0]["message"]["content"]
+            if isinstance(content, list):
+                content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+            result = json.loads(extract_json(str(content)))
+            line1 = strip_title_punctuation(result.get("line1", ""))
+            line2 = strip_title_punctuation(result.get("line2", ""))
+            if 1 <= len(line1) <= 9 and 1 <= len(line2) <= 9:
+                return {"line1": line1, "line2": line2, "full_title": f"{line1} {line2}"}
+            last_error = f"第1行{len(line1)}字，第2行{len(line2)}字，要求每行1-9字"
+        return {"line1": "", "line2": "", "full_title": "", "error": last_error or "Title generation failed"}
+    except Exception as exc:
+        return {"line1": "", "line2": "", "full_title": "", "error": str(exc)[:200]}
 
 
 def clean_publish_description(text: str, limit: int = 140) -> str:
@@ -1048,7 +1108,7 @@ def generate_shots(script: str) -> list[dict]:
             "object_tags": required_object,
             "scene_tags": required_scene,
             "keywords": [],
-            "search_keywords": tags["keywords"][:4],
+            "search_keywords": [],
             "selected_asset_id": None,
             "asset_source": None,
             "match_score": 0,
