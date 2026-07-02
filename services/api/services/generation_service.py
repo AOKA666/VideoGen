@@ -24,6 +24,10 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 from services.store import public_url
 
 
+STORYBOARD_SEEDREAM_MODEL = "doubao-seedream-4-0-250828"
+STORYBOARD_IMAGE_SIZE = "1024x1024"
+
+
 FEMALE_PERSON_HINTS = {
     "黄令仪", "王承书", "屠呦呦", "林巧稚", "吴健雄", "何泽慧", "叶叔华",
 }
@@ -218,7 +222,7 @@ def ark_endpoint() -> str:
 
 
 def ark_image_model() -> str:
-    return os.getenv("ARK_IMAGE_MODEL", "doubao-seedream-4.5")
+    return os.getenv("ARK_IMAGE_MODEL", STORYBOARD_SEEDREAM_MODEL)
 
 
 def ark_image_edit_model() -> str:
@@ -231,6 +235,10 @@ def image_size_for_ratio(video_ratio: str | None) -> str:
     if video_ratio == "1:1":
         return "1024x1024"
     return "1440x2560"
+
+
+def storyboard_image_size() -> str:
+    return STORYBOARD_IMAGE_SIZE
 
 
 def image_edit_size_for_source(path: Path) -> str:
@@ -275,7 +283,7 @@ def remove_watermark_with_seedream(path: Path, shot: dict | None = None) -> dict
         "image": image_data_uri,
         "strength": 0.3,
         "n": 1,
-        "size": image_edit_size_for_source(path),
+        "size": storyboard_image_size(),
         "watermark": False,
         "response_format": "url",
     }
@@ -357,7 +365,7 @@ def generate_doubao_image(
         "model": ark_image_model(),
         "prompt": prompt,
         "negative_prompt": "文字，水印，logo，畸形手指，低清晰度，过曝，过度卡通，现代广告感",
-        "size": image_size_for_ratio(video_ratio),
+        "size": storyboard_image_size(),
         "response_format": "url",
         "watermark": False,
     }

@@ -48,8 +48,8 @@ MINIMAX_IMAGE_MODEL=MiniMax-M3
 # 火山方舟 / Seedream：AI 分镜图和去水印
 ARK_API_KEY=your_ark_api_key
 ARK_ENDPOINT=https://ark.cn-beijing.volces.com/api/v3
-ARK_IMAGE_MODEL=doubao-seedream-4-5-251128
-ARK_IMAGE_EDIT_MODEL=doubao-seedream-4-5-251128
+ARK_IMAGE_MODEL=doubao-seedream-4-0-250828
+ARK_IMAGE_EDIT_MODEL=doubao-seedream-4-0-250828
 
 # 腾讯云图片搜索
 TENCENT_CLOUD_SECRET_ID=your_tencent_secret_id
