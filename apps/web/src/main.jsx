@@ -1456,8 +1456,9 @@ function App() {
                   一句话短标题
                   <input
                     value={publishShortTitle}
-                    onChange={(e) => setPublishShortTitle(e.target.value)}
-                    placeholder="不带标点的短标题"
+                    maxLength={16}
+                    onChange={(e) => setPublishShortTitle(e.target.value.slice(0, 16))}
+                    placeholder="不超过16字不带标点"
                   />
                 </label>
                 <label>
