@@ -141,6 +141,13 @@ def export_assets(
             try:
                 with Image.open(source) as image:
                     converted = ImageOps.exif_transpose(image).convert("RGBA")
+                    crop = (generated or asset or {}).get("crop_region") or {}
+                    if crop.get("size"):
+                        width, height = converted.size
+                        side = max(1, min(int(round(float(crop.get("size") or 0))), width, height))
+                        left = max(0, min(int(round(float(crop.get("x") or 0))), width - side))
+                        top = max(0, min(int(round(float(crop.get("y") or 0))), height - side))
+                        converted = converted.crop((left, top, left + side, top + side))
                     converted.save(target, format="PNG", optimize=True)
             except Exception as exc:
                 raise HTTPException(

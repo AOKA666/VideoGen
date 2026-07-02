@@ -15,12 +15,18 @@ from pydantic import BaseModel
 from services.asset_service import new_id
 from services.r2_storage import ensure_asset_local
 from services.generation_service import (
+    align_lyrics_to_shots,
     build_image_prompt,
     compose_uploaded_cover,
+    convert_music_to_main_voice,
+    expected_lyrics_from_shots,
     generate_doubao_image,
     generate_export_srt,
+    align_lyrics_with_whisperx,
+    lrc_from_lines,
     remove_watermark_with_seedream,
     synthesize_project_voice,
+    weighted_music_timeline_from_shots,
     write_timeline,
 )
 from services.store import load_db, project_dir, public_url, save_db
@@ -38,10 +44,21 @@ class ImageGenerationPayload(BaseModel):
     prompt: str | None = None
 
 
+class SquareCropPayload(BaseModel):
+    x: float
+    y: float
+    size: float
+
+
 class MusicSettingsPayload(BaseModel):
     music_id: str | None = None
     start_sec: float = 0
     volume: float = 0.2
+
+
+class MusicVoicePayload(BaseModel):
+    music_id: str
+    start_sec: float | None = None
 
 
 def _generated_image(db: dict, project_id: str, asset_id: str) -> tuple[dict, Path]:
@@ -99,6 +116,43 @@ def _crop_square(path: Path) -> None:
         cropped.save(path, format=save_format, **save_options)
 
 
+def _crop_square_region(path: Path, x: float, y: float, size: float) -> None:
+    with Image.open(path) as source:
+        suffix = path.suffix.lower()
+        image = ImageOps.exif_transpose(source).convert("RGBA" if suffix == ".png" else "RGB")
+        width, height = image.size
+        if width <= 0 or height <= 0:
+            raise ValueError("Image has invalid dimensions")
+        side = max(1, min(int(round(size)), width, height))
+        left = max(0, min(int(round(x)), width - side))
+        top = max(0, min(int(round(y)), height - side))
+        cropped = image.crop((left, top, left + side, top + side))
+        save_format = {
+            ".png": "PNG",
+            ".webp": "WEBP",
+        }.get(suffix, "JPEG")
+        save_options = {"quality": 95} if save_format in {"JPEG", "WEBP"} else {}
+        cropped.save(path, format=save_format, **save_options)
+
+
+def _read_crop_region(path: Path, x: float, y: float, size: float) -> dict:
+    with Image.open(path) as source:
+        image = ImageOps.exif_transpose(source)
+        width, height = image.size
+    if width <= 0 or height <= 0:
+        raise ValueError("Image has invalid dimensions")
+    side = max(1, min(float(size), float(width), float(height)))
+    left = max(0.0, min(float(x), width - side))
+    top = max(0.0, min(float(y), height - side))
+    return {
+        "x": round(left, 3),
+        "y": round(top, 3),
+        "size": round(side, 3),
+        "image_width": width,
+        "image_height": height,
+    }
+
+
 @router.get("/{project_id}/generated-assets/{asset_id}/download-png")
 def download_generated_image_png(project_id: str, asset_id: str):
     db = load_db()
@@ -132,6 +186,24 @@ def crop_generated_image_square(project_id: str, asset_id: str):
     except Exception as exc:
         raise HTTPException(500, f"Crop image failed: {exc}") from exc
     _refresh_image_metadata(asset, path, "crop_square")
+    save_db(db)
+    return {"status": "success", "asset": asset}
+
+
+@router.post("/{project_id}/generated-assets/{asset_id}/crop-square-region")
+def crop_generated_image_square_region(project_id: str, asset_id: str, payload: SquareCropPayload):
+    db = load_db()
+    asset, path = _generated_image(db, project_id, asset_id)
+    try:
+        crop_region = _read_crop_region(path, payload.x, payload.y, payload.size)
+    except Exception as exc:
+        raise HTTPException(500, f"Save crop region failed: {exc}") from exc
+    asset["crop_region"] = crop_region
+    asset["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    asset.setdefault("image_operations", []).append({
+        "operation": "set_crop_region",
+        "created_at": asset["updated_at"],
+    })
     save_db(db)
     return {"status": "success", "asset": asset}
 
@@ -513,6 +585,116 @@ def update_music_settings(project_id: str, payload: MusicSettingsPayload):
         "music": music,
         "start_sec": project["background_music_start_sec"],
         "volume": project["background_music_volume"],
+    }
+
+
+@router.post("/{project_id}/generate-music-voice")
+def generate_music_voice(project_id: str, payload: MusicVoicePayload):
+    db = load_db()
+    project = next((p for p in db["projects"] if p["id"] == project_id), None)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    shots = sorted([s for s in db["shots"] if s["project_id"] == project_id], key=lambda s: s["shot_index"])
+    if not shots:
+        raise HTTPException(400, "No shots")
+
+    music = next(
+        (item for item in db.get("music_library", []) if item.get("id") == payload.music_id),
+        None,
+    )
+    if not music:
+        raise HTTPException(404, "Music not found")
+    source = Path(str(music.get("local_path") or ""))
+    if not source.exists():
+        raise HTTPException(404, "Music file not found")
+
+    source_duration = float(music.get("duration_sec") or 0)
+    start_sec = (
+        float(payload.start_sec)
+        if payload.start_sec is not None
+        else float(project.get("background_music_start_sec") or 0)
+    )
+    start_sec = max(0.0, start_sec)
+    if source_duration > 0:
+        start_sec = min(start_sec, max(source_duration - 0.1, 0))
+
+    audio_path = project_dir(project_id) / "audio" / "main_voice.mp3"
+    lyrics_path = project_dir(project_id) / "subtitles" / "lyrics.lrc"
+    timeline_path = project_dir(project_id) / "audio" / "voice_timeline.json"
+    lyric_warning = None
+    try:
+        duration = convert_music_to_main_voice(source, audio_path, start_sec=start_sec)
+    except Exception as exc:
+        raise HTTPException(502, str(exc)) from exc
+    try:
+        lyric_result = align_lyrics_with_whisperx(audio_path, expected_lyrics_from_shots(shots), duration)
+        shot_timings = align_lyrics_to_shots(
+            lyric_result["lines"],
+            shots,
+            duration,
+            source_start_sec=0,
+        )
+    except Exception as exc:
+        lyric_warning = str(exc)
+        shot_timings = weighted_music_timeline_from_shots(shots, duration)
+        fallback_lines = []
+        for timing in shot_timings:
+            fallback_lines.extend(timing.get("subtitle_timings", []))
+        lyric_result = {
+            "provider": "duration_weighted_fallback",
+            "model": "",
+            "lines": fallback_lines,
+            "lrc": lrc_from_lines(fallback_lines),
+        }
+
+    timing_by_shot = {
+        timing["shot_id"]: timing
+        for timing in shot_timings
+        if timing.get("shot_id")
+    }
+    for shot in shots:
+        timing = timing_by_shot.get(shot["id"])
+        if not timing:
+            continue
+        shot["start_time"] = round(timing["start_time"], 3)
+        shot["end_time"] = round(timing["end_time"], 3)
+        shot["duration_sec"] = round(timing["duration_sec"], 3)
+        shot["subtitle_timings"] = timing.get("subtitle_timings", [])
+
+    timeline_path.write_text(json.dumps(shot_timings, ensure_ascii=False, indent=2), encoding="utf-8")
+    lyrics_path.write_text(lrc_from_lines(lyric_result["lines"]), encoding="utf-8")
+    now = datetime.now().isoformat(timespec="seconds")
+    project.update({
+        "voice_style": "music",
+        "audio_url": public_url(audio_path),
+        "voice_timeline_url": public_url(timeline_path),
+        "lyrics_lrc_url": public_url(lyrics_path),
+        "audio_format": "mp3",
+        "audio_provider": "music_upload",
+        "music_voice_id": music.get("id"),
+        "music_voice_name": music.get("name"),
+        "music_voice_source_start_sec": round(start_sec, 3),
+        "music_voice_lyric_provider": lyric_result.get("provider"),
+        "music_voice_lyric_model": lyric_result.get("model"),
+        "music_voice_lyric_warning": lyric_warning,
+        "background_music_id": None,
+        "background_music_name": "",
+        "background_music_url": "",
+        "background_music_start_sec": 0,
+        "background_music_volume": 0.2,
+        "updated_at": now,
+    })
+    save_db(db)
+    return {
+        "status": "success",
+        "audio_url": project["audio_url"],
+        "voice_timeline_url": project["voice_timeline_url"],
+        "lyrics_lrc_url": project["lyrics_lrc_url"],
+        "duration_sec": duration,
+        "line_count": len(lyric_result["lines"]),
+        "provider": lyric_result.get("provider"),
+        "model": lyric_result.get("model"),
+        "warning": lyric_warning,
     }
 
 

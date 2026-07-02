@@ -336,6 +336,30 @@ h3 { font-size: 16px; line-height: 1.48; }
   align-items: center;
   margin-bottom: 18px;
 }
+.voice-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+}
+.voice-toolbar label.compact-control {
+  flex: 0 0 auto;
+  min-width: 0;
+}
+.voice-toolbar label.compact-control:first-of-type {
+  width: 220px;
+}
+.voice-toolbar label.compact-control:last-of-type {
+  width: 120px;
+}
+.voice-toolbar button {
+  flex: 0 0 auto;
+  width: auto;
+  padding: 0 14px;
+  white-space: nowrap;
+}
+.voice-toolbar button.primary {
+  min-width: 220px;
+}
 .single-upload { grid-template-columns: minmax(240px, 1fr) minmax(220px, .45fr) auto; }
 .asset-upload-actions {
   display: flex;
@@ -1286,6 +1310,48 @@ h3 { font-size: 16px; line-height: 1.48; }
 .image-preview .image-fallback {
   width: min(720px, 100%);
   height: min(520px, calc(100vh - 170px));
+}
+.crop-preview-stage {
+  position: relative;
+  display: inline-grid;
+  justify-self: center;
+  max-width: 100%;
+  max-height: calc(100vh - 170px);
+}
+.crop-preview-stage img {
+  display: block;
+  max-width: 100%;
+  max-height: calc(100vh - 170px);
+  border-radius: 6px;
+  background: #edf0eb;
+  user-select: none;
+}
+.crop-box {
+  position: absolute;
+  z-index: 2;
+  cursor: grab;
+  touch-action: none;
+  border: 2px solid #f8fafc;
+  background:
+    linear-gradient(rgba(255,255,255,.44), rgba(255,255,255,.44)) padding-box,
+    rgba(12, 21, 25, .08);
+  box-shadow:
+    0 0 0 9999px rgba(12, 21, 25, .48),
+    0 12px 28px rgba(0, 0, 0, .24),
+    inset 0 0 0 1px rgba(36, 103, 91, .78);
+}
+.crop-box:active {
+  cursor: grabbing;
+}
+.crop-box:focus-visible {
+  outline: 3px solid rgba(246, 216, 120, .9);
+  outline-offset: 2px;
+}
+.crop-box span {
+  position: absolute;
+  inset: 33.333%;
+  border: 1px solid rgba(255, 255, 255, .7);
+  pointer-events: none;
 }
 .image-preview a {
   color: var(--brand);

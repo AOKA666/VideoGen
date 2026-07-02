@@ -8,8 +8,10 @@ import json
 import mimetypes
 import os
 import re
+import shlex
 import shutil
 import subprocess
+import tempfile
 import urllib.error
 import urllib.request
 import wave
@@ -255,6 +257,23 @@ def image_edit_size_for_source(path: Path) -> str:
     return image_size_for_ratio("1:1")
 
 
+def _fit_without_distortion(image: Image.Image, target_size: tuple[int, int]) -> Image.Image:
+    target_width, target_height = target_size
+    source_width, source_height = image.size
+    if source_width <= 0 or source_height <= 0:
+        raise RuntimeError(f"Edited image has invalid dimensions: {source_width}x{source_height}")
+    source_ratio = source_width / source_height
+    target_ratio = target_width / target_height
+    if abs(source_ratio - target_ratio) <= 0.02:
+        return image.resize(target_size, Image.Resampling.LANCZOS)
+    return ImageOps.fit(
+        image,
+        target_size,
+        method=Image.Resampling.LANCZOS,
+        centering=(0.5, 0.5),
+    )
+
+
 def remove_watermark_with_seedream(path: Path, shot: dict | None = None) -> dict:
     api_key = os.getenv("ARK_API_KEY", "").strip()
     if not api_key:
@@ -272,6 +291,7 @@ def remove_watermark_with_seedream(path: Path, shot: dict | None = None) -> dict
     with Image.open(BytesIO(original_bytes)) as source:
         original = ImageOps.exif_transpose(source)
         original_size = original.size
+    edit_size = image_edit_size_for_source(path)
 
     image_b64 = base64.b64encode(original_bytes).decode("ascii")
     mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
@@ -283,7 +303,7 @@ def remove_watermark_with_seedream(path: Path, shot: dict | None = None) -> dict
         "image": image_data_uri,
         "strength": 0.3,
         "n": 1,
-        "size": storyboard_image_size(),
+        "size": edit_size,
         "watermark": False,
         "response_format": "url",
     }
@@ -320,7 +340,7 @@ def remove_watermark_with_seedream(path: Path, shot: dict | None = None) -> dict
             edited_image = ImageOps.exif_transpose(source)
             edited_image.load()
             if edited_image.size != original_size:
-                edited_image = edited_image.resize(original_size, Image.Resampling.LANCZOS)
+                edited_image = _fit_without_distortion(edited_image, original_size)
             suffix = path.suffix.lower()
             save_format = {
                 ".png": "PNG",
@@ -345,6 +365,8 @@ def remove_watermark_with_seedream(path: Path, shot: dict | None = None) -> dict
         "provider": "volcengine_ark",
         "model": ark_image_edit_model(),
         "image_size": payload["size"],
+        "original_size": f"{original_size[0]}x{original_size[1]}",
+        "aspect_preserved": True,
         "remote_url": image_url or "",
     }
 
@@ -994,6 +1016,322 @@ def synthesize_project_voice(path: Path, shots: list[dict], voice_type: str | No
         "duration_sec": final_duration,
         **alignment,
     }
+
+
+def expected_lyrics_from_shots(shots: list[dict]) -> list[str]:
+    lines: list[str] = []
+    for shot in shots:
+        text = re.sub(r"\s+", "", str(shot.get("voice_text") or ""))
+        chunks = [
+            item.strip()
+            for item in re.findall(r"[^，。！？!?；;\n]+[，。！？!?；;]?", text)
+            if item.strip()
+        ]
+        if not chunks and text:
+            chunks = [text]
+        lines.extend(chunk for chunk in chunks if chunk)
+    return lines
+
+
+def whisperx_command() -> list[str]:
+    command = os.getenv("WHISPERX_COMMAND", "whisperx").strip() or "whisperx"
+    if os.name == "nt" and Path(command).exists():
+        return [command]
+    return shlex.split(command, posix=(os.name != "nt"))
+
+
+def _whisperx_json_path(output_dir: Path, audio_path: Path) -> Path:
+    exact = output_dir / f"{audio_path.stem}.json"
+    if exact.exists():
+        return exact
+    matches = sorted(output_dir.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)
+    if not matches:
+        raise RuntimeError("WhisperX did not produce a JSON output file")
+    return matches[0]
+
+
+def _extract_whisperx_words(data: dict) -> list[dict]:
+    words: list[dict] = []
+    for item in data.get("word_segments") or []:
+        text = item.get("word") or item.get("text") or ""
+        start = item.get("start")
+        end = item.get("end")
+        if text and start is not None and end is not None:
+            words.append({"text": str(text), "start": float(start), "end": float(end)})
+    if words:
+        return words
+    for segment in data.get("segments") or []:
+        for item in segment.get("words") or []:
+            text = item.get("word") or item.get("text") or ""
+            start = item.get("start")
+            end = item.get("end")
+            if text and start is not None and end is not None:
+                words.append({"text": str(text), "start": float(start), "end": float(end)})
+    return words
+
+
+def _lines_from_character_timeline(expected_lines: list[str], characters: list[dict]) -> list[dict]:
+    lines: list[dict] = []
+    cursor = 0
+    for line in expected_lines:
+        char_count = len(alignment_text(line))
+        line_chars = characters[cursor:cursor + char_count]
+        cursor += char_count
+        if not line_chars:
+            continue
+        lines.append({
+            "start_time": round(float(line_chars[0]["start"]), 3),
+            "end_time": round(float(line_chars[-1]["end"]), 3),
+            "duration_sec": round(float(line_chars[-1]["end"]) - float(line_chars[0]["start"]), 3),
+            "text": line,
+        })
+    return lines
+
+
+def align_lyrics_with_whisperx(audio_path: Path, expected_lines: list[str], duration: float | None = None) -> dict:
+    if os.getenv("WHISPERX_ENABLED", "true").strip().lower() in {"0", "false", "no", "off"}:
+        raise RuntimeError("WhisperX alignment is disabled by WHISPERX_ENABLED=false")
+    if not expected_lines:
+        raise RuntimeError("No project lyrics are available for alignment")
+    if duration is None:
+        duration = audio_duration(audio_path)
+    command = whisperx_command()
+    with tempfile.TemporaryDirectory(prefix="whisperx_align_") as tmp:
+        output_dir = Path(tmp)
+        args = [
+            *command,
+            str(audio_path),
+            "--model", os.getenv("WHISPERX_MODEL", "small"),
+            "--language", os.getenv("WHISPERX_LANGUAGE", "zh"),
+            "--device", os.getenv("WHISPERX_DEVICE", "cpu"),
+            "--compute_type", os.getenv("WHISPERX_COMPUTE_TYPE", "int8"),
+            "--output_format", "json",
+            "--output_dir", str(output_dir),
+        ]
+        extra_args = os.getenv("WHISPERX_EXTRA_ARGS", "").strip()
+        if extra_args:
+            args.extend(shlex.split(extra_args))
+        env = os.environ.copy()
+        env.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+        env.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+        try:
+            subprocess.run(
+                args,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=0x08000000,
+                timeout=int(os.getenv("WHISPERX_TIMEOUT_SEC", "900")),
+                env=env,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("WhisperX is not installed or WHISPERX_COMMAND is not on PATH") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"WhisperX timed out after {exc.timeout} seconds") from exc
+        except subprocess.CalledProcessError as exc:
+            combined_output = "\n".join(part for part in [exc.stdout, exc.stderr] if part)
+            raise RuntimeError(f"WhisperX failed: {combined_output[-3000:]}") from exc
+
+        data = json.loads(_whisperx_json_path(output_dir, audio_path).read_text(encoding="utf-8"))
+    words = _extract_whisperx_words(data)
+    if not words:
+        raise RuntimeError("WhisperX did not return word-level timestamps")
+    source_text = "".join(expected_lines)
+    characters = _character_timeline_from_words(words, source_text, float(duration))
+    lines = _lines_from_character_timeline(expected_lines, characters)
+    if not lines:
+        raise RuntimeError("WhisperX timestamps could not be matched to the project lyrics")
+    return {
+        "provider": "whisperx",
+        "model": os.getenv("WHISPERX_MODEL", "small"),
+        "language": os.getenv("WHISPERX_LANGUAGE", "zh"),
+        "lines": lines,
+        "lrc": lrc_from_lines(lines),
+        "word_count": len(words),
+    }
+
+
+def _parse_lrc_seconds(value) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    match = re.fullmatch(r"(?:(\d{1,2}):)?(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?", text)
+    if match:
+        hour = int(match.group(1) or 0)
+        minute = int(match.group(2))
+        second = int(match.group(3))
+        fraction = match.group(4) or "0"
+        return hour * 3600 + minute * 60 + second + int(fraction.ljust(3, "0")[:3]) / 1000
+    match = re.fullmatch(r"(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?", text)
+    if match:
+        minute = int(match.group(1))
+        second = int(match.group(2))
+        fraction = match.group(3) or "0"
+        return minute * 60 + second + int(fraction.ljust(3, "0")[:3]) / 1000
+    return None
+
+
+def normalize_lrc_lines(lines: list[dict], lrc_text: str = "") -> list[dict]:
+    normalized: list[dict] = []
+    for item in lines if isinstance(lines, list) else []:
+        text = str(item.get("text") or item.get("lyric") or item.get("line") or "").strip()
+        start = item.get("start_time", item.get("timestamp", item.get("time", item.get("start"))))
+        if not text:
+            continue
+        start_time = _parse_lrc_seconds(start)
+        if start_time is None:
+            continue
+        normalized.append({"start_time": round(max(start_time, 0.0), 3), "text": text})
+    if not normalized:
+        for match in re.finditer(r"\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]([^\r\n]+)", lrc_text or ""):
+            minute = int(match.group(1))
+            second = int(match.group(2))
+            fraction = match.group(3) or "0"
+            start_time = minute * 60 + second + int(fraction.ljust(3, "0")[:3]) / 1000
+            text = match.group(4).strip()
+            if text:
+                normalized.append({"start_time": round(start_time, 3), "text": text})
+    normalized.sort(key=lambda item: item["start_time"])
+    deduped: list[dict] = []
+    for item in normalized:
+        if deduped and abs(item["start_time"] - deduped[-1]["start_time"]) < 0.05 and item["text"] == deduped[-1]["text"]:
+            continue
+        deduped.append(item)
+    return deduped
+
+
+def format_lrc_time(seconds: float) -> str:
+    total_cs = int(round(max(seconds, 0.0) * 100))
+    minute = total_cs // 6000
+    second = (total_cs % 6000) // 100
+    centisecond = total_cs % 100
+    return f"{minute:02d}:{second:02d}.{centisecond:02d}"
+
+
+def lrc_from_lines(lines: list[dict]) -> str:
+    return "\n".join(
+        f"[{format_lrc_time(float(item['start_time']))}]{str(item.get('text') or '').strip()}"
+        for item in lines
+        if str(item.get("text") or "").strip()
+    ) + "\n"
+
+
+def convert_music_to_main_voice(source_path: Path, output_path: Path, start_sec: float = 0.0) -> float:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = ["ffmpeg", "-y"]
+    if start_sec > 0:
+        command.extend(["-ss", f"{start_sec:.3f}"])
+    command.extend([
+        "-i", str(source_path),
+        "-vn",
+        "-acodec", "libmp3lame",
+        "-ar", "44100",
+        "-b:a", "192k",
+        str(output_path),
+    ])
+    try:
+        subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=0x08000000,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("FFmpeg is required to use music as the main audio") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"Failed to prepare music audio: {exc.stderr[-500:]}") from exc
+    return audio_duration(output_path)
+
+
+def align_lyrics_to_shots(lines: list[dict], shots: list[dict], duration: float, source_start_sec: float = 0.0) -> list[dict]:
+    adjusted: list[dict] = []
+    for index, item in enumerate(lines):
+        start = float(item["start_time"]) - source_start_sec
+        if start < -0.05 or start > duration:
+            continue
+        next_start = (
+            float(lines[index + 1]["start_time"]) - source_start_sec
+            if index + 1 < len(lines)
+            else min(duration, max(start + 3.0, duration))
+        )
+        start = max(start, 0.0)
+        end = max(start + 0.25, min(next_start, duration))
+        adjusted.append({
+            "start_time": round(start, 3),
+            "end_time": round(end, 3),
+            "duration_sec": round(end - start, 3),
+            "text": str(item.get("text") or "").strip(),
+        })
+    if not adjusted:
+        raise RuntimeError("No lyric lines fall inside the selected music range")
+
+    shot_count = len(shots)
+    line_count = len(adjusted)
+    shot_timings: list[dict] = []
+    for shot_index, shot in enumerate(shots):
+        start_index = line_count * shot_index // shot_count
+        end_index = line_count * (shot_index + 1) // shot_count
+        own_lines = adjusted[start_index:end_index]
+        if not own_lines:
+            start = duration * shot_index / shot_count
+            end = duration * (shot_index + 1) / shot_count
+            shot_timings.append({
+                "shot_id": shot.get("id"),
+                "shot_index": shot.get("shot_index"),
+                "start_time": round(start, 3),
+                "end_time": round(end, 3),
+                "duration_sec": round(end - start, 3),
+                "subtitle_timings": [],
+            })
+            continue
+        subtitle_timings = []
+        for subtitle_index, line in enumerate(own_lines, 1):
+            subtitle_timings.append({
+                "shot_id": shot.get("id"),
+                "shot_index": shot.get("shot_index"),
+                "subtitle_index": subtitle_index,
+                **line,
+            })
+        shot_timings.append({
+            "shot_id": shot.get("id"),
+            "shot_index": shot.get("shot_index"),
+            "start_time": subtitle_timings[0]["start_time"],
+            "end_time": subtitle_timings[-1]["end_time"],
+            "duration_sec": subtitle_timings[-1]["end_time"] - subtitle_timings[0]["start_time"],
+            "subtitle_timings": subtitle_timings,
+        })
+    return shot_timings
+
+
+def weighted_music_timeline_from_shots(shots: list[dict], duration: float) -> list[dict]:
+    subtitle_timings = _weighted_subtitle_timeline(shots, duration)
+    shot_timings: list[dict] = []
+    for shot in shots:
+        own_timings = [item for item in subtitle_timings if item.get("shot_id") == shot.get("id")]
+        if not own_timings:
+            continue
+        shot_timings.append({
+            "shot_id": shot.get("id"),
+            "shot_index": shot.get("shot_index"),
+            "start_time": own_timings[0]["start_time"],
+            "end_time": own_timings[-1]["end_time"],
+            "duration_sec": own_timings[-1]["end_time"] - own_timings[0]["start_time"],
+            "subtitle_timings": own_timings,
+        })
+    return shot_timings
 
 
 def format_srt_time(seconds: float) -> str:

@@ -49,6 +49,21 @@ function assetImageUrl(asset) {
   return `${API}${asset.file_url}${version ? `?v=${encodeURIComponent(version)}` : ''}`;
 }
 
+function assetCropObjectPosition(asset) {
+  const crop = asset?.crop_region;
+  const width = Number(crop?.image_width || 0);
+  const height = Number(crop?.image_height || 0);
+  const size = Number(crop?.size || 0);
+  if (!width || !height || !size) return undefined;
+  const movableX = Math.max(width - size, 0);
+  const movableY = Math.max(height - size, 0);
+  const x = movableX ? (Number(crop.x || 0) / movableX) * 100 : 50;
+  const y = movableY ? (Number(crop.y || 0) / movableY) * 100 : 50;
+  return {
+    objectPosition: `${Math.max(0, Math.min(100, x))}% ${Math.max(0, Math.min(100, y))}%`,
+  };
+}
+
 function App() {
   const [tab, setTab] = useState('create');
   const [projects, setProjects] = useState([]);
@@ -91,6 +106,7 @@ function App() {
   const uploadInputRef = useRef(null);
   const coverInputRef = useRef(null);
   const musicInputRef = useRef(null);
+  const musicVoiceInputRef = useRef(null);
   const musicPreviewRef = useRef(null);
   const lastProjectStatusRef = useRef('');
 
@@ -614,6 +630,25 @@ function App() {
     }
   }
 
+  async function cropGeneratedImageRegion(asset, crop) {
+    if (!asset?.project_id || !asset?.id || !crop) return;
+    setProcessingImage(`${asset.id}:crop-square-region`);
+    try {
+      await run('保存图片显示区域', () => request(
+        `/api/projects/${asset.project_id}/generated-assets/${asset.id}/crop-square-region`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(crop),
+        },
+      ));
+      setPreviewAsset(null);
+      await refreshAll(projectId);
+    } finally {
+      setProcessingImage('');
+    }
+  }
+
   async function uploadManualShotImage(shotId, file) {
     const data = new FormData();
     data.append('file', file, file.name);
@@ -673,6 +708,41 @@ function App() {
     await refreshAll(projectId);
     setTab('cover');
     return true;
+  }
+
+  async function generateMusicVoiceAndSubtitles(musicId = backgroundMusicId, startSec = backgroundMusicStart) {
+    if (!musicId) {
+      setMessage('请先上传或选择一首音乐');
+      return false;
+    }
+    const musicResult = await run('生成音乐歌词字幕', () => request(`/api/projects/${projectId}/generate-music-voice`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ music_id: musicId, start_sec: Number(startSec) || 0 }),
+    }));
+    if (!musicResult) return false;
+    const subtitleResult = await run('生成字幕', () => request(`/api/projects/${projectId}/generate-subtitles`, { method: 'POST' }));
+    if (!subtitleResult) return false;
+    await refreshAll(projectId);
+    setMessage(musicResult.warning
+      ? `音乐字幕已生成，但 AI 对齐失败，已按时长临时匹配：${musicResult.warning}`
+      : `音乐已作为主音轨，识别 ${musicResult.line_count || 0} 行歌词并生成字幕`);
+    setTab('cover');
+    return true;
+  }
+
+  async function uploadMusicVoice(file) {
+    if (!file) return;
+    const data = new FormData();
+    data.append('file', file, file.name);
+    const result = await run('上传音乐', () => request('/api/assets/music', {
+      method: 'POST',
+      body: data,
+    }));
+    if (!result?.music) return;
+    const musicData = await request('/api/assets/music');
+    setMusicLibrary(musicData.music || []);
+    await generateMusicVoiceAndSubtitles(result.music.id, 0);
   }
 
   async function generateCover() {
@@ -1163,9 +1233,30 @@ function App() {
 
         {tab === 'match' && (
           <section className="band">
-            <div className="toolbar">
+            <div className="toolbar voice-toolbar">
+              <input
+                ref={musicVoiceInputRef}
+                className="hidden-input"
+                type="file"
+                accept=".mp3,.wav,.m4a,.aac,.ogg,.flac,audio/*"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (file) uploadMusicVoice(file);
+                  event.target.value = '';
+                }}
+              />
               <VoiceSelect value={voiceType} onChange={setVoiceType} />
               <SpeechRateSelect value={speechRate} onChange={setSpeechRate} />
+              <button type="button" onClick={() => musicVoiceInputRef.current?.click()}>
+                <Music size={18} /> 上传音乐生成歌词字幕
+              </button>
+              <button
+                type="button"
+                disabled={!backgroundMusicId || busy}
+                onClick={() => generateMusicVoiceAndSubtitles()}
+              >
+                <Music size={18} /> 用音乐库生成歌词字幕
+              </button>
               <button className="primary" onClick={generateVoiceAndSubtitles}><Mic size={18} /> 生成配音与字幕</button>
             </div>
             <div className="shot-list">
@@ -1517,7 +1608,14 @@ function App() {
         />
       )}
       {editingAsset && <AssetEditor asset={editingAsset} onClose={() => setEditingAsset(null)} onSave={saveAssetTags} onDelete={deleteAsset} />}
-      {previewAsset && <ImagePreview asset={previewAsset} onClose={() => setPreviewAsset(null)} />}
+      {previewAsset && (
+        <ImagePreview
+          asset={previewAsset}
+          busy={Boolean(processingImage)}
+          onApplyCrop={cropGeneratedImageRegion}
+          onClose={() => setPreviewAsset(null)}
+        />
+      )}
       {libraryPickerShotId && (
         <LibraryImagePicker
           assets={assets}
@@ -1576,7 +1674,7 @@ function AssetCard({ asset, selected, onSelect, onPreview, onEdit, onDelete, ima
         onClick={openPreview}
         onKeyDown={openPreview}
       >
-        {asset.file_type === 'image' ? <SafeImage src={src} alt={asset.file_name} /> : <video src={src} controls />}
+        {asset.file_type === 'image' ? <SafeImage src={src} alt={asset.file_name} style={assetCropObjectPosition(asset)} /> : <video src={src} controls />}
         {imageTools}
       </div>
       <h3>{asset.file_name}</h3>
@@ -1594,7 +1692,7 @@ function AssetCard({ asset, selected, onSelect, onPreview, onEdit, onDelete, ima
   );
 }
 
-function SafeImage({ src, alt }) {
+function SafeImage({ src, alt, style }) {
   const [broken, setBroken] = useState(false);
   useEffect(() => {
     setBroken(false);
@@ -1602,7 +1700,7 @@ function SafeImage({ src, alt }) {
   if (!src || broken) {
     return <div className="image-fallback">图片文件不可用</div>;
   }
-  return <img src={src} alt={alt || ''} onError={() => setBroken(true)} />;
+  return <img src={src} alt={alt || ''} style={style} onError={() => setBroken(true)} />;
 }
 
 
@@ -1748,9 +1846,89 @@ function SearchProgress({ progress, project, onStop }) {
   );
 }
 
-function ImagePreview({ asset, onClose }) {
+function ImagePreview({ asset, busy = false, onApplyCrop, onClose }) {
   const src = assetImageUrl(asset);
   const canDownloadPng = Boolean(asset.project_id && asset.id && asset.file_type !== 'video');
+  const canCrop = canDownloadPng && typeof onApplyCrop === 'function';
+  const imageRef = useRef(null);
+  const dragRef = useRef(null);
+  const [imageBox, setImageBox] = useState(null);
+  const [naturalSize, setNaturalSize] = useState(null);
+  const [cropBox, setCropBox] = useState(null);
+
+  function readImageBox() {
+    const image = imageRef.current;
+    if (!image) return null;
+    const rect = image.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+    const nextImageBox = { width: rect.width, height: rect.height };
+    setImageBox(nextImageBox);
+    return nextImageBox;
+  }
+
+  function resetCropBox(nextImageBox = imageBox) {
+    if (!nextImageBox) return;
+    const side = Math.min(nextImageBox.width, nextImageBox.height);
+    setCropBox({
+      x: Math.round((nextImageBox.width - side) / 2),
+      y: Math.round((nextImageBox.height - side) / 2),
+      size: Math.round(side),
+    });
+  }
+
+  function onImageLoad(event) {
+    const image = event.currentTarget;
+    const nextImageBox = readImageBox();
+    setNaturalSize({ width: image.naturalWidth, height: image.naturalHeight });
+    const crop = asset.crop_region;
+    if (crop?.image_width && crop?.image_height && crop?.size && nextImageBox) {
+      const scaleX = nextImageBox.width / Number(crop.image_width);
+      const scaleY = nextImageBox.height / Number(crop.image_height);
+      setCropBox({
+        x: Math.max(0, Math.min(Number(crop.x || 0) * scaleX, nextImageBox.width)),
+        y: Math.max(0, Math.min(Number(crop.y || 0) * scaleY, nextImageBox.height)),
+        size: Math.min(Number(crop.size) * Math.min(scaleX, scaleY), nextImageBox.width, nextImageBox.height),
+      });
+    } else {
+      resetCropBox(nextImageBox);
+    }
+  }
+
+  function moveCrop(clientX, clientY) {
+    const drag = dragRef.current;
+    if (!drag || !imageBox || !cropBox) return;
+    const nextX = Math.max(0, Math.min(drag.startCropX + clientX - drag.startClientX, imageBox.width - cropBox.size));
+    const nextY = Math.max(0, Math.min(drag.startCropY + clientY - drag.startClientY, imageBox.height - cropBox.size));
+    setCropBox((current) => current ? { ...current, x: nextX, y: nextY } : current);
+  }
+
+  function startDrag(event) {
+    if (!cropBox) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    dragRef.current = {
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      startCropX: cropBox.x,
+      startCropY: cropBox.y,
+    };
+  }
+
+  function finishDrag(event) {
+    event.currentTarget.releasePointerCapture?.(event.pointerId);
+    dragRef.current = null;
+  }
+
+  function applyCrop() {
+    if (busy || !canCrop || !cropBox || !imageBox || !naturalSize) return;
+    const scaleX = naturalSize.width / imageBox.width;
+    const scaleY = naturalSize.height / imageBox.height;
+    onApplyCrop(asset, {
+      x: cropBox.x * scaleX,
+      y: cropBox.y * scaleY,
+      size: cropBox.size * Math.min(scaleX, scaleY),
+    });
+  }
   function downloadPng() {
     const link = document.createElement('a');
     link.href = `${API}/api/projects/${asset.project_id}/generated-assets/${asset.id}/download-png`;
@@ -1765,15 +1943,67 @@ function ImagePreview({ asset, onClose }) {
         <div className="image-preview-head">
           <strong>{asset.file_name || '图片预览'}</strong>
           <div className="image-preview-actions">
+            {canCrop && (
+              <button type="button" onClick={() => resetCropBox(readImageBox())}>
+                <Crop size={17} /> 重置裁剪框
+              </button>
+            )}
+            {canCrop && (
+              <button type="button" className="primary" onClick={applyCrop}>
+                <Crop size={17} /> {busy ? '保存中' : '应用显示区域'}
+              </button>
+            )}
             {canDownloadPng && (
-              <button type="button" className="primary" onClick={downloadPng}>
+              <button type="button" onClick={downloadPng}>
                 <Download size={17} /> 下载 PNG
               </button>
             )}
             <button type="button" onClick={onClose}>关闭</button>
           </div>
         </div>
-        <SafeImage src={src} alt={asset.file_name || 'preview'} />
+        <div className="crop-preview-stage">
+          <img ref={imageRef} src={src} alt={asset.file_name || 'preview'} onLoad={onImageLoad} />
+          {canCrop && imageBox && cropBox && (
+            <div
+              className="crop-box"
+              role="slider"
+              aria-label="拖拽选择方形裁剪区域"
+              tabIndex={0}
+              style={{
+                left: `${cropBox.x}px`,
+                top: `${cropBox.y}px`,
+                width: `${cropBox.size}px`,
+                height: `${cropBox.size}px`,
+              }}
+              onPointerDown={startDrag}
+              onPointerMove={(event) => moveCrop(event.clientX, event.clientY)}
+              onPointerUp={finishDrag}
+              onPointerCancel={finishDrag}
+              onKeyDown={(event) => {
+                if (!imageBox || !cropBox) return;
+                const step = event.shiftKey ? 20 : 5;
+                const delta = {
+                  ArrowLeft: [-step, 0],
+                  ArrowRight: [step, 0],
+                  ArrowUp: [0, -step],
+                  ArrowDown: [0, step],
+                }[event.key];
+                if (!delta) return;
+                event.preventDefault();
+                setCropBox((current) => {
+                  if (!current) return current;
+                  return {
+                    ...current,
+                    x: Math.max(0, Math.min(current.x + delta[0], imageBox.width - current.size)),
+                    y: Math.max(0, Math.min(current.y + delta[1], imageBox.height - current.size)),
+                  };
+                });
+              }}
+            >
+              <span />
+            </div>
+          )}
+        </div>
         {(asset.source_page || asset.remote_url) && (
           <a href={asset.source_page || asset.remote_url} target="_blank" rel="noreferrer">查看来源</a>
         )}
@@ -2043,7 +2273,7 @@ function ShotCard({
                         disabled={Boolean(processingImage)}
                         onClick={(event) => {
                           event.stopPropagation();
-                          onCrop?.(item.id);
+                          onPreview?.(item);
                         }}
                       >
                         <Crop size={16} />

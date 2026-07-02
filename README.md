@@ -44,6 +44,11 @@ BIGMODEL_MODEL=glm-5.1
 MINIMAX_API_KEY=your_minimax_api_key
 MINIMAX_ENDPOINT=https://api.minimaxi.com/v1
 MINIMAX_IMAGE_MODEL=MiniMax-M3
+WHISPERX_COMMAND=whisperx
+WHISPERX_MODEL=small
+WHISPERX_LANGUAGE=zh
+WHISPERX_DEVICE=cpu
+WHISPERX_COMPUTE_TYPE=int8
 
 # 火山方舟 / Seedream：AI 分镜图和去水印
 ARK_API_KEY=your_ark_api_key
