@@ -982,8 +982,6 @@ def clean_publish_description(text: str, limit: int = 140) -> str:
         description,
     )
     description = re.sub(r"\s+", " ", description).strip(" ，。！？、；： ")
-    if len(description) > limit:
-        description = description[:limit].rstrip("，。！？、；： ")
     return description
 
 
