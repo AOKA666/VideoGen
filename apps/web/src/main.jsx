@@ -1,9 +1,10 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Archive, Crop, Download, Eraser, Film, FolderOpen, ImagePlus, Library, Mic, Music, RefreshCw, Save, Scissors, Search, Tags, Trash2, Wand2 } from 'lucide-react';
+import { Archive, Check, Crop, Download, Eraser, Film, FolderOpen, ImagePlus, Library, Mic, Music, RefreshCw, Save, Scissors, Search, Tags, Trash2, Wand2 } from 'lucide-react';
 import './styles.css';
 
 const API = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
+const ASSET_PAGE_SIZE = 60;
 const VOICE_OPTIONS = [
   { value: 'zh_male_m191_uranus_bigtts', label: '男声 · 沉稳叙事' },
   { value: 'zh_male_dongfanghaoran_uranus_bigtts', label: '男声 · 东方浩然' },
@@ -88,6 +89,7 @@ function App() {
   const [materialSourceStrategy, setMaterialSourceStrategy] = useState('library_first');
   const [voiceType, setVoiceType] = useState(VOICE_OPTIONS[0].value);
   const [speechRate, setSpeechRate] = useState(0);
+  const [projectNameDraft, setProjectNameDraft] = useState('');
   const [titleLine1, setTitleLine1] = useState('');
   const [titleLine2, setTitleLine2] = useState('');
   const [titleConfirmed, setTitleConfirmed] = useState(false);
@@ -102,6 +104,7 @@ function App() {
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [exportResult, setExportResult] = useState(null);
   const [selectedAssetIds, setSelectedAssetIds] = useState(new Set());
+  const [visibleAssetCount, setVisibleAssetCount] = useState(ASSET_PAGE_SIZE);
   const folderFallbackRef = useRef(null);
   const uploadInputRef = useRef(null);
   const coverInputRef = useRef(null);
@@ -177,6 +180,10 @@ function App() {
     map.forEach((list) => list.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || ''))));
     return map;
   }, [webImageDiagnostics]);
+  const visibleAssets = useMemo(
+    () => assets.slice(0, visibleAssetCount),
+    [assets, visibleAssetCount],
+  );
 
   async function run(label, fn) {
     setBusy(true);
@@ -235,6 +242,7 @@ function App() {
 
   useEffect(() => {
     if (!project) return;
+    setProjectNameDraft(project.name || '');
     setTitleLine1(project.title_line1 || '');
     setTitleLine2(project.title_line2 || '');
     setTitleConfirmed(Boolean(project.title_line1 && project.title_line2) || Boolean(project.cover_url));
@@ -246,6 +254,7 @@ function App() {
     setBackgroundMusicVolume(Math.round(Number(project.background_music_volume ?? 0.2) * 100));
   }, [
     project?.id,
+    project?.name,
     project?.title_line1,
     project?.title_line2,
     project?.publish_short_title,
@@ -281,6 +290,12 @@ function App() {
     }, 2500);
     return () => window.clearInterval(timer);
   }, [assets, projectId]);
+
+  useEffect(() => {
+    if (tab === 'assets') {
+      setVisibleAssetCount(ASSET_PAGE_SIZE);
+    }
+  }, [tab, activeLibrary?.id]);
 
   useEffect(() => {
     const activeStatuses = ['pending_search', 'analyzing_intent', 'searching'];
@@ -381,6 +396,23 @@ function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ rewritten_script: project.rewritten_script }),
     }));
+    await refreshAll(projectId);
+  }
+
+  async function saveProjectName() {
+    if (!projectId) return;
+    const name = projectNameDraft.trim();
+    if (!name) {
+      setMessage('项目名称不能为空');
+      return;
+    }
+    if (name === (project?.name || '').trim()) return;
+    const result = await run('保存项目名称', () => request(`/api/projects/${projectId}/script`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    }));
+    if (!result) return;
     await refreshAll(projectId);
   }
 
@@ -630,8 +662,8 @@ function App() {
     }
   }
 
-  async function cropGeneratedImageRegion(asset, crop) {
-    if (!asset?.project_id || !asset?.id || !crop) return;
+  async function saveGeneratedImageDisplayRegion(asset, region) {
+    if (!asset?.project_id || !asset?.id || !region) return;
     setProcessingImage(`${asset.id}:crop-square-region`);
     try {
       await run('保存图片显示区域', () => request(
@@ -639,7 +671,7 @@ function App() {
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(crop),
+          body: JSON.stringify(region),
         },
       ));
       setPreviewAsset(null);
@@ -1000,6 +1032,29 @@ function App() {
             <p>{activeLibrary ? `当前素材库：${activeLibrary.name}` : '进入素材库前，需要先选择一个文件夹作为素材库。'}</p>
           </div>
           <div className="top-actions">
+            {project && (
+              <div className="project-name-editor">
+                <input
+                  value={projectNameDraft}
+                  onChange={(event) => setProjectNameDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') saveProjectName();
+                    if (event.key === 'Escape') setProjectNameDraft(project.name || '');
+                  }}
+                  aria-label="项目名称"
+                  maxLength="80"
+                />
+                <button
+                  type="button"
+                  className="icon-button"
+                  title="保存项目名称"
+                  disabled={busy || !projectNameDraft.trim() || projectNameDraft.trim() === (project?.name || '').trim()}
+                  onClick={saveProjectName}
+                >
+                  <Check size={18} />
+                </button>
+              </div>
+            )}
             <span className={workflowBusy ? 'status busy' : 'status'}>{workflowMessage}</span>
           </div>
         </header>
@@ -1081,7 +1136,7 @@ function App() {
                   </div>
                 )}
                 <div className="asset-grid">
-                  {assets.map((asset) => (
+                  {visibleAssets.map((asset) => (
                     <AssetCard
                       key={asset.id}
                       asset={asset}
@@ -1094,6 +1149,16 @@ function App() {
                     />
                   ))}
                 </div>
+                {visibleAssetCount < assets.length && (
+                  <div className="load-more-row">
+                    <button
+                      type="button"
+                      onClick={() => setVisibleAssetCount((count) => Math.min(count + ASSET_PAGE_SIZE, assets.length))}
+                    >
+                      加载更多（{Math.min(ASSET_PAGE_SIZE, assets.length - visibleAssetCount)} / 剩余 {assets.length - visibleAssetCount}）
+                    </button>
+                  </div>
+                )}
               </>
             )}
           </section>
@@ -1612,7 +1677,7 @@ function App() {
         <ImagePreview
           asset={previewAsset}
           busy={Boolean(processingImage)}
-          onApplyCrop={cropGeneratedImageRegion}
+          onApplyCrop={saveGeneratedImageDisplayRegion}
           onClose={() => setPreviewAsset(null)}
         />
       )}
@@ -1700,7 +1765,7 @@ function SafeImage({ src, alt, style }) {
   if (!src || broken) {
     return <div className="image-fallback">图片文件不可用</div>;
   }
-  return <img src={src} alt={alt || ''} style={style} onError={() => setBroken(true)} />;
+  return <img src={src} alt={alt || ''} style={style} loading="lazy" decoding="async" onError={() => setBroken(true)} />;
 }
 
 

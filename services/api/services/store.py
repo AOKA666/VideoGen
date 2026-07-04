@@ -5,6 +5,7 @@ import os
 import re
 import threading
 import time
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,8 @@ DEFAULT_DB: dict[str, Any] = {
     "web_image_diagnostics": [],
 }
 _DB_LOCK = threading.RLock()
+_DB_CACHE: dict[str, Any] | None = None
+_DB_CACHE_MTIME_NS: int | None = None
 _STORAGE_INITIALIZED = False
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 _SHOT_DIR_PATTERN = re.compile(r"^shot_(\d+)$")
@@ -209,28 +212,39 @@ def ensure_storage() -> None:
         _STORAGE_INITIALIZED = True
 
 
-def load_db() -> dict[str, Any]:
+def load_db(copy_data: bool = True) -> dict[str, Any]:
     with _DB_LOCK:
         ensure_storage()
-        return _read_db_file()
+        return _read_db_file(copy_data=copy_data)
 
 
 def save_db(data: dict[str, Any]) -> None:
+    global _DB_CACHE, _DB_CACHE_MTIME_NS
     with _DB_LOCK:
         STORAGE.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(data, ensure_ascii=False, indent=2)
         tmp = DB.with_name(f"{DB.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         tmp.write_text(payload, encoding="utf-8")
         os.replace(tmp, DB)
+        _DB_CACHE = deepcopy(data)
+        _DB_CACHE_MTIME_NS = DB.stat().st_mtime_ns
 
 
-def _read_db_file() -> dict[str, Any]:
+def _read_db_file(copy_data: bool = True) -> dict[str, Any]:
+    global _DB_CACHE, _DB_CACHE_MTIME_NS
+    if _DB_CACHE is not None and DB.exists():
+        mtime_ns = DB.stat().st_mtime_ns
+        if _DB_CACHE_MTIME_NS == mtime_ns:
+            return deepcopy(_DB_CACHE) if copy_data else _DB_CACHE
     for attempt in range(3):
         try:
             text = DB.read_text(encoding="utf-8")
             if not text.strip():
                 raise json.JSONDecodeError("Empty database file", text, 0)
-            return json.loads(text)
+            data = json.loads(text)
+            _DB_CACHE = deepcopy(data)
+            _DB_CACHE_MTIME_NS = DB.stat().st_mtime_ns
+            return deepcopy(_DB_CACHE) if copy_data else _DB_CACHE
         except json.JSONDecodeError:
             if attempt == 2:
                 raise

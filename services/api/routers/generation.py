@@ -195,19 +195,16 @@ def crop_generated_image_square_region(project_id: str, asset_id: str, payload: 
     db = load_db()
     asset, path = _generated_image(db, project_id, asset_id)
     try:
-        _crop_square_region(path, payload.x, payload.y, payload.size)
-        with Image.open(path) as image:
-            width, height = image.size
+        crop_region = _read_crop_region(path, payload.x, payload.y, payload.size)
     except Exception as exc:
-        raise HTTPException(500, f"Crop image region failed: {exc}") from exc
-    _refresh_image_metadata(asset, path, "crop_square_region")
-    asset["crop_region"] = {
-        "x": 0,
-        "y": 0,
-        "size": min(width, height),
-        "image_width": width,
-        "image_height": height,
-    }
+        raise HTTPException(500, f"Save image display region failed: {exc}") from exc
+    asset["crop_region"] = crop_region
+    now = datetime.now().isoformat(timespec="seconds")
+    asset["updated_at"] = now
+    asset.setdefault("image_operations", []).append({
+        "operation": "display_region",
+        "created_at": now,
+    })
     save_db(db)
     return {"status": "success", "asset": asset}
 

@@ -649,13 +649,126 @@ def build_guozhijiliang_script_prompt(person_name: str = "", event_angle: str = 
 只返回 JSON，不要 Markdown，不要解释写作思路，不要列大纲，不要加小标题，不要加“镜头一、镜头二”。JSON 字段必须包含 title, person, event_angle, script。script 字段里只放按镜头分段后的正文。"""
 
 
+def build_guozhijiliang_script_prompt_v2(person_name: str = "", event_angle: str = "") -> str:
+    person_line, event_line = choose_guozhijiliang_seed(person_name, event_angle)
+    return f"""你是一名视频号爆款短视频文案策划，擅长写历史人物、爱国教育、大国叙事、卖书转化类文案，尤其擅长写《国之脊梁》《感动中国》风格的人物故事文案。
+
+我要你围绕【人物名称】写一篇适合视频号发布的短视频口播文案，目标是提高播放量、完播率、转发率，并自然带出《国之脊梁》这本书。
+
+人物名称：{person_line}
+核心事件/角度：{event_line}
+目标书籍：《国之脊梁》
+视频时长：2到3分钟
+
+一、整体风格要求
+
+不要写成人物百科。不要从“某某出生于某年”开始。不要平铺直叙介绍人物一生。不要写成新闻通稿、官方传记、公众号社论、学生作文。
+要写成视频号爆款口播文案。风格要：狠、短、燃、抓人、有悬念、有爽感、有情绪、有画面、有故事。
+文案要像一个情绪很足的人在给观众讲一个被埋没的英雄故事，而不是像 AI 在写人物简介。
+
+二、前三秒要求
+
+前三秒必须暴击。开头不能慢热，不能铺垫，不能介绍背景。开头必须直接制造一个强冲突、强悬念、强反差，让观众立刻想知道“为什么”。
+开头不要只写宏大概念，比如“中国芯片被卡脖子”“中国原子弹来之不易”“中国航天发展很艰难”“他为国家做出巨大贡献”。这种太普通，不够抓人。
+开头要尽量从一个具体画面、具体误区、具体反差切入。
+
+优先使用以下开头模型：
+1. 认知颠覆型：去大街上拉住一万个人问，【某件大事】到底是谁做的？9999个人都会答错。
+2. 被埋没型：他明明立下了改变国家命运的大功，却硬是把自己从功劳簿上抹得干干净净。
+3. 生死瞬间型：生命最后一天，医生让他躺下休息，他却拔掉管子，穿着病号服坐到了电脑前。
+4. 亲情冲突型：父亲去世时，他没能回家送终。母亲骂了他三十年不孝，直到真相曝光那天，全家都沉默了。
+5. 屈辱反击型：当年美国人连门口都不让他站，后来他亲手把中国送进了世界最顶尖的行列。
+6. 普通人反差型：一个穿着15块钱胶鞋的老太太，走进银行开口就要捐1000万，工作人员当场慌了。
+7. 名字消失型：她参与了改变国家命运的工程，可庆功名单上没有她的名字。不是别人漏写了，而是她自己要求抹掉。
+8. 普通画面反转型：很多人第一次见她，是在食堂里排队打饭。可谁也想不到，中国芯片最硬的一口气，就藏在这个满头白发的老太太身上。
+前三秒的核心是：先给结果、先给冲突、先给反差，不要先讲来龙去脉。
+
+三、故事结构要求
+
+整篇文案按照下面结构写：
+1. 暴击开头：用一句强冲突的话打碎观众认知。
+2. 留下悬念：让观众产生疑问：为什么会这样？这个人到底是谁？
+3. 人物登场：用一句有力量的话说出人物名字。例如：您听好这三个字：朱光亚。
+4. 历史屈辱：写他当年被看不起、被封锁、被阻拦、被误解、被羞辱的场景。要具体，不要空泛。
+5. 关键选择：写他放弃了什么。比如高薪、绿卡、世界顶级实验室、署名、家庭、荣誉、自由、健康、生命。
+6. 炼狱过程：写他怎么熬过最难的阶段。要有具体画面：戈壁、算盘、手稿、病床、风沙、深夜的灯、破自行车、公文包、旧胶鞋、行李箱、实验室、母亲等待的门口。
+7. 结果爆发：写原子弹爆炸、氢弹成功、核潜艇下水、导弹升空、资料被保住、巨款被捐出等关键结果。这里可以写得燃一点、爽一点。
+8. 低调反差：写成功之后他没有邀功、没有署名、没有热搜、没有享受荣华，甚至主动隐藏自己。这部分要制造观众的亏欠感。
+9. 观众共情：写“我们今天知道太多明星，却不知道这样的人”。让观众产生转发给孩子、家人、朋友的冲动。
+10. 自然带书：最后自然引出《国之脊梁》。不要硬卖，不要写“赶紧买”。要让书成为这个情绪的承接和答案。
+
+四、语言风格要求
+
+语言必须适合视频号口播。要像真人说话，不要像书面文章。多用短句。多用反问。多用“您听好”“您以为”“可真正狠的是”“这不是爽文”“您别划走”。
+可以适度夸张，可以有爽感，可以有攻击性，可以有情绪冲击。要优先追求高流量、强情绪、强钩子，而不是过度克制。
+可以使用类似表达：“您被骗了几十年。”“他把自己从历史功劳簿上抹得干干净净。”“美国人最怕的不是一支军队，而是这个中国人回家。”“这口气，他咽了几十年。”“这不是爽文，这是那个年代真实发生过的事。”“他死后连热搜都没有，可他替14亿人挡住了最危险的威胁。”“他们才是中国孩子最该追的星。”
+避免这些表达：悍然、方知、伟岸、至此、乃、赴汤蹈火、径直、再至、苍生、星光、壮烈史诗、强国气场、精神源泉、深受震撼、恩重如山。
+不要把文案写成朗诵稿。不要把人物写成百科介绍。
+
+五、故事化要求
+
+必须围绕一个具体事件写，不要写人物一生简介。
+写钱学森，不要泛泛写“中国航天之父”，要聚焦“美国海关扣下他的行李”。
+写黄旭华，不要泛泛写“中国核潜艇之父”，要聚焦“父亲去世不能回家，母亲骂他三十年不孝”。
+写郭永怀，不要泛泛写“两弹一星元勋”，要聚焦“飞机失事前用身体护住公文包”。
+写林俊德，不要泛泛写“核试验专家”，要聚焦“生命最后一天穿病号服整理资料”。
+写王承书，不要泛泛写“铀同位素分离专家”，要聚焦“主动要求抹掉自己的名字”。
+写朱光亚，不要泛泛写“核武器专家”，要聚焦“写信召回52名留学生，后来又把自己从功劳簿上抹掉”。
+写马旭，不要泛泛写“女空降兵”，要聚焦“穿15块钱胶鞋走进银行捐出1000万”。
+写黄令仪，不要泛泛写“芯片卡脖子”，要聚焦“食堂里排队打饭的普通老太太，竟然是中国芯片最难时往前顶的人”。
+
+六、细节要求
+
+每篇文案必须有大量能拍出来、能配图、能搜素材的细节。
+可以使用：旧胶鞋、破自行车、公文包、病号服、电脑、算盘、手稿、行李箱、抽屉、信封、实验室的灯、戈壁风沙、零下几十度、银行柜台、母亲的门口、烧毁的资料、密密麻麻的数据、深夜还亮着的窗户、食堂打饭的饭盘。
+不要只写：他很伟大。他无私奉献。他是民族脊梁。他做出了巨大贡献。要通过动作和物品表现人物，而不是空喊口号。
+
+七、情绪要求
+
+情绪要一层比一层强。前面让人好奇。中间让人愤怒、憋屈、心疼。后面让人热血、敬佩、想转发。
+结尾让人觉得：这些人才应该让孩子知道。
+整篇文案的情绪路线是：好奇 → 震惊 → 憋屈 → 心疼 → 热血 → 敬佩 → 亏欠 → 转发/买书。
+
+八、分镜分段要求
+
+必须按短视频分镜逻辑分段。一个镜头一段。同一个镜头内部不要换行。
+每一段必须能对应一个完整画面，方便后续 AI 配图、素材搜索、剪映剪辑。
+不要出现只有几个字的空段。每段建议 30 到 80 字左右。
+换段标准是：时间变化、地点变化、人物动作变化、画面主体变化、情绪节点变化。
+不要按朗读断句分段，而要按画面分段。不要加“镜头一、镜头二”。直接用自然段输出。
+
+九、带书转化要求
+
+结尾必须自然带出《国之脊梁》。不要硬广，不要写“点击小黄车购买”。
+可以这样写：“翻开《国之脊梁》才知道，今天我们习以为常的底气，从来不是凭空来的。”“读完这本书才明白，我们不是没有英雄，只是太多人把名字藏进了历史深处。”“如果家里有孩子，真希望他们认识这些人。”“因为真正值得追的星，从来不在热搜里，而在《国之脊梁》里。”“他们不是娱乐新闻里的明星，却是中国孩子最该知道的名字。”
+
+十、用户视角反审要求
+
+写完整篇文案后，不要立刻输出。你必须先在心里模拟一个普通视频号用户的反应，从用户视角重新审视一遍。
+请自检：前三秒会不会停下来？开头是不是太平？是不是一眼能猜到后面？有没有具体事件？有没有能记住的画面或物品？有没有足够反差？有没有爽点、痛点、亏欠感？用户会不会想转发给家人或孩子？是不是太像 AI？有没有太多大道理和空话？
+如果答案不满意，必须重写。尤其注意：如果前三秒只是“某某很伟大”“某个领域被卡脖子”“某人做出巨大贡献”，必须推翻重写。如果开头没有强悬念、强反差、强画面，必须推翻重写。如果全文只是在讲“他很伟大、他很奉献、国家很需要他”，必须推翻重写。如果普通用户听了前5秒就能猜到后面内容，必须推翻重写。
+
+十一、最终输出要求
+
+只输出经过自检后的完整文案。不要输出自检过程。不要解释写作思路。不要列大纲。不要加小标题。不要输出注意事项。不要说“以下是文案”。
+文案必须按分镜自然分段。
+
+程序解析要求：
+你必须只返回严格 JSON，不要 Markdown。JSON 字段必须包含 title, person, event_angle, script。
+script 字段里只放经过自检后的完整正文，按分镜自然段分段；不要在 script 里写自检过程、标题、小标题或说明。
+person 字段填写：{person_line}
+event_angle 字段填写：{event_line}
+title 字段填写 2 到 9 个字的项目标题，不要标点。
+"""
+
+
 def generate_guozhijiliang_script(person_name: str = "", event_angle: str = "") -> dict:
     api_key = os.getenv("BIGMODEL_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("BIGMODEL_API_KEY is not configured")
 
     selected_person, selected_angle = choose_guozhijiliang_seed(person_name, event_angle)
-    prompt = build_guozhijiliang_script_prompt(selected_person, selected_angle)
+    prompt = build_guozhijiliang_script_prompt_v2(selected_person, selected_angle)
     payload = {
         "model": bigmodel_model(),
         "messages": [
@@ -664,7 +777,7 @@ def generate_guozhijiliang_script(person_name: str = "", event_angle: str = "") 
         ],
         "temperature": 0.85,
         "top_p": 0.9,
-        "max_tokens": 4096,
+        "max_tokens": 6000,
         "stream": False,
         "thinking": {"type": "disabled"},
         "response_format": {"type": "json_object"},
@@ -710,8 +823,10 @@ def keywords_from_text(text: str) -> dict[str, list[str]]:
     people = [p for p in PERSON_HINTS if p in text]
     scenes = [s for s in SCENE_HINTS if s in text]
     eras = [e for e in ERA_HINTS if e in text]
-    # No more "老照片"/"历史档案" fallbacks — only use tags that are actually found in text
-    keywords = list(dict.fromkeys(people + scenes + eras + re.findall(r"[一-鿿]{2,6}", text)[:6]))
+    # Never derive tags by slicing arbitrary narration fragments. If AI visual
+    # analysis is unavailable, leave unknown tags empty instead of inventing
+    # misleading labels from the script text.
+    keywords = list(dict.fromkeys(people + scenes + eras))
     return {"people": people, "scene": scenes, "era": eras, "keywords": keywords}
 
 
@@ -721,6 +836,33 @@ def is_meaningful_shot_text(text: str) -> bool:
 
 
 SHOT_VISUALS_BATCH_SIZE = 10
+SHOT_TAG_PUNCTUATION = re.compile(r"[\s，。！？、；：,.!?;:\"'()\[\]{}<>]+")
+SHOT_TAG_BAD_PARTS = (
+    "画面", "镜头", "旁白", "体现", "展现", "展示", "表现", "强调", "需要",
+    "应该", "相关", "历史画面", "纪实画面", "老照片", "历史档案",
+)
+SHOT_TAG_BAD_PREFIXES = ("的", "了", "在", "把", "被", "将", "为", "以", "和", "与")
+SHOT_TAG_BAD_SUFFIXES = ("的", "了", "着", "过", "中", "时", "后", "前")
+
+
+def clean_shot_visual_terms(values: list, *, max_length: int) -> list[str]:
+    cleaned: list[str] = []
+    for value in values or []:
+        tag = re.sub(r"\s+", "", str(value or "")).strip()
+        if not tag:
+            continue
+        if len(tag) > max_length:
+            continue
+        if SHOT_TAG_PUNCTUATION.search(tag):
+            continue
+        if tag.startswith(SHOT_TAG_BAD_PREFIXES) or tag.endswith(SHOT_TAG_BAD_SUFFIXES):
+            continue
+        if any(part in tag for part in SHOT_TAG_BAD_PARTS):
+            continue
+        if tag in cleaned:
+            continue
+        cleaned.append(tag)
+    return cleaned[:5]
 
 
 def _build_shot_visuals_prompt(shot_items: list[dict], full_script: str) -> str:
@@ -818,10 +960,10 @@ def ai_generate_shot_visuals(shots: list[dict], full_script: str) -> dict[str, d
                 for person_name in person_names:
                     person_description = person_description.replace(person_name, "")
                 person_description = re.sub(r"\s+", " ", person_description).strip(" ，,。")
-                search_keywords = [str(k).strip() for k in (item.get("search_keywords") or []) if str(k).strip()]
-                object_tags = [str(k).strip() for k in (item.get("object_tags") or []) if str(k).strip()]
-                scene_tags = [str(k).strip() for k in (item.get("scene_tags") or []) if str(k).strip()]
-                keywords = [str(k).strip() for k in (item.get("keywords") or []) if str(k).strip()]
+                search_keywords = clean_shot_visual_terms(item.get("search_keywords") or [], max_length=12)
+                object_tags = clean_shot_visual_terms(item.get("object_tags") or [], max_length=8)
+                scene_tags = clean_shot_visual_terms(item.get("scene_tags") or [], max_length=8)
+                keywords = clean_shot_visual_terms(item.get("keywords") or [], max_length=10)
                 if (
                     visual_need or person_names or person_description or search_keywords
                     or object_tags or scene_tags or keywords or person_gender != "unknown"

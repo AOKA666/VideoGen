@@ -121,19 +121,41 @@ def _candidate_values(result: dict, fallback_values: list[str] | None = None) ->
     return candidates
 
 
+def _numbered_keyword_variants(candidate: str, shot_text: str) -> list[str]:
+    keyword = normalize_core_keyword(candidate)
+    if not keyword:
+        return []
+    variants: list[str] = []
+
+    if re.fullmatch(r"\d{3,}", keyword):
+        escaped = re.escape(keyword)
+        for match in re.finditer(rf"[\u3400-\u9fffA-Za-z]{{1,6}}{escaped}[\u3400-\u9fffA-Za-z]{{0,4}}", shot_text or ""):
+            value = normalize_core_keyword(match.group(0))
+            if value and value != keyword:
+                variants.append(value)
+                if not value.endswith("事件"):
+                    variants.append(f"{value}事件")
+        return variants
+
+    if re.search(r"\d{3,}$", keyword) and re.search(r"[^\d]", keyword):
+        variants.append(f"{keyword}事件")
+    return variants
+
+
 def sanitize_intent(result: dict, _shot_text: str = "", fallback_values: list[str] | None = None) -> dict:
     last_error: ValueError | None = None
     for candidate in _candidate_values(result, fallback_values):
-        try:
-            keyword = validate_core_keyword(candidate)
-            return {
-                "core_keyword": keyword,
-                "search_keywords": [keyword],
-                "provider": result.get("provider") or "ai",
-                "error": "",
-            }
-        except ValueError as exc:
-            last_error = exc
+        for value in [candidate, *_numbered_keyword_variants(candidate, _shot_text)]:
+            try:
+                keyword = validate_core_keyword(value)
+                return {
+                    "core_keyword": keyword,
+                    "search_keywords": [keyword],
+                    "provider": result.get("provider") or "ai",
+                    "error": "",
+                }
+            except ValueError as exc:
+                last_error = exc
     if last_error:
         raise last_error
     keyword = validate_core_keyword(_raw_core_keyword(result))

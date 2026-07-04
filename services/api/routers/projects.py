@@ -25,6 +25,7 @@ class ProjectCreate(BaseModel):
 
 
 class ScriptUpdate(BaseModel):
+    name: str | None = None
     rewritten_script: str | None = None
     title_line1: str | None = None
     title_line2: str | None = None
@@ -37,7 +38,7 @@ class AiScriptPayload(BaseModel):
 
 @router.get("")
 def list_projects():
-    return {"projects": load_db()["projects"]}
+    return {"projects": load_db(copy_data=False)["projects"]}
 
 
 @router.post("")
@@ -167,6 +168,13 @@ def update_script(project_id: str, payload: ScriptUpdate):
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
         raise HTTPException(404, "Project not found")
+    if payload.name is not None:
+        name = payload.name.strip()
+        if not name:
+            raise HTTPException(400, "Project name must not be empty")
+        if len(name) > 80:
+            raise HTTPException(400, "Project name must not exceed 80 characters")
+        project["name"] = name
     if payload.rewritten_script is not None:
         project["rewritten_script"] = payload.rewritten_script
         project["status"] = "script_ready"

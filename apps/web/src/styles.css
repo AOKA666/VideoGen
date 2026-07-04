@@ -275,6 +275,21 @@ main { min-width: 0; }
   align-items: center;
   justify-content: flex-end;
   gap: 10px;
+  flex-wrap: wrap;
+}
+.project-name-editor {
+  display: grid;
+  grid-template-columns: minmax(180px, 320px) 42px;
+  gap: 8px;
+  align-items: center;
+}
+.project-name-editor input {
+  height: 42px;
+  font-size: 18px;
+  font-weight: 800;
+}
+.project-name-editor .icon-button {
+  height: 42px;
 }
 h1, h2, h3, p { margin-top: 0; }
 h1 {
@@ -782,6 +797,11 @@ h3 { font-size: 16px; line-height: 1.48; }
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
   gap: 16px;
+}
+.load-more-row {
+  display: flex;
+  justify-content: center;
+  padding: 18px 0 4px;
 }
 .asset-card {
   position: relative;
@@ -1600,6 +1620,7 @@ h3 { font-size: 16px; line-height: 1.48; }
   .storyboard-actions { align-items: stretch; flex-direction: column; }
   .storyboard-action-buttons { align-items: stretch; flex-direction: column; }
   .top-actions, .console-head, .console-tools { align-items: stretch; flex-direction: column; }
+  .project-name-editor { grid-template-columns: minmax(0, 1fr) 42px; width: 100%; }
   .cover-workspace { grid-template-columns: 1fr; }
   .cover-preview { min-height: 0; }
   .export-actions { grid-template-columns: 1fr; }

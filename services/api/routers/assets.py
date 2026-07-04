@@ -71,7 +71,7 @@ def rename_analyzed_asset(asset: dict) -> None:
 
 @router.get("/library")
 def get_library():
-    library = load_db().get("asset_library")
+    library = load_db(copy_data=False).get("asset_library")
     return {"library": library if is_valid_library(library) else None}
 
 
@@ -98,7 +98,7 @@ def _audio_duration(path: Path) -> float:
 
 @router.get("/music")
 def list_music():
-    db = load_db()
+    db = load_db(copy_data=False)
     music = [
         item for item in db.get("music_library", [])
         if Path(str(item.get("local_path") or "")).exists()
@@ -206,7 +206,7 @@ def set_library(payload: LibraryConfig):
 
 @router.get("")
 def list_assets(q: str = ""):
-    assets = load_db()["assets"]
+    assets = load_db(copy_data=False)["assets"]
     if q:
         needle = q.lower()
         assets = [
