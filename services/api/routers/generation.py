@@ -81,6 +81,8 @@ def _generated_image(db: dict, project_id: str, asset_id: str) -> tuple[dict, Pa
 def _refresh_image_metadata(asset: dict, path: Path, operation: str) -> None:
     with Image.open(path) as image:
         asset["width"], asset["height"] = image.size
+    if operation in {"crop_square", "crop_square_region"}:
+        asset.pop("crop_region", None)
     asset["file_size"] = path.stat().st_size
     asset["hash"] = hashlib.sha256(path.read_bytes()).hexdigest()
     asset["updated_at"] = datetime.now().isoformat(timespec="seconds")

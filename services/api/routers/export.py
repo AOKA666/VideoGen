@@ -142,8 +142,10 @@ def export_assets(
                 with Image.open(source) as image:
                     converted = ImageOps.exif_transpose(image).convert("RGBA")
                     crop = (generated or asset or {}).get("crop_region") or {}
-                    if crop.get("size"):
-                        width, height = converted.size
+                    width, height = converted.size
+                    crop_width = int(crop.get("image_width") or 0)
+                    crop_height = int(crop.get("image_height") or 0)
+                    if crop.get("size") and (not crop_width or crop_width == width) and (not crop_height or crop_height == height):
                         side = max(1, min(int(round(float(crop.get("size") or 0))), width, height))
                         left = max(0, min(int(round(float(crop.get("x") or 0))), width - side))
                         top = max(0, min(int(round(float(crop.get("y") or 0))), height - side))

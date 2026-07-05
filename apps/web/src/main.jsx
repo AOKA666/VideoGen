@@ -50,18 +50,27 @@ function assetImageUrl(asset) {
   return `${API}${asset.file_url}${version ? `?v=${encodeURIComponent(version)}` : ''}`;
 }
 
-function assetCropObjectPosition(asset) {
+function assetCropDisplayStyle(asset) {
   const crop = asset?.crop_region;
   const width = Number(crop?.image_width || 0);
   const height = Number(crop?.image_height || 0);
   const size = Number(crop?.size || 0);
   if (!width || !height || !size) return undefined;
-  const movableX = Math.max(width - size, 0);
-  const movableY = Math.max(height - size, 0);
-  const x = movableX ? (Number(crop.x || 0) / movableX) * 100 : 50;
-  const y = movableY ? (Number(crop.y || 0) / movableY) * 100 : 50;
+  const assetWidth = Number(asset?.width || 0);
+  const assetHeight = Number(asset?.height || 0);
+  if ((assetWidth && assetWidth !== width) || (assetHeight && assetHeight !== height)) return undefined;
+  const safeSize = Math.max(1, Math.min(size, width, height));
+  const x = Math.max(0, Math.min(Number(crop.x || 0), width - safeSize));
+  const y = Math.max(0, Math.min(Number(crop.y || 0), height - safeSize));
   return {
-    objectPosition: `${Math.max(0, Math.min(100, x))}% ${Math.max(0, Math.min(100, y))}%`,
+    position: 'absolute',
+    maxWidth: 'none',
+    maxHeight: 'none',
+    width: `${(width / safeSize) * 100}%`,
+    height: `${(height / safeSize) * 100}%`,
+    left: `${-(x / safeSize) * 100}%`,
+    top: `${-(y / safeSize) * 100}%`,
+    objectFit: 'fill',
   };
 }
 
@@ -1739,7 +1748,7 @@ function AssetCard({ asset, selected, onSelect, onPreview, onEdit, onDelete, ima
         onClick={openPreview}
         onKeyDown={openPreview}
       >
-        {asset.file_type === 'image' ? <SafeImage src={src} alt={asset.file_name} style={assetCropObjectPosition(asset)} /> : <video src={src} controls />}
+        {asset.file_type === 'image' ? <SafeImage src={src} alt={asset.file_name} style={assetCropDisplayStyle(asset)} /> : <video src={src} controls />}
         {imageTools}
       </div>
       <h3>{asset.file_name}</h3>
@@ -1946,13 +1955,16 @@ function ImagePreview({ asset, busy = false, onApplyCrop, onClose }) {
     const nextImageBox = readImageBox();
     setNaturalSize({ width: image.naturalWidth, height: image.naturalHeight });
     const crop = asset.crop_region;
-    if (crop?.image_width && crop?.image_height && crop?.size && nextImageBox) {
+    const cropMatchesImage = Number(crop?.image_width || 0) === image.naturalWidth
+      && Number(crop?.image_height || 0) === image.naturalHeight;
+    if (cropMatchesImage && crop?.size && nextImageBox) {
       const scaleX = nextImageBox.width / Number(crop.image_width);
       const scaleY = nextImageBox.height / Number(crop.image_height);
+      const displaySize = Math.min(Number(crop.size) * Math.min(scaleX, scaleY), nextImageBox.width, nextImageBox.height);
       setCropBox({
-        x: Math.max(0, Math.min(Number(crop.x || 0) * scaleX, nextImageBox.width)),
-        y: Math.max(0, Math.min(Number(crop.y || 0) * scaleY, nextImageBox.height)),
-        size: Math.min(Number(crop.size) * Math.min(scaleX, scaleY), nextImageBox.width, nextImageBox.height),
+        x: Math.max(0, Math.min(Number(crop.x || 0) * scaleX, nextImageBox.width - displaySize)),
+        y: Math.max(0, Math.min(Number(crop.y || 0) * scaleY, nextImageBox.height - displaySize)),
+        size: displaySize,
       });
     } else {
       resetCropBox(nextImageBox);

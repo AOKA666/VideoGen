@@ -9,7 +9,14 @@ import urllib.request
 from collections import Counter
 from difflib import SequenceMatcher
 
-PERSON_HINTS = ["钱学森", "邓稼先", "于敏", "黄旭华", "郭永怀", "袁隆平", "王淦昌", "两弹一星"]
+GUOZHIJILIANG_PEOPLE = [
+    "李四光", "竺可桢", "茅以升", "叶企孙", "俞大绂", "林巧稚", "周培源", "裴文中",
+    "王淦昌", "赵九章", "王应睐", "郭永怀", "汪猷", "华罗庚", "钱学森", "侯祥麟",
+    "王承书", "钱三强", "罗沛霖", "何泽慧", "王大珩", "彭桓武", "卢嘉锡", "任新民",
+    "叶笃正", "陈芳允", "吴征镒", "黄纬禄", "刘东生", "屠守锷", "吴自良", "林兰英",
+    "程开甲", "吴文俊", "杨嘉墀", "黄昆", "谢家麟", "徐光宪", "师昌绪", "朱光亚",
+]
+PERSON_HINTS = GUOZHIJILIANG_PEOPLE + ["邓稼先", "于敏", "黄旭华", "袁隆平", "孙家栋", "屠呦呦", "彭士禄", "两弹一星"]
 SCENE_HINTS = ["实验室", "会议", "档案", "照片", "火箭", "导弹", "核潜艇", "宿舍", "办公室", "手稿", "文件"]
 ERA_HINTS = ["1950", "1960", "1970", "上世纪", "建国", "抗战"]
 MIN_REWRITE_LENGTH_RATIO = 0.85
@@ -19,9 +26,97 @@ MAX_REWRITE_ATTEMPTS = 3
 MAX_AUTO_TITLE_LENGTH = 9
 MAX_PUBLISH_SHORT_TITLE_LENGTH = 16
 TITLE_PUNCTUATION = re.compile(r"""[，。！？、；："'“”‘’《》【】（）—…\-.!?,;:()\[\]{}<>\s]""")
+WEAK_COVER_TITLE_PATTERNS = (
+    "伟大",
+    "精神",
+    "民族脊梁",
+    "大国",
+    "传奇",
+    "一生",
+    "故事",
+    "感动",
+    "震撼",
+    "不简单",
+    "值得铭记",
+    "科学家",
+    "人物",
+)
+COVER_TITLE_ATTRACTION_WORDS = (
+    "扣下",
+    "炸掉",
+    "抹掉",
+    "坠毁",
+    "病危",
+    "临终",
+    "不能",
+    "不敢",
+    "不许",
+    "被骂",
+    "被拦",
+    "被藏",
+    "护住",
+    "捐出",
+    "消失",
+    "隐姓",
+    "埋名",
+    "封锁",
+    "回家",
+    "父亲",
+    "母亲",
+    "最后",
+    "凭什么",
+    "为什么",
+    "到底",
+    "没人敢",
+    "谁也没想到",
+    "千万",
+    "15块",
+    "普通老太太",
+    "院士",
+    "回国",
+    "海关",
+    "箱子",
+    "大桥",
+    "胶鞋",
+    "名单",
+    "功劳簿",
+    "热搜",
+    "骂了多年",
+    "捐出",
+    "穿",
+    "亲手",
+    "点头",
+    "女儿",
+    "没回头",
+    "反常",
+    "离谱",
+)
+COVER_TITLE_SPOILER_COMBOS = (
+    ("病危", "绝密"),
+    ("病危", "图纸"),
+    ("病危", "公文包"),
+    ("病危", "国家机密"),
+    ("去世", "绝密"),
+    ("去世", "图纸"),
+    ("去世", "公文包"),
+    ("坠毁", "公文包"),
+    ("坠毁", "国家机密"),
+    ("真相", "泪目"),
+    ("真相", "曝光"),
+)
 RANDOM = random.SystemRandom()
 GUOZHIJILIANG_STORY_SEEDS = [
+    ("李四光", "从一块让少年困惑的大石头，写到他后来用地质力学为中国寻找石油"),
+    ("竺可桢", "在战火和迁徙中坚持记录气象与物候，把科学判断看得比人情压力更重"),
+    ("茅以升", "亲手建成钱塘江大桥，又在战火逼近时含泪参与炸桥"),
+    ("叶企孙", "他培养出一批改变中国科学命运的学生，自己却长期站在光环背后"),
+    ("俞大绂", "他放下书斋里的安稳，走进田间地头研究作物病害"),
+    ("林巧稚", "她一生没有自己的孩子，却在产房里守护了无数新生命"),
+    ("周培源", "从流体力学到教育现场，他在国家最需要基础科学时撑住一张书桌"),
+    ("裴文中", "他在周口店发现北京人头盖骨，让中国古人类研究有了关键证据"),
     ("钱学森", "美国海关扣下他的行李，硬说里面藏着国家机密"),
+    ("钱三强", "他在海外实验室握住前沿成果，却选择回到一穷二白的中国原子能事业"),
+    ("程开甲", "他隐姓埋名走进戈壁，把自己的名字藏在一次次核试验背后"),
     ("邓稼先", "在戈壁核试验场，他明知有危险仍走向爆心查找碎片"),
     ("黄旭华", "父亲去世不能回家奔丧，母亲多年不知道他去了哪里"),
     ("郭永怀", "飞机失事前，他和警卫员用身体护住装有绝密资料的公文包"),
@@ -33,7 +128,69 @@ GUOZHIJILIANG_STORY_SEEDS = [
     ("屠呦呦", "她翻遍古籍后，把青蒿提取实验一次次推倒重来"),
     ("王承书", "她主动要求抹掉自己的名字，隐姓埋名参与国家工程"),
     ("彭士禄", "核潜艇研制最难的时候，他带着队伍在简陋条件下啃硬骨头"),
+    ("赵九章", "他把目光投向高空和太空，为中国第一颗人造卫星铺路"),
+    ("王应睐", "他带队攻关人工合成胰岛素，在一次次失败里守住实验室的灯"),
+    ("汪猷", "他在有机化学深处长期耕耘，把基础研究变成后人继续攀登的台阶"),
+    ("华罗庚", "他从小店学徒走向数学高峰，又把优选法带到工厂和车间"),
+    ("侯祥麟", "他把一生交给中国石油炼制，让工业血脉不再处处受制于人"),
+    ("罗沛霖", "他在电子学和通信工程的关键处埋头搭桥，让技术真正服务国家工程"),
+    ("何泽慧", "她在核物理实验中一次次校准轨迹，把名字留在中国原子科学起步处"),
+    ("王大珩", "他在中国光学玻璃最薄弱的时候，带人从零搭起精密光学的根基"),
+    ("彭桓武", "他从海外回国后投身理论物理和核事业，把个人荣誉放到国家需求之后"),
+    ("卢嘉锡", "他做科研不怕先估算再验证，用朴素办法把复杂问题往前推"),
+    ("任新民", "他在航天型号一线统筹攻关，被称为中国航天通信卫星的总总师"),
+    ("叶笃正", "他研究大气环流和气候变化，把天地万象变成可追问的科学问题"),
+    ("陈芳允", "他参与卫星测控，让东方红的声音真正从太空传回中国"),
+    ("吴征镒", "他一生跋山涉水采集植物，把中国植物志写进世界科学版图"),
+    ("黄纬禄", "他盯着导弹和潜射系统的每个细节，等待巨浪腾空的那一刻"),
+    ("刘东生", "他踩着黄土高原的风尘做研究，从层层黄土里读懂地球历史"),
+    ("屠守锷", "他带队研制洲际导弹，在无数图纸和试验里托起大国长剑"),
+    ("吴自良", "他为关键材料和分离膜技术攻关，让国家工程装上可靠的心脏"),
+    ("林兰英", "她在半导体材料最艰难的时候往前顶，把单晶材料做成中国底气"),
+    ("吴文俊", "他把中国古代数学思想和现代数学连接起来，走出机器证明的新路"),
+    ("杨嘉墀", "他把自动控制和空间技术拧在一起，为中国卫星追星探路"),
+    ("黄昆", "他在固体物理和半导体理论深处扎根，托起中国半导体的一代基础"),
+    ("谢家麟", "他三十年投身加速器，把看不见的粒子轨迹变成国家大科学装置"),
+    ("徐光宪", "他在稀土分离难题前反复拆解，把中国稀土优势真正做硬"),
+    ("师昌绪", "他盯住高温合金和关键材料，让中国装备有了更硬的金属翅膀"),
+    ("朱光亚", "他写信召回留学生，又把自己从功劳簿上悄悄往后放"),
 ]
+RECENT_GUOZHIJILIANG_PEOPLE: list[str] = []
+MAX_RECENT_GUOZHIJILIANG_PEOPLE = 12
+GUOZHIJILIANG_OPENING_GUIDES = [
+    "物件开场：先写一个能入镜的物件，比如行李箱、公文包、病号服、饭盘、算盘、桥梁图纸、野外采样袋，再揭示它背后的国家命运。",
+    "选择开场：先写这个人物放弃了什么，比如署名、回家、高薪、安稳、荣誉、健康、家庭时间，再写为什么这个选择反常识。",
+    "结果倒放：先写后来发生的巨大结果，比如大桥通车又被炸、卫星传回信号、导弹升空、稀土分离突破，再倒回最不起眼的那一刻。",
+    "身份反差：先写观众最容易误判的普通身份或生活画面，再揭示他/她真正托住的国家工程。",
+    "沉默代价：先写这个人物没有说出口、不能说出口、没人知道的一件事，让悬念来自沉默而不是口号。",
+    "历史误解：先写一段亲人、同事、公众当年无法理解的误会，再用事实反转。",
+    "现场危机：先写一个具体危机现场，比如风沙、病房、实验室深夜、银行柜台、桥边爆破、试验场倒计时。",
+    "名字消失：先写名单、档案、论文、工程记录里看不见的名字，再解释为什么这个人主动或被迫站到背后。",
+]
+RECENT_GUOZHIJILIANG_OPENINGS: list[str] = []
+MAX_RECENT_GUOZHIJILIANG_OPENINGS = 4
+MIN_GUOZHIJILIANG_SCRIPT_CHARS = 1000
+MAX_GUOZHIJILIANG_SCRIPT_CHARS = 1300
+MIN_GUOZHIJILIANG_SCRIPT_PARAGRAPHS = 20
+MAX_GUOZHIJILIANG_SCRIPT_PARAGRAPHS = 30
+WEAK_GUOZHIJILIANG_OPENING_PATTERNS = (
+    "出生于",
+    "是我国",
+    "是一位",
+    "有这样一位",
+    "提起",
+    "说到",
+    "在中国科学史上",
+    "在那个年代",
+    "那个年代",
+    "在当时",
+    "故事要从",
+    "今天讲",
+    "他很伟大",
+    "她很伟大",
+    "民族脊梁",
+    "做出了巨大贡献",
+)
 
 
 class RewriteQualityError(RuntimeError):
@@ -460,13 +617,15 @@ def build_rewrite_prompt(raw_script: str, style: str, attempt: int, previous: di
 不要频繁使用空泛大词，例如：伟大、震撼、辉煌、底蕴、史诗、精神源泉、民族脊梁、大国情怀。这些词可以少量使用，但不能堆。
 不要把文案改成端着的播音腔。
 不要一上来介绍背景，不要平铺直叙。
+不要用背景、环境、天气、时代、氛围、人物状态来开头。开头必须先给爆点、冲突、结果、反差或悬念。
+如果原文前三秒之后需要承接，承接句也不要写“在那个年代”“当时的环境”“故事要从某年说起”，要直接进入具体事件和具体动作。
 不要削弱原文的爽感、反差感和情绪冲击。
 
 【短视频改写原则】
 一、句子要短。适合真人口播。能用短句就不要用长句。能用人话就不要用书面话。
 二、表达要狠。该硬的地方要硬。比如：“你可以试试敢不敢将它击落。”这种句子不要改成：“那便试试看是否敢于动用武力击落。”
 三、要有画面。多保留或强化具体画面：飞机起飞、国旗铺满街道、地图包围、旧照片、病房电脑、公文包、胶鞋、行李箱、实验室灯光、戈壁风沙。少写抽象评价。
-四、要有情绪递进。文案结构尽量按照：前三秒钩子不变 → 具体事件 → 背景解释 → 历史伤痛/现实困境 → 今日反转 → 情绪爆发 → 英雄群像/人物承接 → 自然带书 → 家长转化。
+四、要有情绪递进。文案结构尽量按照：前三秒钩子不变 → 具体事件暴击 → 关键冲突 → 必要背景解释 → 历史伤痛/现实困境 → 今日反转 → 情绪爆发 → 英雄群像/人物承接 → 自然带书 → 家长转化。背景只能在爆点之后补，不能放在开头。
 五、带书要自然。如果文案是为了卖《国之脊梁》，不要硬广，不要写“赶紧点击小黄车购买”。可以写：“翻开《国之脊梁》才知道，今天的底气不是凭空来的。”“如果家里有孩子，真希望他们认识这些真正值得追的星。”“他们不是热搜里的明星，却是孩子最该知道的人。”
 
 【分段要求】
@@ -592,13 +751,52 @@ def choose_guozhijiliang_seed(person_name: str = "", event_angle: str = "") -> t
     if person and angle:
         return person, angle
     if not person:
-        person, default_angle = RANDOM.choice(GUOZHIJILIANG_STORY_SEEDS)
+        candidates = [
+            seed for seed in GUOZHIJILIANG_STORY_SEEDS
+            if seed[0] not in RECENT_GUOZHIJILIANG_PEOPLE
+        ] or GUOZHIJILIANG_STORY_SEEDS
+        person, default_angle = RANDOM.choice(candidates)
+        RECENT_GUOZHIJILIANG_PEOPLE.append(person)
+        del RECENT_GUOZHIJILIANG_PEOPLE[:-MAX_RECENT_GUOZHIJILIANG_PEOPLE]
         return person, angle or default_angle
     default_angle = next(
         (seed_angle for seed_person, seed_angle in GUOZHIJILIANG_STORY_SEEDS if seed_person == person),
         "从这个人物真实经历中选择一个最适合短视频叙事的核心事件",
     )
     return person, angle or default_angle
+
+
+def choose_guozhijiliang_opening_guide() -> str:
+    candidates = [
+        guide for guide in GUOZHIJILIANG_OPENING_GUIDES
+        if guide not in RECENT_GUOZHIJILIANG_OPENINGS
+    ] or GUOZHIJILIANG_OPENING_GUIDES
+    guide = RANDOM.choice(candidates)
+    RECENT_GUOZHIJILIANG_OPENINGS.append(guide)
+    del RECENT_GUOZHIJILIANG_OPENINGS[:-MAX_RECENT_GUOZHIJILIANG_OPENINGS]
+    return guide
+
+
+def guozhijiliang_script_stats(script: str) -> dict[str, int]:
+    return {
+        "chars": content_length(script),
+        "paragraphs": len([line for line in str(script or "").splitlines() if line.strip()]),
+    }
+
+
+def guozhijiliang_opening_needs_rewrite(script: str) -> bool:
+    lines = [line.strip() for line in str(script or "").splitlines() if line.strip()]
+    if not lines:
+        return True
+    first_sentence = re.split(r"[。！？!?]", lines[0], maxsplit=1)[0].strip()
+    opening = first_sentence[:70]
+    if len(opening) < 8:
+        return True
+    if any(pattern in opening for pattern in WEAK_GUOZHIJILIANG_OPENING_PATTERNS):
+        return True
+    if re.match(r"^(在|当|那是|这是|有一位|很多人|如果说|我们都知道)", opening):
+        return True
+    return False
 
 
 def build_guozhijiliang_script_prompt(person_name: str = "", event_angle: str = "") -> str:
@@ -651,14 +849,19 @@ def build_guozhijiliang_script_prompt(person_name: str = "", event_angle: str = 
 
 def build_guozhijiliang_script_prompt_v2(person_name: str = "", event_angle: str = "") -> str:
     person_line, event_line = choose_guozhijiliang_seed(person_name, event_angle)
+    opening_guide = choose_guozhijiliang_opening_guide()
     return f"""你是一名视频号爆款短视频文案策划，擅长写历史人物、爱国教育、大国叙事、卖书转化类文案，尤其擅长写《国之脊梁》《感动中国》风格的人物故事文案。
 
 我要你围绕【人物名称】写一篇适合视频号发布的短视频口播文案，目标是提高播放量、完播率、转发率，并自然带出《国之脊梁》这本书。
 
 人物名称：{person_line}
 核心事件/角度：{event_line}
+本篇独特点：必须从“{person_line}”这个人的真实反常识点出发，不要套其他人物也能用的通用开头。
+本篇开头策略：{opening_guide}
 目标书籍：《国之脊梁》
-视频时长：2到3分钟
+视频时长：4到5分钟
+正文长度：1000到1300个中文字符，不能少于1000字。少于1000字必须继续扩写，不要提前收尾。
+分镜段落：20到30段，每段建议35到65字。段落太少会导致视频太短、画面不够密，必须拆细动作、冲突、转折和情绪递进。
 
 一、整体风格要求
 
@@ -668,27 +871,34 @@ def build_guozhijiliang_script_prompt_v2(person_name: str = "", event_angle: str
 
 二、前三秒要求
 
-前三秒必须暴击。开头不能慢热，不能铺垫，不能介绍背景。开头必须直接制造一个强冲突、强悬念、强反差，让观众立刻想知道“为什么”。
+前三秒必须暴击。开头不能慢热，不能铺垫，不能介绍背景，不能描写环境、天气、时代氛围、人物外貌或普通状态。开头必须直接制造一个强冲突、强悬念、强反差，让观众立刻想知道“为什么”。
+第一句话就是钩子，不能承担介绍任务。第一句话必须直接给事件爆点，必须是异常事实、异常动作、危险现场、巨大反差、结果倒放或未解悬念之一。
+前三秒必须做到“三连击”：第一句给爆点，第二句加压或反转，第三句抛出观众必须追下去的问题。前三句里必须至少出现一个明确冲突词或动作词，例如扣下、炸掉、抹掉、失踪、拒绝、隐瞒、牺牲、封锁、审查、病危、坠毁、捐出、消失、不能回家、不能署名、被骂、被拦、被藏起来。
+第一句话必须有“事情正在发生”的冲击感，不要只是“这个人很特殊”“这个故事很震撼”“他的一生不简单”。如果第一句删掉人物姓名后仍然能套到任何科学家身上，必须重写。
+第一句话不要出现人物身份介绍，不要写成“某某是……”“他/她是……”“在中国科学史上……”“有这样一位……”“提到……很多人会想到……”“今天讲一个……”。
+第一句话禁止写“在某年”“那个年代”“在某个地方”“寒风中”“夜色里”“一间实验室里”“一个普通清晨”这类背景、环境、氛围铺垫。不要先搭景，再讲事；必须先出事，再补背景。
+第一句话不要先给结论和评价，比如“他很伟大”“他是民族脊梁”“他改变了中国”“他做出了巨大贡献”。这些放在开头会平。
+强冲突开头示例，只学习力度和结构，不要照抄：他亲手建起的大桥，最后却要亲手炸掉。父亲去世那天，他明明活着，却不能回家奔丧。飞机坠毁前，他最后护住的不是自己，是那个公文包。她最大的功劳，是把自己的名字从功劳簿上抹掉。美国海关扣下他的行李时，真正害怕的不是箱子，是他回中国。
+第一段前两句必须让人产生一个具体问题：他为什么这么做？这件东西为什么重要？这个结果怎么来的？这家人为什么沉默？这个名字为什么消失？
 开头不要只写宏大概念，比如“中国芯片被卡脖子”“中国原子弹来之不易”“中国航天发展很艰难”“他为国家做出巨大贡献”。这种太普通，不够抓人。
-开头要尽量从一个具体画面、具体误区、具体反差切入。
+开头要尽量从这个人物独有的具体画面、具体误区、具体反差切入。第一句话必须和“{event_line}”强相关，换成另一个人物就不成立。
+禁止使用街访问答模板、百分比未知模板、泛泛“很多人不知道”模板。
 
-优先使用以下开头模型：
-1. 认知颠覆型：去大街上拉住一万个人问，【某件大事】到底是谁做的？9999个人都会答错。
-2. 被埋没型：他明明立下了改变国家命运的大功，却硬是把自己从功劳簿上抹得干干净净。
-3. 生死瞬间型：生命最后一天，医生让他躺下休息，他却拔掉管子，穿着病号服坐到了电脑前。
-4. 亲情冲突型：父亲去世时，他没能回家送终。母亲骂了他三十年不孝，直到真相曝光那天，全家都沉默了。
-5. 屈辱反击型：当年美国人连门口都不让他站，后来他亲手把中国送进了世界最顶尖的行列。
-6. 普通人反差型：一个穿着15块钱胶鞋的老太太，走进银行开口就要捐1000万，工作人员当场慌了。
-7. 名字消失型：她参与了改变国家命运的工程，可庆功名单上没有她的名字。不是别人漏写了，而是她自己要求抹掉。
-8. 普通画面反转型：很多人第一次见她，是在食堂里排队打饭。可谁也想不到，中国芯片最硬的一口气，就藏在这个满头白发的老太太身上。
-前三秒的核心是：先给结果、先给冲突、先给反差，不要先讲来龙去脉。
+可选开头方向，不要照抄：
+1. 物件悬念：一只箱子、一份档案、一张图纸、一件病号服、一双旧鞋、一个饭盘，为什么能牵出国家命运？
+2. 选择反常识：最该邀功的人为什么主动退后？最该回家的人为什么没有回家？最该活下去的人为什么先护住资料？
+3. 结果倒放：先给出后来改变国家的结果，再倒回那个最不起眼、最没人理解的瞬间。
+4. 亲情误解：亲人骂他、等他、误会他多年，最后才知道他不是不想说，而是不能说。
+5. 普通画面反转：从食堂、病房、车间、田埂、桥边、银行柜台、戈壁风沙这样的普通画面进入，再反转出人物分量。
+6. 名字缺席：从名单上没有他/她、档案里看不见他/她、庆功时站在后面切入。
+前三秒的核心是：先给这个人物独有的反常识，再给冲突和悬念，不要先讲来龙去脉。背景最多从第三句开始补，而且只能为解释爆点服务。
 
 三、故事结构要求
 
 整篇文案按照下面结构写：
-1. 暴击开头：用一句强冲突的话打碎观众认知。
+1. 暴击开头：用一句强冲突的话打碎观众认知。第一句直接写“发生了什么离谱/危险/反常的事”，不要写它发生在什么背景里。
 2. 留下悬念：让观众产生疑问：为什么会这样？这个人到底是谁？
-3. 人物登场：用一句有力量的话说出人物名字。例如：您听好这三个字：朱光亚。
+3. 人物登场：用一句有力量的话自然带出人物名字，不要固定套用“您听好这三个字”。可以用画面、结果、旁人误解、历史欠账来揭名，例如“这个被藏在功劳背后的人，叫朱光亚。”
 4. 历史屈辱：写他当年被看不起、被封锁、被阻拦、被误解、被羞辱的场景。要具体，不要空泛。
 5. 关键选择：写他放弃了什么。比如高薪、绿卡、世界顶级实验室、署名、家庭、荣誉、自由、健康、生命。
 6. 炼狱过程：写他怎么熬过最难的阶段。要有具体画面：戈壁、算盘、手稿、病床、风沙、深夜的灯、破自行车、公文包、旧胶鞋、行李箱、实验室、母亲等待的门口。
@@ -699,7 +909,8 @@ def build_guozhijiliang_script_prompt_v2(person_name: str = "", event_angle: str
 
 四、语言风格要求
 
-语言必须适合视频号口播。要像真人说话，不要像书面文章。多用短句。多用反问。多用“您听好”“您以为”“可真正狠的是”“这不是爽文”“您别划走”。
+语言必须适合视频号口播。要像真人说话，不要像书面文章。多用短句。多用反问。可以使用“您以为”“可真正狠的是”“这不是爽文”“您别划走”等口语表达，但不要把每篇都写成同一种开场和同一种揭名句。
+禁止反复使用“您听好这三个字：某某”“请记住这个名字：某某”“这个人叫某某”这类模板句。人物姓名要顺着故事和画面自然出现。
 可以适度夸张，可以有爽感，可以有攻击性，可以有情绪冲击。要优先追求高流量、强情绪、强钩子，而不是过度克制。
 可以使用类似表达：“您被骗了几十年。”“他把自己从历史功劳簿上抹得干干净净。”“美国人最怕的不是一支军队，而是这个中国人回家。”“这口气，他咽了几十年。”“这不是爽文，这是那个年代真实发生过的事。”“他死后连热搜都没有，可他替14亿人挡住了最危险的威胁。”“他们才是中国孩子最该追的星。”
 避免这些表达：悍然、方知、伟岸、至此、乃、赴汤蹈火、径直、再至、苍生、星光、壮烈史诗、强国气场、精神源泉、深受震撼、恩重如山。
@@ -733,7 +944,8 @@ def build_guozhijiliang_script_prompt_v2(person_name: str = "", event_angle: str
 
 必须按短视频分镜逻辑分段。一个镜头一段。同一个镜头内部不要换行。
 每一段必须能对应一个完整画面，方便后续 AI 配图、素材搜索、剪映剪辑。
-不要出现只有几个字的空段。每段建议 30 到 80 字左右。
+不要出现只有几个字的空段。每段建议 35 到 65 字左右。
+全文必须写满 20 到 30 个自然段，总字数必须达到 1000 到 1300 个中文字符；如果写到结尾发现段落不够，必须把关键事件过程、人物动作、现场细节、情绪转折拆成更多镜头段落，不要用空话凑字。
 换段标准是：时间变化、地点变化、人物动作变化、画面主体变化、情绪节点变化。
 不要按朗读断句分段，而要按画面分段。不要加“镜头一、镜头二”。直接用自然段输出。
 
@@ -746,12 +958,13 @@ def build_guozhijiliang_script_prompt_v2(person_name: str = "", event_angle: str
 
 写完整篇文案后，不要立刻输出。你必须先在心里模拟一个普通视频号用户的反应，从用户视角重新审视一遍。
 请自检：前三秒会不会停下来？开头是不是太平？是不是一眼能猜到后面？有没有具体事件？有没有能记住的画面或物品？有没有足够反差？有没有爽点、痛点、亏欠感？用户会不会想转发给家人或孩子？是不是太像 AI？有没有太多大道理和空话？
-如果答案不满意，必须重写。尤其注意：如果前三秒只是“某某很伟大”“某个领域被卡脖子”“某人做出巨大贡献”，必须推翻重写。如果开头没有强悬念、强反差、强画面，必须推翻重写。如果全文只是在讲“他很伟大、他很奉献、国家很需要他”，必须推翻重写。如果普通用户听了前5秒就能猜到后面内容，必须推翻重写。
+如果答案不满意，必须重写。尤其注意：如果第一句话是在介绍人物身份、交代背景、下价值判断、喊口号，必须推翻重写。如果前三秒只是“某某很伟大”“某个领域被卡脖子”“某人做出巨大贡献”，必须推翻重写。如果开头像街采模板、问答模板、百科模板、人物通用模板，必须推翻重写。如果开头换成另一个科学家也能用，必须推翻重写。如果开头没有强悬念、强反差、强画面，必须推翻重写。如果全文只是在讲“他很伟大、他很奉献、国家很需要他”，必须推翻重写。如果普通用户听了前5秒就能猜到后面内容，必须推翻重写。
 
 十一、最终输出要求
 
 只输出经过自检后的完整文案。不要输出自检过程。不要解释写作思路。不要列大纲。不要加小标题。不要输出注意事项。不要说“以下是文案”。
 文案必须按分镜自然分段。
+script 字段正文必须是 1000 到 1300 个中文字符，20 到 30 个自然段。少于1000字或少于20段都视为不合格，必须重写后再输出。
 
 程序解析要求：
 你必须只返回严格 JSON，不要 Markdown。JSON 字段必须包含 title, person, event_angle, script。
@@ -768,39 +981,67 @@ def generate_guozhijiliang_script(person_name: str = "", event_angle: str = "") 
         raise RuntimeError("BIGMODEL_API_KEY is not configured")
 
     selected_person, selected_angle = choose_guozhijiliang_seed(person_name, event_angle)
-    prompt = build_guozhijiliang_script_prompt_v2(selected_person, selected_angle)
-    payload = {
-        "model": bigmodel_model(),
-        "messages": [
-            {"role": "system", "content": "你只输出可解析 JSON。"},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.85,
-        "top_p": 0.9,
-        "max_tokens": 6000,
-        "stream": False,
-        "thinking": {"type": "disabled"},
-        "response_format": {"type": "json_object"},
-    }
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        f"{bigmodel_endpoint().rstrip('/')}/chat/completions",
-        data=data,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=90) as response:
-            body = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"GLM API {exc.code}: {error_body}") from exc
+    result: dict = {}
+    script = ""
+    stats = {"chars": 0, "paragraphs": 0}
+    retry_note = ""
+    for attempt in range(2):
+        prompt = build_guozhijiliang_script_prompt_v2(selected_person, selected_angle) + retry_note
+        payload = {
+            "model": bigmodel_model(),
+            "messages": [
+                {"role": "system", "content": "你只输出可解析 JSON。"},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.85,
+            "top_p": 0.9,
+            "max_tokens": 8000,
+            "stream": False,
+            "thinking": {"type": "disabled"},
+            "response_format": {"type": "json_object"},
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{bigmodel_endpoint().rstrip('/')}/chat/completions",
+            data=data,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"GLM API {exc.code}: {error_body}") from exc
 
-    content = body["choices"][0]["message"]["content"]
-    if isinstance(content, list):
-        content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
-    result = json.loads(extract_json(str(content)))
-    script = clean_rewritten_script("", str(result.get("script") or result.get("rewritten_script") or "")).strip()
+        content = body["choices"][0]["message"]["content"]
+        if isinstance(content, list):
+            content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+        result = json.loads(extract_json(str(content)))
+        script = clean_rewritten_script("", str(result.get("script") or result.get("rewritten_script") or "")).strip()
+        stats = guozhijiliang_script_stats(script)
+        opening_needs_rewrite = guozhijiliang_opening_needs_rewrite(script)
+        if (
+            stats["chars"] >= MIN_GUOZHIJILIANG_SCRIPT_CHARS
+            and stats["paragraphs"] >= MIN_GUOZHIJILIANG_SCRIPT_PARAGRAPHS
+            and not opening_needs_rewrite
+        ):
+            break
+        if opening_needs_rewrite:
+            retry_note = (
+                "\n\n【重写要求】刚才生成的开头不合格，前三秒留人能力不够。"
+                "第一句话不能介绍人物、交代背景、下价值判断或写氛围，必须直接给强冲突事件。"
+                "前三句必须形成三连击：爆点、加压或反转、抛出疑问。"
+                "第一句必须让人立刻想问：为什么会这样？他/她接下来怎么办？"
+            )
+        else:
+            retry_note = (
+                "\n\n【重写要求】刚才生成的正文太短或段落太少，不合格。"
+                f"必须扩写到 {MIN_GUOZHIJILIANG_SCRIPT_CHARS} 到 {MAX_GUOZHIJILIANG_SCRIPT_CHARS} 个中文字符，"
+                f"{MIN_GUOZHIJILIANG_SCRIPT_PARAGRAPHS} 到 {MAX_GUOZHIJILIANG_SCRIPT_PARAGRAPHS} 个自然段。"
+                "补充关键事件过程、人物代价、现场细节、情绪递进和自然带书，不要用空话凑字。"
+            )
+
     if not script:
         raise RuntimeError("GLM response does not contain script")
     return {
@@ -808,6 +1049,8 @@ def generate_guozhijiliang_script(person_name: str = "", event_angle: str = "") 
         "person": str(result.get("person") or selected_person).strip(),
         "event_angle": str(result.get("event_angle") or selected_angle).strip(),
         "script": script,
+        "script_chars": stats["chars"],
+        "script_paragraphs": stats["paragraphs"],
         "provider": bigmodel_model(),
     }
 
@@ -984,73 +1227,36 @@ def ai_generate_shot_visuals(shots: list[dict], full_script: str) -> dict[str, d
     return all_visuals
 
 
-def generate_viral_title(script: str) -> dict:
-    """Use GLM to generate a two-line viral short video title based on script content."""
-    api_key = os.getenv("BIGMODEL_API_KEY", "").strip()
-    if not api_key:
-        return {"line1": "", "line2": "", "full_title": ""}
-
-    prompt = (
-        "你是爆款短视频标题专家。请根据以下文案内容，生成一个两行式爆款标题。"
-        "\n\n标题规则："
-        "\n1. 必须生成两行文字，每行使用完整短句，不要为了字数截断一句话。"
-        "\n2. 标题要制造悬念或反差，让用户忍不住点开。"
-        "\n3. 以下是爆款标题示范格式，请学习其逻辑但不要照搬："
-        "\n   - 第一行：飞机坠毁前 / 第二行：他用身体护住了国家机密"
-        "\n   - 第一行：母亲骂他三十年不孝 / 第二行：真相曝光后全国泪目"
-        "\n   - 第一行：穿15块胶鞋的老太太 / 第二行：捐出了1000万"
-        "\n4. 标题必须忠于文案事实，不能编造信息。"
-        "\n5. 不要用「震惊」「惊人」「不可思议」等空洞词汇。"
-        "\n6. 标题中禁止出现任何标点符号，包括逗号、句号、感叹号、问号、冒号、破折号等。"
-        "\n7. 只返回 JSON，不要 Markdown，不要解释。"
-        "\n\n文案内容："
-        f"\n{script[:600]}"
-        "\n\n返回格式："
-        '\n{"line1": "第一行标题", "line2": "第二行标题"}'
-    )
-
-    payload = {
-        "model": bigmodel_model(),
-        "messages": [
-            {"role": "system", "content": "你只输出可解析 JSON。"},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.8,
-        "top_p": 0.9,
-        "max_tokens": 200,
-        "stream": False,
-        "thinking": {"type": "disabled"},
-        "response_format": {"type": "json_object"},
-    }
-
-    try:
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            f"{bigmodel_endpoint().rstrip('/')}/chat/completions",
-            data=data,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=30) as response:
-            body = json.loads(response.read().decode("utf-8"))
-        content = body["choices"][0]["message"]["content"]
-        if isinstance(content, list):
-            content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
-        result = json.loads(extract_json(str(content)))
-        line1 = str(result.get("line1", "")).strip()
-        line2 = str(result.get("line2", "")).strip()
-        # Strip any punctuation that the model might still produce
-        _punct_pat = re.compile(r"[，。！？、；：“”‘’《》【】（）—…\-.!?,;:'\"()\[\]{}<>]")
-        line1 = _punct_pat.sub("", line1).strip()
-        line2 = _punct_pat.sub("", line2).strip()
-        return {"line1": line1, "line2": line2, "full_title": f"{line1} {line2}"}
-    except Exception as exc:
-        return {"line1": "", "line2": "", "full_title": "", "error": str(exc)[:200]}
-
-
 def strip_title_punctuation(text: str) -> str:
     punctuation = re.compile(r"[，。！？、；：“”‘’《》【】（）—…\-.!?,;:'\"()\[\]{}<>]")
     return re.sub(r"\s+", "", punctuation.sub("", str(text or ""))).strip()
+
+
+def cover_title_needs_rewrite(line1: str, line2: str) -> bool:
+    combined = f"{line1}{line2}"
+    if not combined:
+        return True
+    if any(pattern in combined for pattern in WEAK_COVER_TITLE_PATTERNS):
+        return True
+    if any(left in combined and right in combined for left, right in COVER_TITLE_SPOILER_COMBOS):
+        return True
+    if len(combined) >= 6 and not any(word in combined for word in COVER_TITLE_ATTRACTION_WORDS):
+        return True
+    return False
+
+
+def extract_json_array(text: str) -> str:
+    match = re.search(r"\[.*\]", text, flags=re.S)
+    if not match:
+        raise ValueError("GLM response does not contain JSON array")
+    return match.group(0)
+
+
+def parse_title_candidates(content: str) -> list[dict]:
+    parsed = json.loads(extract_json_array(content))
+    if isinstance(parsed, list):
+        return [item for item in parsed if isinstance(item, dict)]
+    return []
 
 
 def generate_viral_title(script: str) -> dict:
@@ -1060,19 +1266,84 @@ def generate_viral_title(script: str) -> dict:
         return {"line1": "", "line2": "", "full_title": ""}
 
     base_prompt = (
-        "你是爆款短视频标题专家。请根据以下文案内容，生成一个两行式爆款标题。"
-        "\n\n标题规则："
-        "\n1. 必须生成两行文字，每行1-9个字，任何一行都不能超过9个字。"
-        "\n2. 如果一句话超过9个字，必须重新概括成更短的完整表达，严禁直接截断。"
-        "\n3. 标题要制造悬念或反差，让用户忍不住点开。"
-        "\n4. 标题必须忠于文案事实，不能编造信息。"
-        "\n5. 不要用「震惊」「惊人」「不可思议」等空洞词汇。"
-        "\n6. 标题中禁止出现任何标点符号，包括逗号、句号、感叹号、问号、冒号、破折号等。"
-        "\n7. 只返回JSON，不要Markdown，不要解释。"
-        "\n\n文案内容："
-        f"\n{script[:600]}"
-        "\n\n返回格式："
-        '\n{"line1": "第一行标题", "line2": "第二行标题"}'
+        "你是视频号和抖音爆款封面标题专家，擅长为历史人物、爱国教育、大国叙事、卖书转化类短视频生成高停留率封面标题。"
+        "\n\n请根据我提供的文案内容，生成两行式短视频封面标题。"
+        "\n\n目标：让用户在推荐流里扫一眼就想停下来，产生“为什么会这样”“这也太离谱了”“这个人是谁”“我得看下去”的反应。"
+        "\n\n【最重要原则】"
+        "\n标题不是文章标题，不是新闻标题，不是中心思想，不是文案摘要。"
+        "\n标题只需要抓住文案里最有冲突、最反常识、最心疼、最不公平、最有画面感的一个局部爆点。"
+        "\n宁可抓一个狠瞬间，也不要写得全面、平衡、正确但没人想点。"
+        "\n\n【生成前的内部步骤】"
+        "\n在生成标题前，请你先在内部完成以下判断，但不要输出过程："
+        "\n1. 从文案里提炼5个最有停留价值的爆点瞬间。"
+        "\n2. 判断哪个爆点最适合做封面标题。"
+        "\n3. 优先选择有具体画面、具体动作、具体物品、具体数字的爆点。"
+        "\n4. 不要优先选择抽象主题、人物贡献、中心思想。"
+        "\n5. 站在普通视频号用户视角反审：如果我刷到这个标题，会不会停下来？如果不会，必须重写。"
+        "\n\n【标题格式】"
+        "\n1. 必须生成两行文字。"
+        "\n2. 每行1到9个字，任何一行都不能超过9个字。"
+        "\n3. 每组标题由“第一行”和“第二行”组成。"
+        "\n4. 标题中禁止出现任何标点符号，包括逗号、句号、感叹号、问号、冒号、破折号、引号等。"
+        "\n5. 如果一句话超过9个字，必须重新概括成更短的完整表达，严禁直接截断。"
+        "\n6. 只返回JSON，不要Markdown，不要解释。"
+        "\n\n【两行分工】"
+        "\n第一行优先放：冲突现场、反常动作、具体物品、身份反差、强结果。"
+        "\n第二行优先放：悬念补刀、情绪放大、代价、反差、追问、亏欠感。"
+        "\n\n好的结构示例："
+        "\n第一行：父亲去世那天\n第二行：他不敢回家"
+        "\n第一行：美国扣下箱子\n第二行：到底怕什么"
+        "\n第一行：她捐出千万\n第二行：却穿15块鞋"
+        "\n第一行：名单上没她\n第二行：她自己划掉"
+        "\n第一行：法国领奖台\n第二行：他却不笑"
+        "\n第一行：病床前电脑\n第二行：他还在敲字"
+        "\n\n【标题风格】"
+        "\n标题必须口语化、狠一点、像人话。"
+        "\n可以大胆使用爆款短视频写法：悬念、反差、冲突、误区纠正、身份反差、强结果、强代价、心疼感、不公平感、亏欠感。"
+        "\n不要端着。不要像纪念馆展板。不要像作文题目。不要像新闻标题。不要像领导题词。不要像百科词条。"
+        "\n\n【优先使用的爆点类型】"
+        "\n1. 认知误区：用户以为是A，其实是B。"
+        "\n2. 身份反差：看起来普通的人，做了极不普通的事。"
+        "\n3. 荣誉缺席：明明立大功，却没有名字。"
+        "\n4. 亲情亏欠：父亲去世不能回家，母亲骂他不孝。"
+        "\n5. 生死瞬间：临终前、坠毁前、病床上、最后一天。"
+        "\n6. 屈辱反击：被外国人看不起，后来用结果打回去。"
+        "\n7. 具体物品：公文包、旧胶鞋、行李箱、手稿、算盘、病号服、轮椅、饭盘、抽屉、奖章。"
+        "\n8. 数字反差：15块鞋、1000万、52人、30年、90岁、最后一天。"
+        "\n\n【高停留词优先】"
+        "\n可以优先使用这些词：扣下、炸掉、抹掉、坠毁、不能回家、被骂、捐出、消失、千万、15块、普通老太太、亲手、名单、功劳簿、凭什么、为什么、到底、没人敢、谁也没想到、最后一天、没名字、没热搜、被忘了、全额赔钱、他却不笑、她自己划掉。"
+        "\n\n【禁止使用】"
+        "\n不要用这些空洞词：震惊、惊人、不可思议、伟大、精神、民族脊梁、大国、传奇、一生、值得铭记、感人至深、无私奉献、家国情怀、时代楷模、光辉事迹。"
+        "\n不要写成这种：国之脊梁、民族英雄、伟大科学家、致敬先辈、孩子该看、中国骄傲、隐姓埋名一生、共和国不会忘记。"
+        "\n这些太正、太空、太像展板，不能作为封面标题。"
+        "\n\n【避免自我解谜】"
+        "\n不要写一眼就把故事讲完的标题。"
+        "\n比如：第一行：女儿病危那天\n第二行：他死盯图纸"
+        "\n这种用户一眼就猜到“为国家舍小家”，张力已经被解释完。"
+        "\n要留一点空，让用户想知道为什么。"
+        "\n更好的方式：第一行：女儿病危那天\n第二行：他不敢抬头"
+        "\n或者：第一行：病危通知来了\n第二行：他却没回家"
+        "\n\n【输出数量】"
+        "\n请一次生成12组标题。"
+        "\n12组标题要尽量覆盖不同类型，不要全是疑问句，不要全是同一种模板。"
+        "\n每组必须包含：first_line、second_line、style。"
+        "\nstyle只能从以下类型中选择：悬念型、反差型、冲突型、心疼型、爽感型、亏欠型、误区型、画面型。"
+        "\n\n【最终自检】"
+        "\n输出前请内部自检："
+        "\n1. 每行是否不超过9个字。"
+        "\n2. 是否没有标点符号。"
+        "\n3. 是否像封面大字，而不是文章标题。"
+        "\n4. 是否抓住了具体爆点，而不是全文概括。"
+        "\n5. 普通用户扫一眼是否有停留理由。"
+        "\n6. 是否避免了空洞大词。"
+        "\n7. 是否有足够反差或悬念。"
+        "\n如果不合格，必须重写后再输出。"
+        "\n\n【输出格式】"
+        "\n只返回JSON数组，不要Markdown，不要解释。"
+        "\n格式如下："
+        '\n[{"first_line": "第一行", "second_line": "第二行", "style": "悬念型"}]'
+        "\n\n下面是文案内容："
+        f"\n{script[:1200]}"
     )
 
     last_error = ""
@@ -1087,10 +1358,9 @@ def generate_viral_title(script: str) -> dict:
                 ],
                 "temperature": 0.8,
                 "top_p": 0.9,
-                "max_tokens": 200,
+                "max_tokens": 1200,
                 "stream": False,
                 "thinking": {"type": "disabled"},
-                "response_format": {"type": "json_object"},
             }
             data = json.dumps(payload).encode("utf-8")
             req = urllib.request.Request(
@@ -1104,12 +1374,18 @@ def generate_viral_title(script: str) -> dict:
             content = body["choices"][0]["message"]["content"]
             if isinstance(content, list):
                 content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
-            result = json.loads(extract_json(str(content)))
-            line1 = strip_title_punctuation(result.get("line1", ""))
-            line2 = strip_title_punctuation(result.get("line2", ""))
-            if 1 <= len(line1) <= 9 and 1 <= len(line2) <= 9:
-                return {"line1": line1, "line2": line2, "full_title": f"{line1} {line2}"}
-            last_error = f"第1行{len(line1)}字，第2行{len(line2)}字，要求每行1-9字"
+            candidates = parse_title_candidates(str(content))
+            last_error = "12组标题里没有合格候选"
+            for item in candidates:
+                line1 = strip_title_punctuation(item.get("first_line") or item.get("line1") or "")
+                line2 = strip_title_punctuation(item.get("second_line") or item.get("line2") or "")
+                if 1 <= len(line1) <= 9 and 1 <= len(line2) <= 9 and not cover_title_needs_rewrite(line1, line2):
+                    return {
+                        "line1": line1,
+                        "line2": line2,
+                        "full_title": f"{line1} {line2}",
+                        "style": str(item.get("style") or "").strip(),
+                    }
         return {"line1": "", "line2": "", "full_title": "", "error": last_error or "Title generation failed"}
     except Exception as exc:
         return {"line1": "", "line2": "", "full_title": "", "error": str(exc)[:200]}
