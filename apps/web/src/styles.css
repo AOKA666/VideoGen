@@ -798,6 +798,48 @@ h3 { font-size: 16px; line-height: 1.48; }
   grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
   gap: 16px;
 }
+
+.asset-type-filter {
+  display: flex;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.asset-type-filter button.active {
+  background: var(--accent, #1f6feb);
+  color: white;
+}
+
+.asset-processing-progress {
+  height: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(127, 127, 127, 0.2);
+}
+
+.asset-processing-progress span {
+  display: block;
+  height: 100%;
+  background: var(--accent, #1f6feb);
+  transition: width 0.25s ease;
+}
+
+.video-processing-placeholder {
+  display: flex;
+  min-height: 150px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: #777;
+}
+
+.video-upload-options {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid rgba(127, 127, 127, 0.24);
+  border-radius: 10px;
+}
 .load-more-row {
   display: flex;
   justify-content: center;

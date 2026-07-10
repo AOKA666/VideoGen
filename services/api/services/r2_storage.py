@@ -64,7 +64,7 @@ def _asset_object_name(asset: dict[str, Any], path: Path | None = None) -> str:
 
 
 def asset_object_key(asset: dict[str, Any], path: Path | None = None) -> str:
-    return f"assets/{_asset_object_name(asset, path)}"
+    return f"assets/{asset['id']}/{_asset_object_name(asset, path)}"
 
 
 def asset_metadata_object_key(asset: dict[str, Any], path: Path | None = None) -> str:

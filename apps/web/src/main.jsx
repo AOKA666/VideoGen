@@ -41,6 +41,8 @@ function emptyTagForm() {
     source_page: '',
     source_note: '用户上传',
     copyright_note: '自用素材',
+    keep_original: false,
+    video_processing_mode: 'split',
   };
 }
 
@@ -114,6 +116,7 @@ function App() {
   const [exportResult, setExportResult] = useState(null);
   const [selectedAssetIds, setSelectedAssetIds] = useState(new Set());
   const [visibleAssetCount, setVisibleAssetCount] = useState(ASSET_PAGE_SIZE);
+  const [assetTypeFilter, setAssetTypeFilter] = useState('all');
   const folderFallbackRef = useRef(null);
   const uploadInputRef = useRef(null);
   const coverInputRef = useRef(null);
@@ -189,9 +192,13 @@ function App() {
     map.forEach((list) => list.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || ''))));
     return map;
   }, [webImageDiagnostics]);
+  const filteredAssets = useMemo(
+    () => assets.filter((asset) => assetTypeFilter === 'all' || asset.file_type === assetTypeFilter),
+    [assets, assetTypeFilter],
+  );
   const visibleAssets = useMemo(
-    () => assets.slice(0, visibleAssetCount),
-    [assets, visibleAssetCount],
+    () => filteredAssets.slice(0, visibleAssetCount),
+    [filteredAssets, visibleAssetCount],
   );
 
   async function run(label, fn) {
@@ -248,6 +255,22 @@ function App() {
   useEffect(() => {
     refreshAll();
   }, []);
+
+  useEffect(() => {
+    const hasProcessingVideo = assets.some((asset) => (
+      asset.file_type === 'video' && ['analyzing', 'probing', 'splitting'].includes(asset.analysis_status)
+    ));
+    if (!hasProcessingVideo) return undefined;
+    const timer = window.setInterval(async () => {
+      try {
+        const data = await request('/api/assets');
+        setAssets(data.assets || []);
+      } catch (_) {
+        // The next interval will retry without interrupting the rest of the UI.
+      }
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [assets]);
 
   useEffect(() => {
     if (!project) return;
@@ -494,6 +517,8 @@ function App() {
       scene: textToList(form.scene),
       keywords: textToList(form.keywords),
     }));
+    data.append('keep_original', String(Boolean(form.keep_original)));
+    data.append('video_processing_mode', form.video_processing_mode || 'split');
     const result = await run('上传素材', () => request('/api/assets/upload', { method: 'POST', body: data }));
     if (!result) return;
     closePendingUpload();
@@ -1131,6 +1156,11 @@ function App() {
                     <button className="primary" type="button" onClick={() => uploadInputRef.current?.click()}><ImagePlus size={18} /> 选择素材</button>
                   </div>
                 </div>
+                <div className="asset-type-filter">
+                  <button className={assetTypeFilter === 'all' ? 'active' : ''} onClick={() => { setAssetTypeFilter('all'); setVisibleAssetCount(ASSET_PAGE_SIZE); }}>全部</button>
+                  <button className={assetTypeFilter === 'image' ? 'active' : ''} onClick={() => { setAssetTypeFilter('image'); setVisibleAssetCount(ASSET_PAGE_SIZE); }}>图片</button>
+                  <button className={assetTypeFilter === 'video' ? 'active' : ''} onClick={() => { setAssetTypeFilter('video'); setVisibleAssetCount(ASSET_PAGE_SIZE); }}>视频</button>
+                </div>
                 {assets.length > 0 && (
                   <div className="batch-bar">
                     <label className="check-row compact">
@@ -1158,13 +1188,13 @@ function App() {
                     />
                   ))}
                 </div>
-                {visibleAssetCount < assets.length && (
+                {visibleAssetCount < filteredAssets.length && (
                   <div className="load-more-row">
                     <button
                       type="button"
-                      onClick={() => setVisibleAssetCount((count) => Math.min(count + ASSET_PAGE_SIZE, assets.length))}
+                      onClick={() => setVisibleAssetCount((count) => Math.min(count + ASSET_PAGE_SIZE, filteredAssets.length))}
                     >
-                      加载更多（{Math.min(ASSET_PAGE_SIZE, assets.length - visibleAssetCount)} / 剩余 {assets.length - visibleAssetCount}）
+                      加载更多（{Math.min(ASSET_PAGE_SIZE, filteredAssets.length - visibleAssetCount)} / 剩余 {filteredAssets.length - visibleAssetCount}）
                     </button>
                   </div>
                 )}
@@ -1748,10 +1778,19 @@ function AssetCard({ asset, selected, onSelect, onPreview, onEdit, onDelete, ima
         onClick={openPreview}
         onKeyDown={openPreview}
       >
-        {asset.file_type === 'image' ? <SafeImage src={src} alt={asset.file_name} style={assetCropDisplayStyle(asset)} /> : <video src={src} controls />}
+        {asset.file_type === 'image' ? <SafeImage src={src} alt={asset.file_name} style={assetCropDisplayStyle(asset)} /> : (
+          asset.file_url
+            ? <video src={src} poster={asset.thumbnail_url ? `${API}${asset.thumbnail_url}` : undefined} controls preload="metadata" />
+            : <div className="video-processing-placeholder"><Film size={32} />{asset.processing_stage === 'failed' ? '处理失败' : '原视频已转为片段'}</div>
+        )}
         {imageTools}
       </div>
       <h3>{asset.file_name}</h3>
+      {asset.file_type === 'video' && asset.processing_stage && asset.processing_stage !== 'ready' && (
+        <div className="asset-processing-progress"><span style={{ width: `${asset.processing_progress || 0}%` }} /></div>
+      )}
+      {asset.file_type === 'video' && asset.duration_ms && <small>{(asset.duration_ms / 1000).toFixed(1)} 秒 · 代理片段</small>}
+      {asset.file_type === 'video' && asset.clip_count !== undefined && <small>已生成 {asset.clip_count} 个片段</small>}
       {imageScore !== undefined && imageScore !== null && <p>图片评分：{imageScore}</p>}
       <p>{asset.analysis_status === 'analyzing' ? '识别中' : [...(asset.object || asset.people || []), ...(asset.scene || []), ...(asset.keywords || [])].slice(0, 6).join(' / ') || '待补充标签'}</p>
       <small>{asset.analysis_status === 'analyzing' ? '识别标签中，请稍候' : `${asset.analysis_provider || 'local_fallback'} · ${asset.copyright_note}`}</small>
@@ -2096,6 +2135,16 @@ function TagFields({ form, update }) {
         <label>主体标签<input value={form.object} onChange={(e) => update('object', e.target.value)} placeholder="钱学森，火车，纪念碑" /></label>
         <label>场景标签<input value={form.scene} onChange={(e) => update('scene', e.target.value)} placeholder="实验室，会议室，戈壁滩" /></label>
         <label>关键词<input value={form.keywords} onChange={(e) => update('keywords', e.target.value)} placeholder="归国科学家，留学回国" /></label>
+      </div>
+      <SourceFields form={form} update={update} />
+    </>
+  );
+}
+
+function SourceFields({ form, update }) {
+  return (
+    <>
+      <div className="grid">
         <label>来源链接<input value={form.source_page || ''} onChange={(e) => update('source_page', e.target.value)} placeholder="https://..." /></label>
       </div>
       <label>来源备注<input value={form.source_note} onChange={(e) => update('source_note', e.target.value)} /></label>
@@ -2124,7 +2173,24 @@ function UploadTagDialog({ files, initialForm, onClose, onUpload }) {
           {files.slice(0, 6).map((file) => <span key={`${file.name}-${file.size}`}>{file.name}</span>)}
           {files.length > 6 && <span>还有 {files.length - 6} 个文件</span>}
         </div>
-        <TagFields form={form} update={update} />
+        <SourceFields form={form} update={update} />
+        {files.some((file) => /\.(mp4|mov|webm)$/i.test(file.name)) && (
+          <div className="video-upload-options">
+            <strong>视频处理方式</strong>
+            <label className="check-row">
+              <input type="radio" name="video-processing-mode" value="split" checked={form.video_processing_mode === 'split'} onChange={() => update('video_processing_mode', 'split')} />
+              智能切割分段（按场景生成多个 3～15 秒素材）
+            </label>
+            <label className="check-row">
+              <input type="radio" name="video-processing-mode" value="full" checked={form.video_processing_mode === 'full'} onChange={() => update('video_processing_mode', 'full')} />
+              保留完整素材（压缩转码，但不改变视频时长）
+            </label>
+            <label className="check-row">
+              <input type="checkbox" checked={Boolean(form.keep_original)} onChange={(e) => update('keep_original', e.target.checked)} />
+              另外长期保存未经压缩的原始文件
+            </label>
+          </div>
+        )}
         <div className="actions"><button type="button" onClick={onClose}>取消</button><button className="primary"><ImagePlus size={18} /> 上传并自动打标</button></div>
       </form>
     </div>

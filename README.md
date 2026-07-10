@@ -103,10 +103,10 @@ JIANYING_DRAFTS_DIR=E:\JianyingPro Drafts
 前端变量放在 `apps/web/.env.local`：
 
 ```env
-VITE_API_URL=http://127.0.0.1:8001
+VITE_API_URL=http://127.0.0.1:8000
 ```
 
-未配置时默认访问 `http://127.0.0.1:8000`。如果后端按本文档使用 `8001` 端口，请在 `apps/web/.env.local` 中设置上面的地址。修改后需要重新启动 Vite。
+未配置时默认访问 `http://127.0.0.1:8000`。如需使用其他端口，请在 `apps/web/.env.local` 中设置对应地址；修改后需要重新启动 Vite。
 
 ## 启动
 
@@ -117,13 +117,13 @@ cd C:\Users\27819\Desktop\VideoGen
 E:\Python\python.exe -m venv .\services\api\.venv
 .\services\api\.venv\Scripts\python.exe -m pip install -r .\services\api\requirements.txt
 cd services/api
-.\.venv\Scripts\python.exe -m uvicorn main:app --reload --host 127.0.0.1 --port 8001
+.\.venv\Scripts\python.exe -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
 ```
 
 健康检查：
 
 ```text
-http://127.0.0.1:8001/api/health
+http://127.0.0.1:8000/api/health
 ```
 
 ### 前端

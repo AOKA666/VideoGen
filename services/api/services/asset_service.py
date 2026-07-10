@@ -95,7 +95,9 @@ def analyze_asset(filename: str, file_path: Path | None = None, file_type: str |
 
 
 def analyze_image_with_minimax(filename: str, file_path: Path, api_key: str) -> dict[str, Any]:
-    mime = mimetypes.guess_type(filename)[0] or "image/jpeg"
+    # The display filename may belong to a video clip while file_path is an
+    # extracted key-frame image. The data URL must describe the actual bytes.
+    mime = mimetypes.guess_type(file_path.name)[0] or "image/jpeg"
     image_b64 = base64.b64encode(file_path.read_bytes()).decode("ascii")
     prompt = (
         '你是短视频素材库的图片打标助手。请根据图片内容和文件名生成精确标签。'

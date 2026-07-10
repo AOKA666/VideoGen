@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import shutil
 import subprocess
 from datetime import datetime
@@ -16,6 +17,7 @@ from services.asset_source_service import normalize_asset_source_fields
 from services.asset_service import analyze_asset, detect_file_type, new_id, safe_storage_name
 from services.r2_storage import R2StorageError, delete_asset_object, ensure_asset_local, upload_asset, upload_asset_metadata
 from services.store import ASSETS_DIR, load_db, public_url, save_db
+from services.video_ingest_service import process_video_asset, reanalyze_video_clip
 
 router = APIRouter(prefix="/api/assets", tags=["assets"])
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
@@ -240,7 +242,15 @@ def require_library(db: dict) -> dict:
     return library
 
 
-def build_asset(file: UploadFile, source_note: str, copyright_note: str, source_page: str, library: dict) -> dict:
+def build_asset(
+    file: UploadFile,
+    source_note: str,
+    copyright_note: str,
+    source_page: str,
+    library: dict,
+    keep_original: bool = False,
+    video_processing_mode: str = "split",
+) -> dict:
     original_path = file.filename or ""
     file_type = detect_file_type(original_path)
     if file_type == "unknown":
@@ -249,9 +259,21 @@ def build_asset(file: UploadFile, source_note: str, copyright_note: str, source_
     asset_id = new_id()
     stored_name = f"{asset_id}_{safe_storage_name(original_path)}"
     target = ASSETS_DIR / stored_name
-    with target.open("wb") as out:
-        shutil.copyfileobj(file.file, out)
-    content_hash = hashlib.sha256(target.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    file_size = 0
+    max_bytes = max(1, int(os.getenv("ASSET_UPLOAD_MAX_MB", "2048"))) * 1024 * 1024
+    try:
+        with target.open("wb") as out:
+            while chunk := file.file.read(1024 * 1024):
+                file_size += len(chunk)
+                if file_size > max_bytes:
+                    raise HTTPException(413, f"文件超过上传上限 {max_bytes // 1024 // 1024} MB")
+                digest.update(chunk)
+                out.write(chunk)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    content_hash = digest.hexdigest()
 
     now = datetime.now().isoformat(timespec="seconds")
     asset = {
@@ -264,6 +286,7 @@ def build_asset(file: UploadFile, source_note: str, copyright_note: str, source_
         "thumbnail_url": public_url(target),
         "local_path": str(target),
         "hash": content_hash,
+        "file_size": file_size,
         "object": [],
         "scene": [],
         "keywords": [],
@@ -276,13 +299,12 @@ def build_asset(file: UploadFile, source_note: str, copyright_note: str, source_
         "is_available": True,
         "created_at": now,
         "updated_at": now,
+        "keep_original": keep_original if file_type == "video" else True,
+        "processing_stage": "uploaded" if file_type == "video" else "analyzing",
+        "processing_progress": 0,
+        "video_processing_mode": video_processing_mode if file_type == "video" else None,
     }
     normalize_asset_source_fields(asset)
-    try:
-        upload_asset(asset, target)
-    except Exception:
-        target.unlink(missing_ok=True)
-        raise
     return asset
 
 
@@ -347,6 +369,8 @@ def upload_assets(
     copyright_note: str = Form("自用素材"),
     source_page: str = Form(""),
     manual_tags: str = Form("{}"),
+    keep_original: bool = Form(False),
+    video_processing_mode: str = Form("split"),
 ):
     db = load_db()
     library = require_library(db)
@@ -354,20 +378,42 @@ def upload_assets(
         parsed_manual_tags = json.loads(manual_tags or "{}")
     except json.JSONDecodeError:
         raise HTTPException(400, "manual_tags must be a JSON object")
+    if video_processing_mode not in {"split", "full"}:
+        raise HTTPException(400, "video_processing_mode must be split or full")
 
     uploaded = []
     skipped = []
+    existing_hashes = {
+        str(item.get("hash")) for item in db.get("assets", []) if item.get("hash")
+    }
     for file in files:
         if detect_file_type(file.filename or "") == "unknown":
             skipped.append({"file_name": file.filename, "reason": "unsupported"})
             continue
         try:
-            asset = build_asset(file, source_note, copyright_note, source_page, library)
+            asset = build_asset(
+                file, source_note, copyright_note, source_page, library,
+                keep_original, video_processing_mode,
+            )
         except R2StorageError as exc:
             raise HTTPException(502, str(exc)) from exc
+        if asset["hash"] in existing_hashes:
+            Path(asset["local_path"]).unlink(missing_ok=True)
+            skipped.append({"file_name": file.filename, "reason": "duplicate"})
+            continue
+        if asset["file_type"] == "image" or asset.get("keep_original"):
+            try:
+                upload_asset(asset, Path(asset["local_path"]))
+            except R2StorageError as exc:
+                Path(asset["local_path"]).unlink(missing_ok=True)
+                raise HTTPException(502, str(exc)) from exc
+        existing_hashes.add(asset["hash"])
         db["assets"].append(asset)
         uploaded.append(asset)
-        background_tasks.add_task(analyze_asset_background, asset["id"], parsed_manual_tags)
+        if asset["file_type"] == "video":
+            background_tasks.add_task(process_video_asset, asset["id"], parsed_manual_tags)
+        else:
+            background_tasks.add_task(analyze_asset_background, asset["id"], parsed_manual_tags)
     save_db(db)
     return {"status": "analyzing", "count": len(uploaded), "skipped": skipped, "assets": uploaded}
 
@@ -376,13 +422,30 @@ def upload_assets(
 def retry_asset_analysis(background_tasks: BackgroundTasks):
     db = load_db()
     retry_ids = []
+    video_retry_count = 0
     now = datetime.now().isoformat(timespec="seconds")
     for asset in db.get("assets", []):
+        is_failed_video_clip = (
+            asset.get("file_type") == "video"
+            and bool(asset.get("parent_asset_id"))
+            and bool(asset.get("analysis_error"))
+        )
         if (
-            asset.get("file_type") != "image"
-            or asset.get("analysis_status") not in {"analyzing", "failed"}
-            or not ensure_asset_local(asset).exists()
+            asset.get("analysis_status") not in {"analyzing", "failed"}
+            and not is_failed_video_clip
         ):
+            continue
+        if asset.get("file_type") == "video" and asset.get("parent_asset_id"):
+            thumbnail = Path(str(asset.get("thumbnail_path") or ""))
+            if not thumbnail.is_file():
+                continue
+            background_tasks.add_task(reanalyze_video_clip, asset["id"])
+            video_retry_count += 1
+            asset["analysis_status"] = "analyzing"
+            asset["analysis_provider"] = "pending"
+            asset["analysis_error"] = ""
+            continue
+        if not ensure_asset_local(asset).is_file():
             continue
         shot = next(
             (
@@ -401,6 +464,13 @@ def retry_asset_analysis(background_tasks: BackgroundTasks):
             asset["updated_at"] = now
             rename_analyzed_asset(asset)
             continue
+        if asset.get("file_type") == "video":
+            background_tasks.add_task(process_video_asset, asset["id"], None)
+            video_retry_count += 1
+            asset["analysis_status"] = "probing"
+            asset["processing_stage"] = "probing"
+            asset["analysis_error"] = ""
+            continue
         retry_ids.append(asset["id"])
         asset["analysis_status"] = "analyzing"
         asset["analysis_provider"] = "pending"
@@ -409,7 +479,8 @@ def retry_asset_analysis(background_tasks: BackgroundTasks):
     save_db(db)
     if retry_ids:
         background_tasks.add_task(analyze_assets_background, retry_ids)
-    return {"status": "analyzing" if retry_ids else "completed", "queued": len(retry_ids)}
+    queued = len(retry_ids) + video_retry_count
+    return {"status": "analyzing" if queued else "completed", "queued": queued}
 
 
 @router.post("/{asset_id}/analyze")
@@ -469,32 +540,41 @@ def delete_asset(asset_id: str):
     if not asset:
         raise HTTPException(404, "Asset not found")
 
-    db["assets"] = [a for a in db["assets"] if a["id"] != asset_id]
-    db["project_assets"] = [pa for pa in db.get("project_assets", []) if pa.get("asset_id") != asset_id]
+    related_assets = [
+        item for item in db["assets"]
+        if item.get("id") == asset_id or item.get("parent_asset_id") == asset_id
+    ]
+    related_ids = {item["id"] for item in related_assets}
+    db["assets"] = [a for a in db["assets"] if a["id"] not in related_ids]
+    db["project_assets"] = [pa for pa in db.get("project_assets", []) if pa.get("asset_id") not in related_ids]
     for shot in db.get("shots", []):
-        if shot.get("selected_asset_id") == asset_id:
+        if shot.get("selected_asset_id") in related_ids:
             shot["selected_asset_id"] = None
             shot["asset_source"] = None
             shot["match_score"] = 0
             shot["status"] = "no_match"
             shot["updated_at"] = datetime.now().isoformat(timespec="seconds")
 
+    deleted_remote = 0
+    deleted_file = False
     try:
-        deleted_remote = delete_asset_object(asset)
+        for related in related_assets:
+            deleted_remote += int(delete_asset_object(related))
+            for field in ("local_path", "thumbnail_path"):
+                local_path = Path(str(related.get(field) or ""))
+                if local_path.is_file() and ASSETS_DIR.resolve() in local_path.resolve().parents:
+                    local_path.unlink()
+                    deleted_file = True
     except R2StorageError as exc:
         raise HTTPException(502, str(exc)) from exc
-    deleted_file = False
-    local_path = Path(asset.get("local_path", ""))
-    if local_path.exists() and ASSETS_DIR.resolve() in local_path.resolve().parents:
-        local_path.unlink()
-        deleted_file = True
 
     save_db(db)
     return {
         "status": "deleted",
         "asset_id": asset_id,
         "deleted_file": deleted_file,
-        "deleted_remote": deleted_remote,
+        "deleted_remote": bool(deleted_remote),
+        "deleted_count": len(related_ids),
     }
 
 
@@ -505,7 +585,11 @@ class BatchDeletePayload(BaseModel):
 @router.post("/batch-delete")
 def batch_delete_assets(payload: BatchDeletePayload):
     db = load_db()
-    ids_to_delete = set(payload.asset_ids)
+    requested_ids = set(payload.asset_ids)
+    ids_to_delete = requested_ids | {
+        item["id"] for item in db.get("assets", [])
+        if item.get("parent_asset_id") in requested_ids
+    }
     if not ids_to_delete:
         raise HTTPException(400, "No asset IDs provided")
 
@@ -519,10 +603,11 @@ def batch_delete_assets(payload: BatchDeletePayload):
             deleted_remote += int(delete_asset_object(asset))
         except R2StorageError as exc:
             raise HTTPException(502, str(exc)) from exc
-        local_path = Path(asset.get("local_path", ""))
-        if local_path.exists() and ASSETS_DIR.resolve() in local_path.resolve().parents:
-            local_path.unlink()
-            deleted_files += 1
+        for field in ("local_path", "thumbnail_path"):
+            local_path = Path(str(asset.get(field) or ""))
+            if local_path.is_file() and ASSETS_DIR.resolve() in local_path.resolve().parents:
+                local_path.unlink()
+                deleted_files += 1
         deleted_ids.append(asset["id"])
 
     db["assets"] = [a for a in db["assets"] if a["id"] not in ids_to_delete]
