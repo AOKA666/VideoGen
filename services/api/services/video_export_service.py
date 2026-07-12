@@ -265,7 +265,7 @@ def render_project_video(
         f"[{video_label}]subtitles=filename='subtitles.srt':"
         f"fontsdir='{preferred_font_dir}':"
         f"force_style='FontName={preferred_font_name},FontSize=15,"
-        "PrimaryColour=&H0000FFFF,OutlineColour=&H00000000,"
+        "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
         "BorderStyle=1,Outline=0.8,Shadow=0,MarginV=500,Alignment=2'[vsub]"
     )
 
@@ -559,7 +559,7 @@ def create_jianying_native_draft(
         style=draft.TextStyle(
             size=15,
             bold=True,
-            color=(1.0, 0.86, 0.0),
+            color=(1.0, 1.0, 1.0),
             align=1,
             auto_wrapping=False,
         ),

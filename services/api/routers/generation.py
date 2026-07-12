@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 from io import BytesIO
 from datetime import datetime
@@ -25,6 +26,7 @@ from services.generation_service import (
     generate_export_srt,
     lrc_from_lines,
     remove_watermark_with_seedream,
+    synthesize_volcengine_tts,
     synthesize_project_voice,
     weighted_music_timeline_from_shots,
     write_timeline,
@@ -38,6 +40,14 @@ router = APIRouter(prefix="/api/projects", tags=["generation"])
 class VoicePayload(BaseModel):
     voice_type: str | None = None
     speech_rate: int | None = None
+
+
+def _first_script_sentence(text: str) -> str:
+    compact = str(text or "").strip()
+    if not compact:
+        return ""
+    match = re.search(r".+?[。！？!?；;](?:[”’\"']*)", compact, flags=re.S)
+    return (match.group(0) if match else compact.splitlines()[0]).strip()[:160]
 
 
 class ImageGenerationPayload(BaseModel):
@@ -116,6 +126,19 @@ def _crop_square(path: Path) -> None:
         }.get(suffix, "JPEG")
         save_options = {"quality": 95} if save_format in {"JPEG", "WEBP"} else {}
         cropped.save(path, format=save_format, **save_options)
+
+
+def _convert_grayscale(path: Path) -> None:
+    with Image.open(path) as source:
+        suffix = path.suffix.lower()
+        transposed = ImageOps.exif_transpose(source)
+        grayscale = ImageOps.grayscale(transposed)
+        if suffix == ".png" and "A" in transposed.getbands():
+            grayscale = grayscale.convert("RGBA")
+            grayscale.putalpha(transposed.getchannel("A"))
+        save_format = {".png": "PNG", ".webp": "WEBP"}.get(suffix, "JPEG")
+        save_options = {"quality": 95} if save_format in {"JPEG", "WEBP"} else {}
+        grayscale.save(path, format=save_format, **save_options)
 
 
 def _crop_square_region(path: Path, x: float, y: float, size: float) -> None:
@@ -207,6 +230,20 @@ def crop_generated_image_square_region(project_id: str, asset_id: str, payload: 
         "operation": "display_region",
         "created_at": now,
     })
+    save_db(db)
+    return {"status": "success", "asset": asset}
+
+
+@router.post("/{project_id}/generated-assets/{asset_id}/grayscale")
+def convert_generated_image_grayscale(project_id: str, asset_id: str):
+    db = load_db()
+    asset, path = _generated_image(db, project_id, asset_id)
+    try:
+        _convert_grayscale(path)
+    except Exception as exc:
+        raise HTTPException(500, f"Convert image to grayscale failed: {exc}") from exc
+    asset["is_grayscale"] = True
+    _refresh_image_metadata(asset, path, "grayscale")
     save_db(db)
     return {"status": "success", "asset": asset}
 
@@ -393,6 +430,7 @@ def generate_voice(project_id: str, payload: VoicePayload | None = None):
         for timing in result.get("shot_timings", [])
         if timing.get("shot_id")
     }
+
     for shot in shots:
         timing = timing_by_shot.get(shot["id"])
         if not timing:
@@ -423,6 +461,30 @@ def generate_voice(project_id: str, payload: VoicePayload | None = None):
         "timestamp_provider": result.get("timestamp_provider"),
         "long_text_error": result.get("long_text_error"),
     }
+
+
+@router.post("/{project_id}/voice-preview")
+def preview_voice(project_id: str, payload: VoicePayload | None = None):
+    db = load_db(copy_data=False)
+    project = next((p for p in db["projects"] if p["id"] == project_id), None)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    sentence = _first_script_sentence(project.get("rewritten_script") or project.get("raw_script") or "")
+    if not sentence:
+        raise HTTPException(400, "No script content available for voice preview")
+    try:
+        result = synthesize_volcengine_tts(
+            sentence,
+            payload.voice_type if payload else None,
+            payload.speech_rate if payload else None,
+        )
+    except Exception as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return StreamingResponse(
+        BytesIO(result["audio"]),
+        media_type="audio/mpeg",
+        headers={"Cache-Control": "no-store", "X-Preview-Text-Length": str(len(sentence))},
+    )
 
 
 @router.post("/{project_id}/generate-title")

@@ -12,6 +12,7 @@ from services.asset_service import new_id
 from services.material_library_service import analyze_archived_assets, archive_project_images
 from services.store import load_db, project_dir, public_url, save_db
 from services.web_image_pipeline import (
+    clear_project_search_stop,
     mark_project_searching,
     request_stop_project_search,
     rerun_failed_shots_web_image_search,
@@ -88,6 +89,7 @@ def retry_image_search(
     shot = next((s for s in db["shots"] if s["project_id"] == project_id and s["id"] == shot_id), None)
     if not shot:
         raise HTTPException(404, "Shot not found")
+    clear_project_search_stop(project_id)
     shot["status"] = "searching"
     project["status"] = "searching_images"
     project["image_search_provider"] = image_search_provider
@@ -117,6 +119,7 @@ def retry_failed_shots(
     failed_shots = [s for s in db["shots"] if s["project_id"] == project_id and s.get("status") in FAILED_STATUSES]
     if not failed_shots:
         return {"project_id": project_id, "retried_count": 0, "status": "no_failed_shots"}
+    clear_project_search_stop(project_id)
     now = datetime.now().isoformat(timespec="seconds")
     for shot in failed_shots:
         shot["status"] = "pending_search"

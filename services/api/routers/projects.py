@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from services.store import PROJECTS_DIR, load_db, project_dir, save_db
-from services.text_service import RewriteQualityError, generate_guozhijiliang_script, infer_title, rewrite_script
+from services.text_service import RewriteQualityError, compare_scripts, generate_guozhijiliang_script, infer_title, merge_short_script_paragraphs, rewrite_script
 from services.web_image_pipeline import DONE_STATUSES, recover_interrupted_searches
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
@@ -29,6 +29,7 @@ class ScriptUpdate(BaseModel):
     rewritten_script: str | None = None
     title_line1: str | None = None
     title_line2: str | None = None
+    archived: bool | None = None
 
 
 class AiScriptPayload(BaseModel):
@@ -36,9 +37,32 @@ class AiScriptPayload(BaseModel):
     event_angle: str | None = None
 
 
+class MergeParagraphsPayload(BaseModel):
+    rewritten_script: str
+
+
+class RewritePayload(BaseModel):
+    opening_preserve_rule: str = "auto"
+    opening_preserve_chars: int | None = None
+
+
 @router.get("")
 def list_projects():
-    return {"projects": load_db(copy_data=False)["projects"]}
+    db = load_db(copy_data=False)
+    shot_counts: dict[str, int] = {}
+    for shot in db.get("shots", []):
+        project_id = str(shot.get("project_id") or "")
+        shot_counts[project_id] = shot_counts.get(project_id, 0) + 1
+    projects = []
+    for project in db["projects"]:
+        item = dict(project)
+        item["shot_count"] = shot_counts.get(str(project.get("id")), 0)
+        item["archived"] = bool(project.get("archived", False))
+        item["has_export"] = (
+            PROJECTS_DIR / str(project.get("id")) / "exports" / "package" / "export_verification.json"
+        ).exists()
+        projects.append(item)
+    return {"projects": projects}
 
 
 @router.post("")
@@ -56,6 +80,7 @@ def create_project(payload: ProjectCreate):
         "voice_style": payload.voice_style,
         "video_ratio": payload.video_ratio,
         "status": "created",
+        "archived": False,
         "created_at": now,
         "updated_at": now,
     }
@@ -140,13 +165,21 @@ def get_project(project_id: str):
 
 
 @router.post("/{project_id}/rewrite")
-def rewrite(project_id: str):
+def rewrite(project_id: str, payload: RewritePayload | None = None):
     db = load_db()
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
         raise HTTPException(404, "Project not found")
     try:
-        result = rewrite_script(project["raw_script"], project.get("script_style", "纪实故事型"))
+        if payload and payload.opening_preserve_chars is not None:
+            if not 1 <= payload.opening_preserve_chars <= 500:
+                raise HTTPException(400, "Opening preserve range must be between 1 and 500 characters")
+            preserve_rule = f"chars_{payload.opening_preserve_chars}"
+        else:
+            preserve_rule = (payload.opening_preserve_rule if payload else "auto")
+        if preserve_rule not in {"auto", "first_sentence", "first_paragraph"} and not preserve_rule.startswith("chars_"):
+            raise HTTPException(400, "Invalid opening preserve rule")
+        result = rewrite_script(project["raw_script"], project.get("script_style", "纪实故事型"), preserve_rule)
     except RewriteQualityError as exc:
         detail = exc.result.get("rewrite_error") or str(exc)
         raise HTTPException(422, detail) from exc
@@ -156,10 +189,41 @@ def rewrite(project_id: str):
     project["rewrite_comparison"] = result.get("rewrite_comparison", {})
     project["rewrite_difference"] = result.get("rewrite_difference", 0)
     project["rewrite_attempts"] = result.get("rewrite_attempts", 1)
+    project["opening_preserve_rule"] = preserve_rule
+    project["opening_preserve_chars"] = payload.opening_preserve_chars if payload else None
     project["status"] = "script_ready"
     project["updated_at"] = datetime.now().isoformat(timespec="seconds")
     save_db(db)
     return result
+
+
+@router.post("/{project_id}/merge-script-paragraphs")
+def merge_script_paragraphs(project_id: str, payload: MergeParagraphsPayload):
+    db = load_db()
+    project = next((p for p in db["projects"] if p["id"] == project_id), None)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    source = payload.rewritten_script.strip()
+    if not source:
+        raise HTTPException(400, "Rewritten script must not be empty")
+    before_count = len([line for line in source.splitlines() if line.strip()])
+    merged = merge_short_script_paragraphs(source)
+    after_count = len([line for line in merged.splitlines() if line.strip()])
+    if "".join(source.split()) != "".join(merged.split()):
+        raise HTTPException(500, "Paragraph merge unexpectedly changed script content")
+    comparison = compare_scripts(project.get("raw_script", ""), merged)
+    project["rewritten_script"] = merged
+    project["rewrite_comparison"] = comparison
+    project["rewrite_difference"] = comparison["overall_difference"]
+    project["status"] = "script_ready"
+    project["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    save_db(db)
+    return {
+        "rewritten_script": merged,
+        "before_count": before_count,
+        "after_count": after_count,
+        "rewrite_comparison": comparison,
+    }
 
 
 @router.patch("/{project_id}/script")
@@ -177,6 +241,9 @@ def update_script(project_id: str, payload: ScriptUpdate):
         project["name"] = name
     if payload.rewritten_script is not None:
         project["rewritten_script"] = payload.rewritten_script
+        comparison = compare_scripts(project.get("raw_script", ""), payload.rewritten_script)
+        project["rewrite_comparison"] = comparison
+        project["rewrite_difference"] = comparison["overall_difference"]
         project["status"] = "script_ready"
     if payload.title_line1 is not None:
         if len(payload.title_line1.strip()) > 9:
@@ -188,6 +255,8 @@ def update_script(project_id: str, payload: ScriptUpdate):
         project["title_line2"] = payload.title_line2
     if payload.title_line1 is not None or payload.title_line2 is not None:
         project["title_full"] = f"{payload.title_line1 or ''} {payload.title_line2 or ''}"
+    if payload.archived is not None:
+        project["archived"] = payload.archived
     project["updated_at"] = datetime.now().isoformat(timespec="seconds")
     save_db(db)
     return {"status": "saved"}

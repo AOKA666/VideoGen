@@ -18,9 +18,12 @@ from services.text_service import (  # noqa: E402
     RECENT_GUOZHIJILIANG_OPENINGS,
     RECENT_GUOZHIJILIANG_PEOPLE,
     build_guozhijiliang_script_prompt_v2,
+    build_rewrite_prompt,
     choose_guozhijiliang_seed,
     clean_shot_visual_terms,
     cover_title_needs_rewrite,
+    ensure_original_opening,
+    extract_opening_hook,
     generate_viral_title,
     generate_shots,
     guozhijiliang_opening_needs_rewrite,
@@ -31,6 +34,35 @@ from services.text_service import (  # noqa: E402
 
 
 class ShotTagGenerationTests(unittest.TestCase):
+    def test_opening_hook_uses_complete_sentences_between_20_and_35_chars(self) -> None:
+        source = "他拒绝了所有人的劝告。因为那个箱子里，藏着不能公开的秘密。后面的故事继续。"
+
+        self.assertEqual("他拒绝了所有人的劝告。因为那个箱子里，藏着不能公开的秘密。", extract_opening_hook(source))
+
+    def test_opening_hook_caps_an_overlong_first_sentence_at_a_clause(self) -> None:
+        source = "美国海关突然扣下他的行李箱，并且封锁了所有消息，因为他们真正害怕的根本不是箱子里的几张纸。后文。"
+        hook = extract_opening_hook(source)
+
+        self.assertGreaterEqual(len(hook), 20)
+        self.assertLessEqual(len(hook), 35)
+        self.assertTrue(hook.endswith(("，", "。", "！", "？", ",")))
+
+    def test_opening_hook_supports_user_selected_ranges(self) -> None:
+        source = "第一句话很短。第二句话用于测试用户选择的固定开头范围。\n\n这是第二段。"
+
+        self.assertEqual(source[:20], extract_opening_hook(source, "chars_20"))
+        self.assertEqual(source[:27], extract_opening_hook(source, "chars_27"))
+        self.assertEqual("第一句话很短。", extract_opening_hook(source, "first_sentence"))
+        self.assertEqual("第一句话很短。第二句话用于测试用户选择的固定开头范围。", extract_opening_hook(source, "first_paragraph"))
+
+    def test_original_opening_is_forced_back_after_rewrite(self) -> None:
+        source = "父亲去世那天，他明明活着，却不能回家奔丧。后面的原文内容。"
+        rewritten = "父亲离世时他没有回去。这里是完全改写后的正文。"
+
+        result = ensure_original_opening(source, rewritten)
+
+        self.assertTrue(result.startswith(extract_opening_hook(source)))
+
     def test_guozhijiliang_seed_pool_covers_book_people(self) -> None:
         seed_people = {person for person, _ in GUOZHIJILIANG_STORY_SEEDS}
 
@@ -88,6 +120,9 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertFalse(cover_title_needs_rewrite("美国扣下箱子", "到底怕什么"))
         self.assertFalse(cover_title_needs_rewrite("她捐出千万", "却穿15块鞋"))
         self.assertFalse(cover_title_needs_rewrite("普通老太太", "顶住中国芯片"))
+        self.assertTrue(cover_title_needs_rewrite("隐姓埋名二十年", "铸就雷达千里眼"))
+        self.assertTrue(cover_title_needs_rewrite("扎根荒原六十年", "为国奉献一生"))
+        self.assertFalse(cover_title_needs_rewrite("庆功名单翻遍", "为什么没有他"))
 
     def test_generate_viral_title_fails_instead_of_using_fallback(self) -> None:
         class FakeResponse:
@@ -110,7 +145,7 @@ class ShotTagGenerationTests(unittest.TestCase):
                 }, ensure_ascii=False).encode("utf-8")
 
         script = "美国海关扣下他的行李，硬说箱子里藏着机密。女儿病危那天，他仍然没有离开岗位。"
-        with patch.dict("os.environ", {"BIGMODEL_API_KEY": "test"}), patch(
+        with patch.dict("os.environ", {"MINIMAX_API_KEY": "test"}), patch(
             "services.text_service.urllib.request.urlopen",
             return_value=FakeResponse(),
         ):
@@ -140,7 +175,7 @@ class ShotTagGenerationTests(unittest.TestCase):
                     }]
                 }, ensure_ascii=False).encode("utf-8")
 
-        with patch.dict("os.environ", {"BIGMODEL_API_KEY": "test"}), patch(
+        with patch.dict("os.environ", {"MINIMAX_API_KEY": "test"}), patch(
             "services.text_service.urllib.request.urlopen",
             return_value=FakeResponse(),
         ):
@@ -165,6 +200,14 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertIn("一个局部爆点", source)
         self.assertIn("请一次生成12组标题", source)
 
+    def test_rewrite_prompt_only_keeps_book_promotion_when_source_has_it(self) -> None:
+        plain_prompt = build_rewrite_prompt("他拒绝高薪，回到祖国继续研究。", "纪实故事型", 1)
+        book_prompt = build_rewrite_prompt("翻开《国之脊梁》，你才知道他的选择。", "纪实故事型", 1)
+
+        self.assertIn("原文不包含带书或图书推荐内容", plain_prompt)
+        self.assertIn("禁止主动添加书名", plain_prompt)
+        self.assertIn("原文包含带书或图书推荐内容", book_prompt)
+
     def test_keywords_from_text_does_not_slice_script_fragments(self) -> None:
         tags = keywords_from_text("alpha beta gamma delta epsilon")
 
@@ -174,7 +217,7 @@ class ShotTagGenerationTests(unittest.TestCase):
     def test_generate_shots_leaves_tags_empty_when_ai_visuals_unavailable(self) -> None:
         script = "alpha beta gamma delta epsilon\nzeta eta theta iota kappa"
 
-        with patch.dict("os.environ", {"BIGMODEL_API_KEY": ""}):
+        with patch.dict("os.environ", {"MINIMAX_API_KEY": ""}):
             shots = generate_shots(script)
 
         self.assertGreaterEqual(len(shots), 1)

@@ -8,6 +8,7 @@ const ASSET_PAGE_SIZE = 60;
 const VOICE_OPTIONS = [
   { value: 'zh_male_m191_uranus_bigtts', label: '男声 · 沉稳叙事' },
   { value: 'zh_male_dongfanghaoran_uranus_bigtts', label: '男声 · 东方浩然' },
+  { value: 'zh_male_dayi_uranus_bigtts', label: '男声 · 大义' },
   { value: 'zh_female_vv_uranus_bigtts', label: '女声 · 清晰自然' },
 ];
 
@@ -31,6 +32,39 @@ function textToList(value) {
     .split(/[,，、\n]/)
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function stripScriptParagraphNumbers(value) {
+  return String(value || '').replace(/(^|\n)([ \t]*)\[\d+\][ \t]*/g, '$1$2').trim();
+}
+
+function numberScriptParagraphs(value) {
+  const script = stripScriptParagraphNumbers(value).replace(/\r\n?/g, '\n');
+  if (!script) return '';
+  return script.split(/\n\s*\n/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean)
+    .map((paragraph, index) => `[${index + 1}] ${paragraph}`)
+    .join('\n\n');
+}
+
+function projectStage(project) {
+  const status = project?.status || 'created';
+  if (project?.has_export || project?.export_url || project?.draft_url || project?.last_export_at) return { key: 'done', label: '已完成' };
+  if (['generating_shots', 'searching_images'].includes(status)) return { key: 'active', label: '处理中' };
+  if (status === 'created') return { key: 'todo', label: '等待二创' };
+  if (status === 'script_ready') return { key: 'todo', label: '文案已完成' };
+  if (status === 'shots_ready') return { key: 'todo', label: project?.voice_url ? '等待标题封面' : '等待配音' };
+  if (status === 'search_failed') return { key: 'todo', label: '图片处理失败' };
+  if (project?.cover_url) return { key: 'todo', label: '可以导出' };
+  return { key: 'todo', label: '待继续' };
+}
+
+function formatProjectTime(value) {
+  if (!value) return '—';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
 }
 
 function emptyTagForm() {
@@ -92,14 +126,19 @@ function App() {
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
   const [rawScriptDraft, setRawScriptDraft] = useState('');
+  const [rewrittenScriptEditor, setRewrittenScriptEditor] = useState('');
   const [aiScriptPerson, setAiScriptPerson] = useState('');
   const [aiScriptAngle, setAiScriptAngle] = useState('');
   const [processingImage, setProcessingImage] = useState('');
   const [generatingShotId, setGeneratingShotId] = useState('');
+  const [recognizingShotIds, setRecognizingShotIds] = useState(new Set());
   const [imagePromptEditors, setImagePromptEditors] = useState({});
   const [materialSourceStrategy, setMaterialSourceStrategy] = useState('library_first');
+  const [openingPreserveChars, setOpeningPreserveChars] = useState(0);
   const [voiceType, setVoiceType] = useState(VOICE_OPTIONS[0].value);
   const [speechRate, setSpeechRate] = useState(0);
+  const [voicePreviewUrl, setVoicePreviewUrl] = useState('');
+  const [previewingVoice, setPreviewingVoice] = useState(false);
   const [projectNameDraft, setProjectNameDraft] = useState('');
   const [titleLine1, setTitleLine1] = useState('');
   const [titleLine2, setTitleLine2] = useState('');
@@ -117,13 +156,19 @@ function App() {
   const [selectedAssetIds, setSelectedAssetIds] = useState(new Set());
   const [visibleAssetCount, setVisibleAssetCount] = useState(ASSET_PAGE_SIZE);
   const [assetTypeFilter, setAssetTypeFilter] = useState('all');
+  const [projectSearch, setProjectSearch] = useState('');
+  const [projectFilter, setProjectFilter] = useState('current');
   const folderFallbackRef = useRef(null);
   const uploadInputRef = useRef(null);
   const coverInputRef = useRef(null);
   const musicInputRef = useRef(null);
   const musicVoiceInputRef = useRef(null);
   const musicPreviewRef = useRef(null);
+  const voicePreviewRef = useRef(null);
+  const playVoicePreviewAfterLoadRef = useRef(false);
   const lastProjectStatusRef = useRef('');
+  const rawScriptRef = useRef(null);
+  const rewrittenScriptDirtyRef = useRef(false);
 
   const activeLibrary = validLibrary(library) ? library : null;
   const selectedAssets = useMemo(() => {
@@ -304,6 +349,17 @@ function App() {
   }, [backgroundMusicVolume, backgroundMusicId]);
 
   useEffect(() => {
+    if (rewrittenScriptDirtyRef.current) return;
+    setRewrittenScriptEditor(numberScriptParagraphs(project?.rewritten_script || ''));
+  }, [project?.id, project?.rewritten_script]);
+
+  useEffect(() => {
+    const savedChars = Number(project?.opening_preserve_chars || 0);
+    const ruleMatch = String(project?.opening_preserve_rule || '').match(/^chars_(\d+)$/);
+    setOpeningPreserveChars(savedChars || Number(ruleMatch?.[1] || 0));
+  }, [project?.id]);
+
+  useEffect(() => {
     const player = musicPreviewRef.current;
     if (!player || !Number.isFinite(player.duration)) return;
     player.currentTime = Math.min(
@@ -311,6 +367,17 @@ function App() {
       Math.max(player.duration - 0.1, 0),
     );
   }, [backgroundMusicStart, backgroundMusicId]);
+
+  useEffect(() => {
+    if (!voicePreviewUrl || !playVoicePreviewAfterLoadRef.current) return;
+    playVoicePreviewAfterLoadRef.current = false;
+    const player = voicePreviewRef.current;
+    if (!player) return;
+    player.currentTime = 0;
+    player.play().catch(() => {
+      setMessage('试听已生成，请点击播放器开始播放');
+    });
+  }, [voicePreviewUrl]);
 
   useEffect(() => {
     if (!assets.some((asset) => asset.analysis_status === 'analyzing')) return undefined;
@@ -331,7 +398,7 @@ function App() {
 
   useEffect(() => {
     const activeStatuses = ['pending_search', 'analyzing_intent', 'searching'];
-    if (!projectId || !shots.some((shot) => activeStatuses.includes(shot.status)) && project?.status !== 'searching_images') return undefined;
+    if (!projectId || !shots.some((shot) => activeStatuses.includes(shot.status)) && !['generating_shots', 'searching_images'].includes(project?.status)) return undefined;
     const timer = window.setInterval(() => {
       refreshProject(projectId);
     }, 1500);
@@ -418,16 +485,27 @@ function App() {
   }
 
   async function rewrite() {
-    const data = await run('二创文案', () => request(`/api/projects/${projectId}/rewrite`, { method: 'POST' }));
+    rewrittenScriptDirtyRef.current = false;
+    const data = await run('二创文案', () => request(`/api/projects/${projectId}/rewrite`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(openingPreserveChars
+        ? { opening_preserve_chars: openingPreserveChars }
+        : { opening_preserve_rule: 'auto' }),
+    }));
     if (data) await refreshAll(projectId);
   }
 
   async function saveScript() {
-    await run('保存文案', () => request(`/api/projects/${projectId}/script`, {
+    const rewrittenScript = stripScriptParagraphNumbers(rewrittenScriptEditor);
+    const data = await run('保存文案', () => request(`/api/projects/${projectId}/script`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ rewritten_script: project.rewritten_script }),
+      body: JSON.stringify({ rewritten_script: rewrittenScript }),
     }));
+    if (!data) return;
+    rewrittenScriptDirtyRef.current = false;
+    setRewrittenScriptEditor(numberScriptParagraphs(rewrittenScript));
     await refreshAll(projectId);
   }
 
@@ -456,14 +534,14 @@ function App() {
       await request(`/api/projects/${projectId}/script`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rewritten_script: project.rewritten_script }),
+        body: JSON.stringify({ rewritten_script: stripScriptParagraphNumbers(rewrittenScriptEditor) }),
       });
       await request(
         `/api/projects/${projectId}/shots?image_search_provider=${imageSearchProvider}&material_source_strategy=${materialSourceStrategy}`,
         { method: 'POST' },
       );
       await refreshAll(projectId);
-      setMessage('分镜已生成，正在分析关键词和搜索图片...');
+      setMessage('旧分镜已清空，正在后台重新生成分镜...');
     } catch (err) {
       setMessage(`生成分镜失败：${err.message}`);
     } finally {
@@ -486,7 +564,7 @@ function App() {
         { method: 'POST' },
       );
       await refreshAll(projectId);
-      setMessage('分镜已生成，正在分析关键词和搜索图片...');
+      setMessage('旧分镜已清空，正在后台重新生成分镜...');
     } catch (err) {
       setMessage(`生成分镜失败：${err.message}`);
     } finally {
@@ -571,6 +649,13 @@ function App() {
     if (!result) return;
     setMessage(result.queued ? `已重新提交 ${result.queued} 张图片进行标签识别` : '没有需要重试的图片');
     await refreshAll(projectId);
+  }
+
+  async function syncRemoteAssets() {
+    const result = await run('拉取远程素材', () => request('/api/assets/sync-remote', { method: 'POST' }));
+    if (!result) return;
+    await refreshAll(projectId);
+    setMessage(`远程同步完成：新增 ${result.added} 条，更新 ${result.updated} 条，共发现 ${result.remote_count} 条素材`);
   }
 
   function toggleAssetSelect(assetId) {
@@ -681,15 +766,108 @@ function App() {
     await refreshAll(projectId);
   }
 
+  async function setProjectArchived(item, archived) {
+    const result = await run(archived ? '归档项目' : '恢复项目', () => request(`/api/projects/${item.id}/script`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ archived }),
+    }));
+    if (!result) return;
+    if (archived && item.id === projectId) {
+      setTab('create');
+      await refreshAll('');
+    } else {
+      await refreshAll(projectId);
+    }
+  }
+
+  async function deleteProjectItem(item) {
+    if (!window.confirm(`确认删除项目「${item.name}」吗？项目文案、分镜、生成文件和导出包都会删除。`)) return;
+    const result = await run('删除项目', () => request(`/api/projects/${item.id}`, { method: 'DELETE' }));
+    if (!result) return;
+    if (item.id === projectId) {
+      setTab('create');
+      await refreshAll('');
+    } else {
+      await refreshAll(projectId);
+    }
+  }
+
+  async function mergeScriptParagraphs() {
+    const data = await run('合并段落', () => request(`/api/projects/${projectId}/merge-script-paragraphs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rewritten_script: stripScriptParagraphNumbers(rewrittenScriptEditor) }),
+    }));
+    if (!data) return;
+    setProject((current) => ({
+      ...current,
+      rewritten_script: data.rewritten_script,
+      rewrite_comparison: data.rewrite_comparison,
+      rewrite_difference: data.rewrite_comparison?.overall_difference,
+    }));
+    rewrittenScriptDirtyRef.current = false;
+    setRewrittenScriptEditor(numberScriptParagraphs(data.rewritten_script));
+    setMessage(`段落已从 ${data.before_count} 段合并为 ${data.after_count} 段，文案内容保持不变`);
+  }
+
+  async function reanalyzeShotImage(shotId) {
+    setRecognizingShotIds((current) => new Set(current).add(shotId));
+    setMessage('正在重新识别图片，可继续识别其他分镜');
+    try {
+      const result = await request(
+        `/api/projects/${projectId}/shots/${shotId}/reanalyze-image`,
+        { method: 'POST' },
+      );
+      closeImagePromptEditor(shotId);
+      setShots((current) => current.map((shot) => (shot.id === shotId ? result.shot : shot)));
+      setMessage(`镜头 ${result.shot.shot_index} 的图片信息已重新识别`);
+    } catch (err) {
+      setMessage(`重新识别失败：${err.message}`);
+    } finally {
+      setRecognizingShotIds((current) => {
+        const next = new Set(current);
+        next.delete(shotId);
+        return next;
+      });
+    }
+  }
+
+  async function updateShotVoiceText(shotId, voiceText) {
+    const text = String(voiceText || '').trim();
+    if (!text) {
+      setMessage('镜头文案不能为空');
+      return false;
+    }
+    const result = await run('保存镜头文案', () => request(`/api/projects/${projectId}/shots/${shotId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ voice_text: text }),
+    }));
+    if (!result) return false;
+    setShots((current) => current.map((shot) => (shot.id === shotId ? result.shot : shot)));
+    setMessage(`镜头 ${result.shot.shot_index} 文案已保存；如画面内容变化，请重新识别图片`);
+    return true;
+  }
+
   async function processGeneratedImage(assetId, operation) {
     const processingKey = `${assetId}:${operation}`;
-    const label = operation === 'crop-square' ? '裁剪图片' : 'Seedream 去水印';
+    const label = {
+      'crop-square': '裁剪图片',
+      grayscale: '转为黑白照片',
+      'remove-watermark': 'Seedream 去水印',
+    }[operation] || '处理图片';
     setProcessingImage(processingKey);
+    const startedAt = Date.now();
     try {
       await run(label, () => request(
         `/api/projects/${projectId}/generated-assets/${assetId}/${operation}`,
         { method: 'POST' },
       ));
+      if (operation === 'grayscale') {
+        const remaining = 700 - (Date.now() - startedAt);
+        if (remaining > 0) await new Promise((resolve) => window.setTimeout(resolve, remaining));
+      }
       await refreshAll(projectId);
     } finally {
       setProcessingImage('');
@@ -774,6 +952,32 @@ function App() {
     await refreshAll(projectId);
     setTab('cover');
     return true;
+  }
+
+  async function previewVoice() {
+    playVoicePreviewAfterLoadRef.current = true;
+    setPreviewingVoice(true);
+    setMessage('正在生成音色试听...');
+    try {
+      const response = await fetch(`${API}/api/projects/${projectId}/voice-preview`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ voice_type: voiceType, speech_rate: speechRate }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      setVoicePreviewUrl((previous) => {
+        if (previous) URL.revokeObjectURL(previous);
+        return url;
+      });
+      setMessage('试听已生成，内容为当前文案第一句');
+    } catch (err) {
+      playVoicePreviewAfterLoadRef.current = false;
+      setMessage(`试听失败：${err.message}`);
+    } finally {
+      setPreviewingVoice(false);
+    }
   }
 
   async function generateMusicVoiceAndSubtitles(musicId = backgroundMusicId, startSec = backgroundMusicStart) {
@@ -1017,6 +1221,9 @@ function App() {
     }
     if (project?.status === 'search_stopped') return message || '就绪';
     if (project?.status !== 'searching_images') return message || '就绪';
+    if (project.search_stage === 'generating_ai_images') {
+      return project.current_search_keyword || '正在使用 AI 生成分镜图片...';
+    }
     if (project.search_stage === 'stopping') return '正在停止图片搜索...';
     if (project.search_stage === 'analyzing_intent') {
       return project.current_search_keyword || '正在分析分镜关键词...';
@@ -1046,7 +1253,7 @@ function App() {
         </nav>
         <div className="project-picker">
           <ProjectSelect
-            projects={projects}
+            projects={projects.filter((item) => !item.archived).sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')))}
             projectId={projectId}
             open={projectMenuOpen}
             onOpenChange={setProjectMenuOpen}
@@ -1094,8 +1301,9 @@ function App() {
         </header>
 
         {tab === 'create' && (
-          <section className="band two-col">
-            <form onSubmit={createProject} className="panel">
+          <section className="band project-workspace">
+            <div className="two-col">
+              <form onSubmit={createProject} className="panel">
               <h2>创建项目</h2>
               <label>项目名称<input name="name" placeholder="可留空，系统自动取标题" /></label>
               <div className="ai-script-options">
@@ -1119,12 +1327,24 @@ function App() {
                 </button>
                 <button className="primary" disabled={!rawScriptDraft.trim()}><Save size={18} /> 创建并进入文案</button>
               </div>
-            </form>
-            <div className="notes">
+              </form>
+              <div className="notes">
               <h2>V1 范围</h2>
               <p>本版本不抓取外网视频，不自动判断版权，不直接生成成片。重点解决“文案拆成镜头，并帮你从素材库里找到合适画面”。</p>
               <p>选择素材后会先让你填写标签，再上传并自动打标；手动标签会优先保留。</p>
+              </div>
             </div>
+            <ProjectManager
+              projects={projects}
+              activeProjectId={projectId}
+              search={projectSearch}
+              filter={projectFilter}
+              onSearch={setProjectSearch}
+              onFilter={setProjectFilter}
+              onOpen={(id) => refreshAll(id)}
+              onArchive={setProjectArchived}
+              onDelete={deleteProjectItem}
+            />
           </section>
         )}
 
@@ -1152,6 +1372,7 @@ function App() {
                   <input ref={uploadInputRef} name="files" type="file" accept=".jpg,.jpeg,.png,.webp,.mp4,.mov" multiple onChange={handleUploadPick} />
                   <span>{pendingUpload ? `已选择 ${pendingUpload.files.length} 个文件` : '选择图片或视频后先设置标签'}</span>
                   <div className="asset-upload-actions">
+                    <button type="button" onClick={syncRemoteAssets}><Download size={18} /> 拉取远程素材</button>
                     <button type="button" onClick={retryAssetAnalysis}><RefreshCw size={18} /> 重试标签识别</button>
                     <button className="primary" type="button" onClick={() => uploadInputRef.current?.click()}><ImagePlus size={18} /> 选择素材</button>
                   </div>
@@ -1207,13 +1428,36 @@ function App() {
           <section className="band two-col script-grid">
             <div className="panel">
               <h2>原始文案</h2>
-              <textarea readOnly value={project.raw_script} rows="18" />
+              <textarea
+                ref={rawScriptRef}
+                readOnly
+                value={project.raw_script}
+                rows="18"
+                onSelect={(event) => {
+                  const start = event.currentTarget.selectionStart;
+                  const end = event.currentTarget.selectionEnd;
+                  if (start === 0 && end > 0) {
+                    setOpeningPreserveChars(end);
+                    setMessage(`已选择原始文案开头 ${end} 字，生成二创时将保持不变`);
+                  } else if (start > 0 && end > start) {
+                    setMessage('开头保护范围必须从原始文案第一个字开始选择');
+                  }
+                }}
+              />
+              <div className="opening-selection-hint">
+                <span>{openingPreserveChars ? `已选中开头 ${openingPreserveChars} 字保持不变` : '请从第一个字开始拖选需要保持不变的开头；未选择时使用智能前三秒'}</span>
+                {openingPreserveChars > 0 && <button type="button" onClick={() => {
+                  setOpeningPreserveChars(0);
+                  rawScriptRef.current?.setSelectionRange(0, 0);
+                }}>清除选区</button>}
+              </div>
               <label className="source-strategy">
                 素材来源策略
                 <select value={materialSourceStrategy} onChange={(event) => setMaterialSourceStrategy(event.target.value)}>
                   <option value="library_first">优先素材库，缺失时联网搜索</option>
                   <option value="library_only">仅使用素材库</option>
                   <option value="web_only">仅联网搜索</option>
+                  <option value="ai_only">仅使用 AI 生成</option>
                 </select>
               </label>
               <div className="actions raw-script-actions">
@@ -1231,7 +1475,10 @@ function App() {
             <div className="panel">
               <div className="row">
                 <h2>二创口播稿</h2>
-                <button onClick={rewrite}><RefreshCw size={18} /> 生成</button>
+                <div className="actions">
+                  <button onClick={mergeScriptParagraphs}><Archive size={18} /> 合并段落</button>
+                  <button onClick={rewrite}><RefreshCw size={18} /> 生成</button>
+                </div>
               </div>
               {project.rewrite_comparison && (
                 <p>
@@ -1240,13 +1487,23 @@ function App() {
                   {' · '}语义相似度：{project.rewrite_comparison.semantic_similarity ?? '-'}%
                 </p>
               )}
-              <textarea value={project.rewritten_script || ''} rows="18" onChange={(e) => setProject({ ...project, rewritten_script: e.target.value })} />
+              <textarea
+                value={rewrittenScriptEditor}
+                rows="18"
+                onChange={(event) => {
+                  rewrittenScriptDirtyRef.current = true;
+                  setRewrittenScriptEditor(event.target.value);
+                }}
+                onBlur={() => setRewrittenScriptEditor((current) => numberScriptParagraphs(current))}
+              />
+              <small className="raw-script-hint">可直接修改文案，段落长度和段内换行不受限制；[1]、[2] 等序号仅用于查看段数，保存和生成分镜时不会写入正文。</small>
               <label className="source-strategy">
                 素材来源策略
                 <select value={materialSourceStrategy} onChange={(event) => setMaterialSourceStrategy(event.target.value)}>
                   <option value="library_first">优先素材库，缺失时联网搜索</option>
                   <option value="library_only">仅使用素材库</option>
                   <option value="web_only">仅联网搜索</option>
+                  <option value="ai_only">仅使用 AI 生成</option>
                 </select>
               </label>
               <div className="actions">
@@ -1323,10 +1580,14 @@ function App() {
                   onGenerate={(prompt) => generateImage(shot.id, prompt)}
                   onRetry={() => retryImageSearch(shot.id, 'so')}
                   onTencentRetry={() => retryImageSearch(shot.id, 'tencent')}
+                  onReanalyzeImage={() => reanalyzeShotImage(shot.id)}
+                  isRecognizingImage={recognizingShotIds.has(shot.id)}
+                  onUpdateVoiceText={(text) => updateShotVoiceText(shot.id, text)}
                   processingImage={processingImage}
                   generatingShotId={generatingShotId}
                   onCrop={(assetId) => processGeneratedImage(assetId, 'crop-square')}
                   onRemoveWatermark={(assetId) => processGeneratedImage(assetId, 'remove-watermark')}
+                  onGrayscale={(assetId) => processGeneratedImage(assetId, 'grayscale')}
                   onManualUpload={(file) => uploadManualShotImage(shot.id, file)}
                   onLibraryUpload={() => setLibraryPickerShotId(shot.id)}
                 />
@@ -1351,6 +1612,10 @@ function App() {
               />
               <VoiceSelect value={voiceType} onChange={setVoiceType} />
               <SpeechRateSelect value={speechRate} onChange={setSpeechRate} />
+              <button type="button" onClick={previewVoice} disabled={previewingVoice}>
+                <Mic size={18} /> {previewingVoice ? '试听生成中…' : '试听音色'}
+              </button>
+              {voicePreviewUrl && <audio ref={voicePreviewRef} className="voice-preview-player" controls src={voicePreviewUrl} />}
               <button type="button" onClick={() => musicVoiceInputRef.current?.click()}>
                 <Music size={18} /> 上传音乐生成歌词字幕
               </button>
@@ -1382,10 +1647,14 @@ function App() {
                     onGenerate={(prompt) => generateImage(shot.id, prompt)}
                     onRetry={() => retryImageSearch(shot.id, 'so')}
                     onTencentRetry={() => retryImageSearch(shot.id, 'tencent')}
+                    onReanalyzeImage={() => reanalyzeShotImage(shot.id)}
+                    isRecognizingImage={recognizingShotIds.has(shot.id)}
+                    onUpdateVoiceText={(text) => updateShotVoiceText(shot.id, text)}
                     processingImage={processingImage}
                     generatingShotId={generatingShotId}
                     onCrop={(assetId) => processGeneratedImage(assetId, 'crop-square')}
                     onRemoveWatermark={(assetId) => processGeneratedImage(assetId, 'remove-watermark')}
+                    onGrayscale={(assetId) => processGeneratedImage(assetId, 'grayscale')}
                     onManualUpload={(file) => uploadManualShotImage(shot.id, file)}
                     onLibraryUpload={() => setLibraryPickerShotId(shot.id)}
                   />
@@ -1630,6 +1899,10 @@ function App() {
             <div className="export-actions">
               <VoiceSelect value={voiceType} onChange={setVoiceType} />
               <SpeechRateSelect value={speechRate} onChange={setSpeechRate} />
+              <button type="button" onClick={previewVoice} disabled={previewingVoice}>
+                <Mic size={18} /> {previewingVoice ? '试听生成中…' : '试听音色'}
+              </button>
+              {voicePreviewUrl && <audio ref={voicePreviewRef} className="voice-preview-player" controls src={voicePreviewUrl} />}
               <button onClick={generateVoiceAndSubtitles}><Mic size={18} /> 重新生成配音字幕</button>
               <button onClick={() => setTab('cover')}><Music size={18} /> 标题封面与配乐</button>
               <button onClick={openExportFolder}><FolderOpen size={18} /> 打开导出文件夹</button>
@@ -1727,6 +2000,77 @@ function App() {
           onSelect={uploadShotImageFromLibrary}
         />
       )}
+    </div>
+  );
+}
+
+function ProjectManager({ projects, activeProjectId, search, filter, onSearch, onFilter, onOpen, onArchive, onDelete }) {
+  const sorted = [...projects].sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')));
+  const recent = sorted.filter((item) => !item.archived).slice(0, 6);
+  const query = search.trim().toLowerCase();
+  const filtered = sorted.filter((item) => {
+    if (query && !String(item.name || '').toLowerCase().includes(query)) return false;
+    if (filter === 'archived') return item.archived;
+    if (item.archived) return false;
+    const stage = projectStage(item);
+    if (filter === 'active') return stage.key === 'active';
+    if (filter === 'todo') return stage.key === 'todo';
+    if (filter === 'done') return stage.key === 'done';
+    return true;
+  });
+
+  return (
+    <div className="project-manager panel">
+      <div className="project-manager-heading">
+        <div><h2>项目工作台</h2><small>优先继续最近项目，旧项目可归档后隐藏。</small></div>
+        <span>{filtered.length} 个项目</span>
+      </div>
+      {recent.length > 0 && (
+        <div className="recent-projects">
+          <strong>最近项目</strong>
+          <div>
+            {recent.map((item) => (
+              <button type="button" className={item.id === activeProjectId ? 'active' : ''} key={item.id} onClick={() => onOpen(item.id)}>
+                <span>{item.name}</span><small>{projectStage(item).label}</small>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+      <div className="project-manager-toolbar">
+        <input value={search} onChange={(event) => onSearch(event.target.value)} placeholder="搜索项目名称" />
+        <select value={filter} onChange={(event) => onFilter(event.target.value)}>
+          <option value="current">全部未归档</option>
+          <option value="active">进行中</option>
+          <option value="todo">待处理</option>
+          <option value="done">已完成</option>
+          <option value="archived">已归档</option>
+        </select>
+      </div>
+      <div className="project-table-wrap">
+        <table className="project-table">
+          <thead><tr><th>项目名称</th><th>当前阶段</th><th>修改时间</th><th>分镜数</th><th>操作</th></tr></thead>
+          <tbody>
+            {filtered.map((item) => {
+              const stage = projectStage(item);
+              return (
+                <tr key={item.id} className={item.id === activeProjectId ? 'active' : ''}>
+                  <td><button type="button" className="project-name-link" onClick={() => onOpen(item.id)}>{item.name}</button></td>
+                  <td><span className={`project-stage ${stage.key}`}>{stage.label}</span></td>
+                  <td>{formatProjectTime(item.updated_at)}</td>
+                  <td>{item.shot_count || 0}</td>
+                  <td><div className="project-row-actions">
+                    <button type="button" onClick={() => onOpen(item.id)}>继续</button>
+                    <button type="button" onClick={() => onArchive(item, !item.archived)}>{item.archived ? '恢复' : '归档'}</button>
+                    <button type="button" className="danger" onClick={() => onDelete(item)}>删除</button>
+                  </div></td>
+                </tr>
+              );
+            })}
+            {!filtered.length && <tr><td colSpan="5" className="empty-projects">没有符合条件的项目</td></tr>}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
@@ -1880,6 +2224,7 @@ function SearchProgress({ progress, project, onStop }) {
   const stopping = searching && stage === 'stopping';
   const stopped = project?.status === 'search_stopped';
   const analyzingIntent = project?.status === 'searching_images' && stage === 'analyzing_intent';
+  const generatingAiImages = searching && stage === 'generating_ai_images';
   const startedAt = project?.intent_analysis_started_at ? new Date(project.intent_analysis_started_at).getTime() : 0;
   const elapsed = startedAt ? Math.floor((Date.now() - startedAt) / 1000) : 0;
   const keywordEstimate = project?.intent_keyword_estimate || (progress.total ? `${progress.total}` : '');
@@ -1910,15 +2255,15 @@ function SearchProgress({ progress, project, onStop }) {
       <div className="progress-row">
         <strong>
           分镜图片进度
-          <span className={project?.image_search_provider === 'tencent' ? 'provider-badge tencent' : 'provider-badge'}>
-            {project?.image_search_provider === 'tencent' ? '腾讯云联网搜图' : '360 图片'}
+          <span className={project?.image_search_provider === 'tencent' && !generatingAiImages ? 'provider-badge tencent' : 'provider-badge'}>
+            {generatingAiImages ? 'AI 生成' : project?.image_search_provider === 'tencent' ? '腾讯云联网搜图' : '360 图片'}
           </span>
         </strong>
         <div className="progress-actions">
           <span>{label}</span>
           <span className="progress-count success">成功 {progress.success}</span>
           <span className="progress-count failed">失败 {progress.failed}</span>
-          {searching && (
+          {searching && !generatingAiImages && (
             <button type="button" className="danger compact-button" disabled={stopping} onClick={onStop}>
               <RefreshCw size={16} /> {stopping ? '停止中' : '停止搜索'}
             </button>
@@ -2257,7 +2602,12 @@ function AssetEditor({ asset, onClose, onSave, onDelete }) {
 function LibraryImagePicker({ assets, onClose, onSelect }) {
   const images = assets.filter((asset) => asset.file_type === 'image' && asset.is_available !== false);
   return (
-    <div className="modal-backdrop">
+    <div
+      className="modal-backdrop"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
       <div className="asset-editor library-image-picker">
         <div className="row">
           <div>
@@ -2304,14 +2654,23 @@ function ShotCard({
   onGenerate,
   onRetry,
   onTencentRetry,
+  onReanalyzeImage,
+  isRecognizingImage,
+  onUpdateVoiceText,
   processingImage,
   generatingShotId,
   onCrop,
   onRemoveWatermark,
+  onGrayscale,
   onManualUpload,
   onLibraryUpload,
 }) {
   const manualUploadRef = useRef(null);
+  const [editingVoiceText, setEditingVoiceText] = useState(false);
+  const [voiceTextDraft, setVoiceTextDraft] = useState(shot.voice_text || '');
+  useEffect(() => {
+    if (!editingVoiceText) setVoiceTextDraft(shot.voice_text || '');
+  }, [shot.voice_text, editingVoiceText]);
   const isGeneratingImage = generatingShotId === shot.id;
   const visibleAssets = [...assets]
     .sort((a, b) => (b.id === selectedAssetId ? 1 : 0) - (a.id === selectedAssetId ? 1 : 0))
@@ -2331,15 +2690,45 @@ function ShotCard({
       : '可重新搜索或生成占位图';
   const diagnosticText = diagnosticSummary(diagnostics);
   return (
-    <article className="shot-card">
+    <article className={isRecognizingImage ? 'shot-card recognizing-image' : 'shot-card'}>
       <div className="shot-main">
         <span className={`pill ${shot.status}`}>镜头 {shot.shot_index} · {shot.status}</span>
-        <h3>{shot.voice_text}</h3>
+        {editingVoiceText ? (
+          <div className="shot-voice-editor">
+            <textarea
+              value={voiceTextDraft}
+              onChange={(event) => setVoiceTextDraft(event.target.value)}
+              rows="4"
+              autoFocus
+            />
+            <div className="actions">
+              <button type="button" onClick={() => { setVoiceTextDraft(shot.voice_text || ''); setEditingVoiceText(false); }}>取消</button>
+              <button
+                type="button"
+                className="primary"
+                disabled={!voiceTextDraft.trim()}
+                onClick={async () => {
+                  if (await onUpdateVoiceText?.(voiceTextDraft)) setEditingVoiceText(false);
+                }}
+              >
+                <Save size={16} /> 保存镜头文案
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="shot-voice-display">
+            <h3>{shot.voice_text}</h3>
+            <button type="button" onClick={() => setEditingVoiceText(true)}>编辑镜头文案</button>
+          </div>
+        )}
         <p>画面描述：{shot.visual_need || '暂无描述'}</p>
-        <p>主体标签：{((shot.material_intent && shot.material_intent.objects) || []).join(' / ') || '—'}</p>
-        <p>场景标签：{((shot.material_intent && shot.material_intent.scenes) || []).join(' / ') || '—'}</p>
-        <p>关键词：{((shot.material_intent && shot.material_intent.keywords) || []).join(' / ') || '—'}</p>
+        <p>主体标签：{((shot.material_intent?.objects?.length ? shot.material_intent.objects : shot.object_tags) || shot.required_object || []).join(' / ') || '—'}</p>
+        <p>场景标签：{((shot.material_intent?.scenes?.length ? shot.material_intent.scenes : shot.scene_tags) || shot.required_scene || []).join(' / ') || '—'}</p>
+        <p>关键词：{((shot.material_intent?.keywords?.length ? shot.material_intent.keywords : shot.keywords) || []).join(' / ') || '—'}</p>
         <p>搜索关键词：{(shot.search_keywords || []).join(' / ') || shot.current_search_keyword || '—'}</p>
+        <button className="reanalyze-image-button" type="button" onClick={onReanalyzeImage} disabled={!canRetry || isRecognizingImage}>
+          <RefreshCw size={18} /> {isRecognizingImage ? '识别中…' : '重新识别图片'}
+        </button>
         {diagnosticText && <p className="shot-diagnostic">{diagnosticText}</p>}
       </div>
       <div className="shot-side">
@@ -2385,7 +2774,10 @@ function ShotCard({
             </div>
           )}
           {visibleAssets.map((item) => (
-            <div className={item.id === selectedAssetId ? 'image-choice selected' : 'image-choice'} key={item.id}>
+            <div
+              className={`${item.id === selectedAssetId ? 'image-choice selected' : 'image-choice'} ${processingImage === `${item.id}:grayscale` ? 'converting-grayscale' : ''}`.trim()}
+              key={item.id}
+            >
               <div
                 className="image-choice-main"
                 role="button"
@@ -2423,6 +2815,18 @@ function ShotCard({
                       </button>
                       <button
                         type="button"
+                        title="一键转为黑白照片"
+                        aria-label="转为黑白照片"
+                        disabled={Boolean(processingImage) || item.is_grayscale}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          onGrayscale?.(item.id);
+                        }}
+                      >
+                        <Film size={16} />
+                      </button>
+                      <button
+                        type="button"
                         title="使用 Seedream 去除水印"
                         aria-label="Seedream 去水印"
                         disabled={Boolean(processingImage)}
@@ -2456,6 +2860,12 @@ function ShotCard({
                   )}
                 />
               </div>
+              {processingImage === `${item.id}:grayscale` && (
+                <div className="grayscale-processing-overlay">
+                  <Film size={22} />
+                  <strong>黑白转换中</strong>
+                </div>
+              )}
             </div>
           ))}
           {Array.from({ length: placeholders }).map((_, index) => (

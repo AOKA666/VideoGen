@@ -62,23 +62,21 @@ def build_material_intent(shot: dict) -> dict:
     ai_scenes = clean_asset_tags("scene", shot.get("scene_tags") or [])
     ai_keywords = clean_asset_tags("keywords", shot.get("keywords") or [])
 
-    if ai_objects or ai_scenes or ai_keywords:
-        return {
-            "objects": ai_objects[:4],
-            "scenes": ai_scenes[:3],
-            "keywords": ai_keywords[:5],
-        }
+    # Fill each category independently. A valid scene tag must not prevent an
+    # empty object or keyword category from using its fallback.
+    objects = ai_objects or clean_asset_tags("object", shot.get("required_object") or [])[:4]
+    scenes = ai_scenes or clean_asset_tags("scene", shot.get("required_scene") or [])[:3]
+    keywords = ai_keywords
 
-    # Fallback: use required_object / required_scene if AI tags are not yet available
-    objects = clean_asset_tags("object", shot.get("required_object") or [])[:4]
-    scenes = clean_asset_tags("scene", shot.get("required_scene") or [])[:3]
-    keywords: list[str] = []
-
-    if not objects and not scenes:
+    if not objects or not scenes or not keywords:
         # Last resort: use keywords_from_text (no more "老照片"/"历史档案" defaults)
         tags = keywords_from_text(f"{shot.get('voice_text', '')} {shot.get('visual_need', '')}")
-        objects = [str(x).strip() for x in tags.get("people") or [] if str(x).strip()][:4]
-        scenes = [str(x).strip() for x in tags.get("scene") or [] if str(x).strip()][:3]
+        if not objects:
+            objects = [str(x).strip() for x in tags.get("people") or [] if str(x).strip()][:4]
+        if not scenes:
+            scenes = [str(x).strip() for x in tags.get("scene") or [] if str(x).strip()][:3]
+        if not keywords:
+            keywords = clean_asset_tags("keywords", shot.get("search_keywords") or [])[:5]
 
     return {
         "objects": objects,

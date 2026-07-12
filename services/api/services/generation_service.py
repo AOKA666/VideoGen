@@ -203,8 +203,12 @@ def generate_svg_placeholder(path: Path, shot: dict) -> str:
 
 def build_image_prompt(shot: dict) -> str:
     person_names = _shot_person_names(shot)
+    raw_visual_need = str(shot.get("visual_need") or "").strip()
+    if raw_visual_need == "待AI生成画面描述":
+        voice_text = str(shot.get("voice_text") or "").strip()
+        raw_visual_need = f"根据这段旁白呈现具体的历史纪实场景：{voice_text[:120]}"
     visual_need = _remove_person_names(
-        str(shot.get("visual_need") or "历史纪实画面"),
+        raw_visual_need or "历史纪实画面",
         person_names,
     )
     person_description = _anonymous_person_description(shot, person_names)

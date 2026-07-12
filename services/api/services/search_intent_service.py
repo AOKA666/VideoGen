@@ -36,12 +36,12 @@ class SearchIntentBatchError(RuntimeError):
     pass
 
 
-def bigmodel_endpoint() -> str:
-    return os.getenv("BIGMODEL_ENDPOINT", "https://open.bigmodel.cn/api/paas/v4")
+def minimax_endpoint() -> str:
+    return os.getenv("MINIMAX_ENDPOINT", "https://api.minimaxi.com/v1")
 
 
-def bigmodel_model() -> str:
-    return os.getenv("BIGMODEL_MODEL", "glm-5.1")
+def minimax_model() -> str:
+    return os.getenv("MINIMAX_MODEL", "MiniMax-M3")
 
 
 def _extract_json_object(text: str) -> str:
@@ -167,12 +167,41 @@ def sanitize_intent(result: dict, _shot_text: str = "", fallback_values: list[st
     }
 
 
-def _request_glm(payload: dict, timeout: int) -> dict:
-    api_key = os.getenv("BIGMODEL_API_KEY", "").strip()
+def fallback_intent_for_shot(shot: dict) -> dict:
+    values = [
+        *(shot.get("person_names") or []),
+        shot.get("shot_description") or "",
+        shot.get("voice_text") or "",
+    ]
+    for value in values:
+        for part in re.split(r"[\s,，、。！？；;：:|/]+", str(value or "")):
+            candidate = normalize_core_keyword(part)
+            if len(candidate) > MAX_KEYWORD_CHARS:
+                candidate = candidate[:MAX_KEYWORD_CHARS]
+            try:
+                keyword = validate_core_keyword(candidate)
+                return {
+                    "core_keyword": keyword,
+                    "search_keywords": [keyword],
+                    "provider": "local_keyword_fallback",
+                    "error": "MiniMax 关键词不合格，已使用本地兜底",
+                }
+            except ValueError:
+                continue
+    return {
+        "core_keyword": "历史人物事件",
+        "search_keywords": ["历史人物事件"],
+        "provider": "local_keyword_fallback",
+        "error": "MiniMax 关键词不合格，已使用通用兜底",
+    }
+
+
+def _request_minimax(payload: dict, timeout: int) -> dict:
+    api_key = os.getenv("MINIMAX_API_KEY", "").strip()
     if not api_key:
-        raise SearchIntentBatchError("BIGMODEL_API_KEY 未配置，无法使用 GLM 生成核心关键词")
+        raise SearchIntentBatchError("MINIMAX_API_KEY 未配置，无法使用 MiniMax 生成核心关键词")
     req = urllib.request.Request(
-        f"{bigmodel_endpoint().rstrip('/')}/chat/completions",
+        f"{minimax_endpoint().rstrip('/')}/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         method="POST",
@@ -211,7 +240,7 @@ def ai_search_intent(shot_text: str, full_text: str = "") -> dict:
 {{"core_keyword": "一个完整核心关键词"}}
 """.strip()
     payload = {
-        "model": bigmodel_model(),
+        "model": minimax_model(),
         "messages": [
             {"role": "system", "content": "你只输出可解析 JSON，并直接选择图片搜索核心关键词。"},
             {"role": "user", "content": prompt},
@@ -224,11 +253,11 @@ def ai_search_intent(shot_text: str, full_text: str = "") -> dict:
         "response_format": {"type": "json_object"},
     }
     try:
-        result = _request_glm(payload, timeout=60)
-        result["provider"] = bigmodel_model()
+        result = _request_minimax(payload, timeout=60)
+        result["provider"] = minimax_model()
         return sanitize_intent(result, shot_text)
     except (urllib.error.URLError, TimeoutError, KeyError, ValueError, json.JSONDecodeError) as exc:
-        raise SearchIntentBatchError(f"GLM 核心关键词生成失败：{str(exc)[:300]}") from exc
+        raise SearchIntentBatchError(f"MiniMax 核心关键词生成失败：{str(exc)[:300]}") from exc
 
 
 def ai_search_intents(shots: list[dict], full_text: str, *, timeout: int = 90, retries: int = 1) -> dict[str, dict]:
@@ -275,7 +304,7 @@ def ai_search_intents(shots: list[dict], full_text: str, *, timeout: int = 90, r
 }}
 """.strip()
     payload = {
-        "model": bigmodel_model(),
+        "model": minimax_model(),
         "messages": [
             {"role": "system", "content": "你只输出可解析 JSON，并直接选择每个分镜的图片搜索核心关键词。"},
             {"role": "user", "content": prompt},
@@ -291,7 +320,7 @@ def ai_search_intents(shots: list[dict], full_text: str, *, timeout: int = 90, r
     last_error: Exception | None = None
     for _attempt in range(max(1, retries + 1)):
         try:
-            result = _request_glm(payload, timeout=timeout)
+            result = _request_minimax(payload, timeout=timeout)
             raw_items = result.get("shots") if isinstance(result, dict) else []
             intents: dict[str, dict] = {}
             valid_ids = {str(item["id"]) for item in shot_items}
@@ -301,19 +330,34 @@ def ai_search_intents(shots: list[dict], full_text: str, *, timeout: int = 90, r
                 shot_id = str(item.get("id") or "")
                 if shot_id not in valid_ids:
                     continue
-                item["provider"] = bigmodel_model()
+                item["provider"] = minimax_model()
                 source = next((shot for shot in shot_items if shot["id"] == shot_id), {})
                 shot_text = f"{source.get('voice_text', '')} {source.get('shot_description', '')}"
-                intents[shot_id] = sanitize_intent(item, shot_text)
+                try:
+                    intents[shot_id] = sanitize_intent(
+                        item,
+                        shot_text,
+                        fallback_values=source.get("person_names") or [],
+                    )
+                except ValueError:
+                    try:
+                        intents[shot_id] = ai_search_intent(shot_text, full_text)
+                    except Exception:
+                        intents[shot_id] = fallback_intent_for_shot(source)
             missing_ids = [shot["id"] for shot in shot_items if shot["id"] not in intents]
-            if missing_ids:
-                raise SearchIntentBatchError(f"GLM 返回缺少 {len(missing_ids)} 个分镜核心关键词")
+            for missing_id in missing_ids:
+                source = next((shot for shot in shot_items if shot["id"] == missing_id), {})
+                shot_text = f"{source.get('voice_text', '')} {source.get('shot_description', '')}"
+                try:
+                    intents[missing_id] = ai_search_intent(shot_text, full_text)
+                except Exception:
+                    intents[missing_id] = fallback_intent_for_shot(source)
             return intents
         except SearchIntentBatchError as exc:
             last_error = exc
         except (urllib.error.URLError, TimeoutError, KeyError, ValueError, json.JSONDecodeError) as exc:
             last_error = exc
-    raise SearchIntentBatchError(f"GLM 核心关键词生成失败：{str(last_error)[:300]}")
+    raise SearchIntentBatchError(f"MiniMax 核心关键词生成失败：{str(last_error)[:300]}")
 
 
 def apply_intent_to_shot(shot: dict, intent: dict) -> dict:

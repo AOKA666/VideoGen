@@ -5,6 +5,7 @@ import hashlib
 import os
 import logging
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -53,6 +54,17 @@ TENCENT_RETRY_SUFFIXES = [
     "现场纪实",
     "新闻现场",
 ]
+_SEARCH_STOP_EVENTS: dict[str, threading.Event] = {}
+_SEARCH_STOP_EVENTS_LOCK = threading.Lock()
+
+
+def _search_stop_event(project_id: str) -> threading.Event:
+    with _SEARCH_STOP_EVENTS_LOCK:
+        return _SEARCH_STOP_EVENTS.setdefault(project_id, threading.Event())
+
+
+def clear_project_search_stop(project_id: str) -> None:
+    _search_stop_event(project_id).clear()
 
 
 def web_image_concurrency() -> int:
@@ -124,17 +136,18 @@ def recover_interrupted_searches(
     for project in db.get("projects", []):
         if project_id and project.get("id") != project_id:
             continue
-        if project.get("status") != "searching_images":
-            continue
-        updated_at = _timestamp(project.get("updated_at"))
-        if not force and updated_at and updated_at > cutoff:
-            continue
-
         active_shots = [
             shot for shot in db.get("shots", [])
             if shot.get("project_id") == project.get("id")
             and shot.get("status") in ACTIVE_SEARCH_STATUSES
         ]
+        stale_stage = project.get("search_stage") in {"pending", "generating_shots", "analyzing_intent", "downloading", "retrying_failed"}
+        if project.get("status") != "searching_images" and not active_shots and not stale_stage:
+            continue
+        updated_at = _timestamp(project.get("updated_at"))
+        if not force and updated_at and updated_at > cutoff:
+            continue
+
         if not active_shots:
             project["status"] = "shots_ready"
             project["search_stage"] = "done"
@@ -173,6 +186,8 @@ def recover_interrupted_searches(
 
 
 def _project_stop_requested(project_id: str) -> bool:
+    if _search_stop_event(project_id).is_set():
+        return True
     db = load_db()
     project = next((p for p in db.get("projects", []) if p.get("id") == project_id), None)
     return bool(project and project.get("search_stop_requested"))
@@ -200,6 +215,7 @@ def request_stop_project_search(db: dict, project_id: str) -> None:
     project = next((p for p in db.get("projects", []) if p.get("id") == project_id), None)
     if not project:
         return
+    _search_stop_event(project_id).set()
     project["search_stop_requested"] = True
     _mark_project_search_stopped(db, project_id)
     project["search_stop_requested"] = True
@@ -235,6 +251,7 @@ def reset_project_web_images(db: dict, project_id: str) -> None:
 
 
 def mark_project_searching(db: dict, project_id: str) -> None:
+    clear_project_search_stop(project_id)
     now = _now()
     total = len([shot for shot in db.get("shots", []) if shot.get("project_id") == project_id])
     project = next((item for item in db.get("projects", []) if item.get("id") == project_id), None)
@@ -258,7 +275,9 @@ def mark_project_searching(db: dict, project_id: str) -> None:
         shot["match_score"] = 0
         shot["status"] = "pending_search"
         shot["downloaded_image_count"] = 0
-        shot["search_keywords"] = []
+        # Keep the structured search terms generated with the shot. The intent
+        # stage may refine them, but a later failure must not erase good data.
+        shot["search_keywords"] = list(shot.get("search_keywords") or [])
         shot.pop("archive_keywords", None)
         shot["web_image_seen_urls"] = []
         shot["web_image_seen_hashes"] = []
@@ -930,6 +949,10 @@ def _run_project_web_image_search(project_id: str) -> None:
             )
         except SearchIntentBatchError as exc:
             db = load_db()
+            if _project_stop_requested(project_id):
+                _mark_project_search_stopped(db, project_id)
+                save_db(db)
+                return
             project = next((p for p in db.get("projects", []) if p.get("id") == project_id), None)
             if project:
                 project["status"] = "search_failed"

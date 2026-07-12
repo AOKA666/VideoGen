@@ -15,7 +15,7 @@ from pydantic import BaseModel
 
 from services.asset_source_service import normalize_asset_source_fields
 from services.asset_service import analyze_asset, detect_file_type, new_id, safe_storage_name
-from services.r2_storage import R2StorageError, delete_asset_object, ensure_asset_local, upload_asset, upload_asset_metadata
+from services.r2_storage import R2StorageError, delete_asset_object, ensure_asset_local, list_asset_metadata, upload_asset, upload_asset_metadata
 from services.store import ASSETS_DIR, load_db, public_url, save_db
 from services.video_ingest_service import process_video_asset, reanalyze_video_clip
 
@@ -218,6 +218,36 @@ def list_assets(q: str = ""):
             or needle in " ".join(a.get("keywords", []) + asset_objects(a) + a.get("scene", [])).lower()
         ]
     return {"assets": assets}
+
+
+@router.post("/sync-remote")
+def sync_remote_assets():
+    try:
+        remote_assets = list_asset_metadata()
+    except R2StorageError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+    db = load_db()
+    local_by_id = {str(item.get("id")): item for item in db.get("assets", [])}
+    added = updated = 0
+    for remote in remote_assets:
+        asset_id = str(remote["id"])
+        local = local_by_id.get(asset_id)
+        if local is None:
+            remote.pop("local_path", None)
+            db.setdefault("assets", []).append(remote)
+            local_by_id[asset_id] = remote
+            added += 1
+            continue
+        local_path = local.get("local_path")
+        before = dict(local)
+        local.update({key: value for key, value in remote.items() if key != "local_path"})
+        if local_path:
+            local["local_path"] = local_path
+        if local != before:
+            updated += 1
+    save_db(db)
+    return {"remote_count": len(remote_assets), "added": added, "updated": updated}
 
 
 @router.get("/{asset_id}/content")

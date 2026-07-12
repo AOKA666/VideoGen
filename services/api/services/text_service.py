@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 import re
+import time
 import urllib.error
 import urllib.request
 from collections import Counter
@@ -25,6 +27,8 @@ MIN_REWRITE_DIFFERENCE = 40
 MAX_REWRITE_ATTEMPTS = 3
 MAX_AUTO_TITLE_LENGTH = 9
 MAX_PUBLISH_SHORT_TITLE_LENGTH = 16
+OPENING_HOOK_MIN_CHARS = 20
+OPENING_HOOK_MAX_CHARS = 35
 TITLE_PUNCTUATION = re.compile(r"""[，。！？、；："'“”‘’《》【】（）—…\-.!?,;:()\[\]{}<>\s]""")
 WEAK_COVER_TITLE_PATTERNS = (
     "伟大",
@@ -40,6 +44,14 @@ WEAK_COVER_TITLE_PATTERNS = (
     "值得铭记",
     "科学家",
     "人物",
+    "铸就",
+    "成就",
+    "奉献",
+    "贡献",
+    "功勋",
+    "报国",
+    "守护中国",
+    "照亮中国",
 )
 COVER_TITLE_ATTRACTION_WORDS = (
     "扣下",
@@ -103,6 +115,15 @@ COVER_TITLE_SPOILER_COMBOS = (
     ("坠毁", "国家机密"),
     ("真相", "泪目"),
     ("真相", "曝光"),
+)
+TITLE_OPEN_LOOP_WORDS = (
+    "却", "竟", "反而", "偏偏", "不敢", "不能", "不许", "没", "没有", "为何",
+    "为什么", "到底", "凭什么", "谁", "真相", "最后", "消失", "扣下", "被骂",
+    "被拦", "炸掉", "抹掉", "坠毁", "病危", "临终", "拒绝", "撕毁", "封锁", "普通",
+)
+TITLE_SUMMARY_ENDINGS = (
+    "铸就", "成就", "造就", "建成", "研制成功", "创造奇迹", "为国争光", "奉献一生",
+    "守护祖国", "守护中国", "改变中国", "照亮中国", "功勋卓著", "终获成功",
 )
 RANDOM = random.SystemRandom()
 GUOZHIJILIANG_STORY_SEEDS = [
@@ -358,7 +379,7 @@ def normalize_auto_title(title: str, raw_script: str) -> str:
 
 
 def infer_title(raw_script: str) -> str:
-    api_key = os.getenv("BIGMODEL_API_KEY", "").strip()
+    api_key = os.getenv("MINIMAX_API_KEY", "").strip()
     if not api_key:
         return fallback_infer_title(raw_script)
     prompt = (
@@ -371,7 +392,7 @@ def infer_title(raw_script: str) -> str:
         '{"title": "项目标题"}'
     )
     payload = {
-        "model": bigmodel_model(),
+        "model": minimax_model(),
         "messages": [
             {"role": "system", "content": "你只输出可解析JSON。"},
             {"role": "user", "content": prompt},
@@ -386,7 +407,7 @@ def infer_title(raw_script: str) -> str:
     try:
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
-            f"{bigmodel_endpoint().rstrip('/')}/chat/completions",
+            f"{minimax_endpoint().rstrip('/')}/chat/completions",
             data=data,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             method="POST",
@@ -402,15 +423,45 @@ def infer_title(raw_script: str) -> str:
         return fallback_infer_title(raw_script)
 
 
-def extract_opening_hook(raw_script: str) -> str:
+def extract_opening_hook(raw_script: str, preserve_rule: str = "auto") -> str:
+    source = re.sub(r"\s+", "", str(raw_script or "").strip())
+    chars_match = re.fullmatch(r"chars_(\d+)", preserve_rule)
+    if chars_match:
+        char_count = max(1, min(int(chars_match.group(1)), 500))
+        return str(raw_script or "")[:char_count]
+    if preserve_rule == "first_paragraph":
+        paragraphs = re.split(r"\n\s*\n", str(raw_script or "").strip())
+        return paragraphs[0].strip() if paragraphs else ""
     sentences = split_sentences(raw_script)
-    for line in raw_script.splitlines():
-        cleaned = line.strip()
-        if cleaned and len(cleaned) <= 90:
-            return cleaned
-        if cleaned and sentences:
-            return sentences[0].strip()
-    return sentences[0].strip() if sentences else ""
+    if not sentences:
+        return ""
+    if preserve_rule == "first_sentence":
+        return sentences[0].strip()
+
+    selected = ""
+    for sentence in sentences:
+        candidate = f"{selected}{sentence.strip()}"
+        if len(candidate) <= OPENING_HOOK_MAX_CHARS:
+            selected = candidate
+            if len(selected) >= OPENING_HOOK_MIN_CHARS:
+                return selected
+            continue
+        break
+
+    if len(selected) >= OPENING_HOOK_MIN_CHARS:
+        return selected
+
+    # An unusually long first sentence still needs a deterministic boundary.
+    # Prefer a complete clause in the 20-35 character window; only fall back to
+    # a hard cap when the source contains no usable punctuation there.
+    window = source[:OPENING_HOOK_MAX_CHARS]
+    clause_ends = [
+        match.end() for match in re.finditer(r"[，,：:；;。！？!?]", window)
+        if match.end() >= OPENING_HOOK_MIN_CHARS
+    ]
+    if clause_ends:
+        return window[:clause_ends[-1]]
+    return window
 
 
 def is_strong_opening_hook(text: str) -> bool:
@@ -441,8 +492,8 @@ def build_fallback_hook(raw_script: str, title: str) -> str:
     return "很多人只看见了结果，却不知道背后那一次几乎没人能承受的选择。"
 
 
-def ensure_original_opening(raw_script: str, rewritten_script: str) -> str:
-    raw_hook = extract_opening_hook(raw_script)
+def ensure_original_opening(raw_script: str, rewritten_script: str, preserve_rule: str = "auto") -> str:
+    raw_hook = extract_opening_hook(raw_script, preserve_rule)
     if not raw_hook:
         return rewritten_script.strip()
 
@@ -500,18 +551,42 @@ def clean_rewritten_script(raw_script: str, rewritten_script: str) -> str:
     return "\n".join(lines).strip()
 
 
-def bigmodel_endpoint() -> str:
-    return os.getenv("BIGMODEL_ENDPOINT", "https://open.bigmodel.cn/api/paas/v4")
+def add_blank_lines_between_paragraphs(text: str) -> str:
+    paragraphs = [line.strip() for line in text.splitlines() if line.strip()]
+    return "\n\n".join(paragraphs)
 
 
-def bigmodel_model() -> str:
-    return os.getenv("BIGMODEL_MODEL", "glm-5.1")
+def merge_short_script_paragraphs(text: str, max_chars: int = 40) -> str:
+    """Merge adjacent short paragraphs without changing their text or order."""
+    paragraphs = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if len(paragraphs) < 2:
+        return str(text or "").strip()
+    merged: list[str] = []
+    current = ""
+    for paragraph in paragraphs:
+        candidate = f"{current}{paragraph}" if current else paragraph
+        if current and content_length(candidate) > max_chars:
+            merged.append(current)
+            current = paragraph
+        else:
+            current = candidate
+    if current:
+        merged.append(current)
+    return "\n\n".join(merged)
 
 
-def fallback_rewrite_script(raw_script: str, style: str = "纪实故事型") -> dict:
+def minimax_endpoint() -> str:
+    return os.getenv("MINIMAX_ENDPOINT", "https://api.minimaxi.com/v1")
+
+
+def minimax_model() -> str:
+    return os.getenv("MINIMAX_MODEL", "MiniMax-M3")
+
+
+def fallback_rewrite_script(raw_script: str, style: str = "纪实故事型", preserve_rule: str = "auto") -> dict:
     sentences = split_sentences(raw_script)
     title = infer_title(raw_script)
-    hook = extract_opening_hook(raw_script) or build_fallback_hook(raw_script, title)
+    hook = extract_opening_hook(raw_script, preserve_rule) or build_fallback_hook(raw_script, title)
     body = []
     if sentences:
         body.append(hook)
@@ -548,32 +623,42 @@ def ensure_min_rewrite_difference(result: dict) -> dict:
     return result
 
 
-def normalize_rewrite_result(result: dict, raw_script: str, style: str) -> dict:
+def normalize_rewrite_result(result: dict, raw_script: str, style: str, preserve_rule: str = "auto") -> dict:
     title = str(result.get("title") or infer_title(raw_script)).strip()
-    hook = extract_opening_hook(raw_script) or str(result.get("hook") or build_fallback_hook(raw_script, title)).strip()
+    hook = extract_opening_hook(raw_script, preserve_rule) or str(result.get("hook") or build_fallback_hook(raw_script, title)).strip()
     rewritten_script = str(result.get("rewritten_script") or "").strip()
     if not rewritten_script:
-        rewritten_script = fallback_rewrite_script(raw_script, style)["rewritten_script"]
+        rewritten_script = fallback_rewrite_script(raw_script, style, preserve_rule)["rewritten_script"]
     rewritten_script = clean_rewritten_script(raw_script, rewritten_script)
-    rewritten_script = ensure_original_opening(raw_script, rewritten_script)
+    rewritten_script = ensure_original_opening(raw_script, rewritten_script, preserve_rule)
+    rewritten_script = add_blank_lines_between_paragraphs(rewritten_script)
     comparison = compare_scripts(raw_script, rewritten_script)
     return {
         "title": normalize_auto_title(title, raw_script),
         "hook": hook,
         "rewritten_script": rewritten_script,
         "script_style": str(result.get("script_style") or style),
-        "rewrite_provider": result.get("rewrite_provider") or bigmodel_model(),
+        "rewrite_provider": result.get("rewrite_provider") or minimax_model(),
         "rewrite_error": result.get("rewrite_error", ""),
         "rewrite_comparison": comparison,
         "rewrite_difference": comparison["overall_difference"],
     }
 
 
-def build_rewrite_prompt(raw_script: str, style: str, attempt: int, previous: dict | None = None) -> str:
-    opening_hook = extract_opening_hook(raw_script)
+def build_rewrite_prompt(raw_script: str, style: str, attempt: int, previous: dict | None = None, preserve_rule: str = "auto") -> str:
+    opening_hook = extract_opening_hook(raw_script, preserve_rule)
     raw_len = content_length(raw_script)
     min_len = int(raw_len * MIN_REWRITE_LENGTH_RATIO)
     max_len = int(raw_len * MAX_REWRITE_LENGTH_RATIO)
+    has_book_promotion = bool(re.search(
+        r"(《[^》]+》|这本书|书里|书中|翻开|读完|买给孩子|下单|购买|小黄车|带书|卖书|推荐给家长)",
+        raw_script,
+    ))
+    conversion_instruction = (
+        "原文包含带书或图书推荐内容，可以保留原有转化意图并重新表达，但不要扩大篇幅、不要改成硬广。"
+        if has_book_promotion else
+        "原文不包含带书或图书推荐内容，改写稿也禁止主动添加书名、翻书、读书感受、买书、小黄车、家长购买或推荐给孩子等转化内容。结尾必须跟随原文主题自然收束。"
+    )
     retry_instruction = ""
     if previous:
         comparison = previous.get("rewrite_comparison") or {}
@@ -585,14 +670,12 @@ def build_rewrite_prompt(raw_script: str, style: str, attempt: int, previous: di
     prompt = f"""
 你是一名视频号爆款短视频文案改写专家，擅长改写卖书类、历史人物类、大国情绪类、爱国教育类短视频口播文案。
 
-我要你改写下面这篇文案，目标是在视频号发布，用于提高播放量、完播率和带书转化。
+我要你改写下面这篇文案，目标是在视频号发布，用于提高播放量和完播率。是否保留带书内容必须跟随原文，不得自行添加。
 
 【最重要要求】
-原文前三秒文案必须一字不改保留。
-也就是说，原文开头最前面的 1～3 句话，如果已经承担前三秒钩子作用，必须完整保留，不允许改字、不允许换词、不允许调整顺序、不允许删减。
-你只能从前三秒之后开始优化。
-如果你判断原文前三秒不够好，也不能擅自改动，只能在正文后额外给出“【前三秒优化建议】”，但正文里必须保留原前三秒不变。
-必须原样保留的前三秒开头是：{opening_hook}
+用户选定的原文开头必须一字不改保留，不允许改字、不允许换词、不允许调整顺序、不允许删减。
+你只能从这段受保护内容之后开始优化。即使你判断开头不够好，也不能擅自改动。
+必须原样保留的开头是：{opening_hook}
 
 【改写目标】
 保留原文的短视频味道，不要改成书面文章。
@@ -600,14 +683,11 @@ def build_rewrite_prompt(raw_script: str, style: str, attempt: int, previous: di
 整体风格要：口语化、有网感、有情绪、有画面、有节奏、有冲突。
 不要追求文采高级，要追求用户愿意听下去、愿意点赞、愿意评论、愿意转发。
 
-【必须保留的东西】
-1. 保留原文前三秒钩子不变。
-2. 保留原文的核心观点。
-3. 保留原文的情绪曲线。
-4. 保留原文中有流量感的短句、狠话、网感表达。
-5. 保留原文中已经很顺口的金句，不要为了改写而强行换词。
-6. 保留原文中能形成画面的具体细节。
-7. 保留原文的带书逻辑，如果原文提到了《国之脊梁》，要保留并自然优化。
+【只允许原样保留的内容】
+1. 只有原文前三秒钩子必须逐字保留。
+2. 人名、地名、年份、数字、事件等客观事实可以保留，但承载这些事实的句子必须重新表达。
+3. 除前三秒钩子和无法改写的专有名词外，原文中的完整句子、金句、狠话、过渡句、情绪表达和带书话术都不要照抄。
+4. 不要求保留原文的句式、段落顺序、叙述视角、情绪推进方式或表达风格；这些内容必须重新组织。
 
 【禁止事项】
 不要做简单同义词替换。
@@ -625,34 +705,32 @@ def build_rewrite_prompt(raw_script: str, style: str, attempt: int, previous: di
 一、句子要短。适合真人口播。能用短句就不要用长句。能用人话就不要用书面话。
 二、表达要狠。该硬的地方要硬。比如：“你可以试试敢不敢将它击落。”这种句子不要改成：“那便试试看是否敢于动用武力击落。”
 三、要有画面。多保留或强化具体画面：飞机起飞、国旗铺满街道、地图包围、旧照片、病房电脑、公文包、胶鞋、行李箱、实验室灯光、戈壁风沙。少写抽象评价。
-四、要有情绪递进。文案结构尽量按照：前三秒钩子不变 → 具体事件暴击 → 关键冲突 → 必要背景解释 → 历史伤痛/现实困境 → 今日反转 → 情绪爆发 → 英雄群像/人物承接 → 自然带书 → 家长转化。背景只能在爆点之后补，不能放在开头。
-五、带书要自然。如果文案是为了卖《国之脊梁》，不要硬广，不要写“赶紧点击小黄车购买”。可以写：“翻开《国之脊梁》才知道，今天的底气不是凭空来的。”“如果家里有孩子，真希望他们认识这些真正值得追的星。”“他们不是热搜里的明星，却是孩子最该知道的人。”
+四、要有情绪递进。文案结构尽量按照：前三秒钩子不变 → 具体事件暴击 → 关键冲突 → 必要背景解释 → 历史伤痛/现实困境 → 今日反转 → 情绪爆发 → 跟随原文主题自然收束。背景只能在爆点之后补，不能放在开头。
+五、带书内容跟随原文：{conversion_instruction}
 
 【分段要求】
-请按短视频分镜逻辑分段。
-一个镜头一段。
-同一个镜头内部不要换行。
-每段必须能对应一个完整画面，方便后续 AI 配图、素材搜索和剪映剪辑。
-不要出现只有几个字的空段。
-每段建议 30～80 字左右。
+按画面逻辑组织自然段，但不限制每段字数，也不限制自然段内部换行。
+每段应尽量对应一个完整画面，方便后续 AI 配图、素材搜索和剪映剪辑。
 换段标准是：时间变化、地点变化、人物动作变化、画面主体变化、情绪节点变化。
 不要按朗读断句分段，而要按画面分段。
+不要在 rewritten_script 中添加 [1]、[2] 等序号，序号由前端界面展示。
 
 【改写尺度】
-不是洗稿式同义替换，而是保留爆点后重新优化节奏。
+不是洗稿式同义替换，而是在保留前三秒和事实边界的前提下重新写一篇文案。
 可以删掉重复啰嗦的句子。
 可以强化画面感和冲突感。
-可以调整后半部分结构。
-可以让带书更自然。
-但不能改动前三秒原文。
+必须调整正文结构、叙述顺序、句式、转折方式和情绪推进。
+可以更换叙述视角，可以把后文爆点前置；只有原文包含带书内容时，才可以重新设计其表达方式。
+除前三秒外，不得连续照抄原文句子；不得只靠换词、增删标点或重新分段制造改写效果。
 
 【长度和质量约束】
 原文去除空白后的长度约 {raw_len} 个中文字符。
 rewritten_script 去除空白后的长度必须控制在 {min_len} 到 {max_len} 个中文字符之间。
 不要压缩成摘要、提纲或短版解说，也不要省略原文中的重要事实。
 事实边界：不虚构；不添加没有依据的具体时间、地点、人物关系；人物、年代、事件、因果关系必须保留。
-除必须原样保留的前三秒开头、专有名词、年份、固定称谓、顺口金句、流量感短句之外，整体内容必须重新组织。
+除必须原样保留的前三秒开头、专有名词、年份、数字和固定称谓之外，整体内容必须重新组织。
 系统会用字符相似度和语义相似度自动对比，最终总体差异度必须达到 {MIN_REWRITE_DIFFERENCE}% 以上。
+40% 是硬性验收线：不能通过重新换行、调整标点或少量同义词替换达成，正文必须让读者明显感到是重新讲述。
 
 【本次生成信息】
 文案风格：{style}。
@@ -668,13 +746,13 @@ rewritten_script 字段里只能放改写后的完整文案正文，禁止包含
     return prompt
 
 
-def rewrite_script_with_glm(raw_script: str, style: str, api_key: str) -> dict:
+def rewrite_script_with_minimax(raw_script: str, style: str, api_key: str, preserve_rule: str = "auto") -> dict:
     raw_len = content_length(raw_script)
     best_result: dict | None = None
     last_result: dict | None = None
     for attempt in range(1, MAX_REWRITE_ATTEMPTS + 1):
-        prompt = build_rewrite_prompt(raw_script, style, attempt, last_result)
-        result = request_glm_rewrite(prompt, raw_script, style, api_key, raw_len)
+        prompt = build_rewrite_prompt(raw_script, style, attempt, last_result, preserve_rule)
+        result = request_minimax_rewrite(prompt, raw_script, style, api_key, raw_len, preserve_rule)
         comparison = result.get("rewrite_comparison") or {}
         if not best_result or comparison.get("overall_difference", 0) > (best_result.get("rewrite_comparison") or {}).get("overall_difference", 0):
             best_result = result
@@ -692,11 +770,11 @@ def rewrite_script_with_glm(raw_script: str, style: str, api_key: str) -> dict:
     raise RewriteQualityError(best_result)
 
 
-def request_glm_rewrite(prompt: str, raw_script: str, style: str, api_key: str, raw_len: int) -> dict:
+def request_minimax_rewrite(prompt: str, raw_script: str, style: str, api_key: str, raw_len: int, preserve_rule: str = "auto") -> dict:
     payload = {
-        "model": bigmodel_model(),
+        "model": minimax_model(),
         "messages": [
-            {"role": "system", "content": "你只输出可解析 JSON。"},
+            {"role": "system", "content": "你只输出可解析 JSON。rewritten_script 按画面逻辑自然分段，不限制每段字数或段内换行，不要在正文中添加段落序号。"},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.65,
@@ -708,7 +786,7 @@ def request_glm_rewrite(prompt: str, raw_script: str, style: str, api_key: str, 
     }
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        f"{bigmodel_endpoint().rstrip('/')}/chat/completions",
+        f"{minimax_endpoint().rstrip('/')}/chat/completions",
         data=data,
         headers={
             "Authorization": f"Bearer {api_key}",
@@ -721,23 +799,23 @@ def request_glm_rewrite(prompt: str, raw_script: str, style: str, api_key: str, 
             body = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         error_body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"GLM API {exc.code}: {error_body}") from exc
+        raise RuntimeError(f"MiniMax API {exc.code}: {error_body}") from exc
 
     content = body["choices"][0]["message"]["content"]
     if isinstance(content, list):
         content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
     result = json.loads(extract_json(str(content)))
-    result["rewrite_provider"] = bigmodel_model()
-    return normalize_rewrite_result(result, raw_script, style)
+    result["rewrite_provider"] = minimax_model()
+    return normalize_rewrite_result(result, raw_script, style, preserve_rule)
 
 
-def rewrite_script(raw_script: str, style: str = "纪实故事型") -> dict:
-    fallback = fallback_rewrite_script(raw_script, style)
-    api_key = os.getenv("BIGMODEL_API_KEY", "").strip()
+def rewrite_script(raw_script: str, style: str = "纪实故事型", preserve_rule: str = "auto") -> dict:
+    fallback = fallback_rewrite_script(raw_script, style, preserve_rule)
+    api_key = os.getenv("MINIMAX_API_KEY", "").strip()
     if not api_key:
         return ensure_min_rewrite_difference(fallback)
     try:
-        return rewrite_script_with_glm(raw_script, style, api_key)
+        return rewrite_script_with_minimax(raw_script, style, api_key, preserve_rule)
     except RewriteQualityError:
         raise
     except Exception as exc:
@@ -976,9 +1054,9 @@ title 字段填写 2 到 9 个字的项目标题，不要标点。
 
 
 def generate_guozhijiliang_script(person_name: str = "", event_angle: str = "") -> dict:
-    api_key = os.getenv("BIGMODEL_API_KEY", "").strip()
+    api_key = os.getenv("MINIMAX_API_KEY", "").strip()
     if not api_key:
-        raise RuntimeError("BIGMODEL_API_KEY is not configured")
+        raise RuntimeError("MINIMAX_API_KEY is not configured")
 
     selected_person, selected_angle = choose_guozhijiliang_seed(person_name, event_angle)
     result: dict = {}
@@ -988,7 +1066,7 @@ def generate_guozhijiliang_script(person_name: str = "", event_angle: str = "") 
     for attempt in range(2):
         prompt = build_guozhijiliang_script_prompt_v2(selected_person, selected_angle) + retry_note
         payload = {
-            "model": bigmodel_model(),
+        "model": minimax_model(),
             "messages": [
                 {"role": "system", "content": "你只输出可解析 JSON。"},
                 {"role": "user", "content": prompt},
@@ -1002,7 +1080,7 @@ def generate_guozhijiliang_script(person_name: str = "", event_angle: str = "") 
         }
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
-            f"{bigmodel_endpoint().rstrip('/')}/chat/completions",
+            f"{minimax_endpoint().rstrip('/')}/chat/completions",
             data=data,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             method="POST",
@@ -1012,7 +1090,7 @@ def generate_guozhijiliang_script(person_name: str = "", event_angle: str = "") 
                 body = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"GLM API {exc.code}: {error_body}") from exc
+            raise RuntimeError(f"MiniMax API {exc.code}: {error_body}") from exc
 
         content = body["choices"][0]["message"]["content"]
         if isinstance(content, list):
@@ -1043,7 +1121,7 @@ def generate_guozhijiliang_script(person_name: str = "", event_angle: str = "") 
             )
 
     if not script:
-        raise RuntimeError("GLM response does not contain script")
+        raise RuntimeError("MiniMax response does not contain script")
     return {
         "title": normalize_auto_title(str(result.get("title") or ""), script),
         "person": str(result.get("person") or selected_person).strip(),
@@ -1051,14 +1129,14 @@ def generate_guozhijiliang_script(person_name: str = "", event_angle: str = "") 
         "script": script,
         "script_chars": stats["chars"],
         "script_paragraphs": stats["paragraphs"],
-        "provider": bigmodel_model(),
+        "provider": minimax_model(),
     }
 
 
 def extract_json(text: str) -> str:
     match = re.search(r"\{.*\}", text, flags=re.S)
     if not match:
-        raise ValueError("GLM response does not contain JSON")
+        raise ValueError("MiniMax response does not contain JSON")
     return match.group(0)
 
 
@@ -1078,7 +1156,8 @@ def is_meaningful_shot_text(text: str) -> bool:
     return bool(cleaned)
 
 
-SHOT_VISUALS_BATCH_SIZE = 10
+SHOT_VISUALS_BATCH_SIZE = 5
+LOGGER = logging.getLogger(__name__)
 SHOT_TAG_PUNCTUATION = re.compile(r"[\s，。！？、；：,.!?;:\"'()\[\]{}<>]+")
 SHOT_TAG_BAD_PARTS = (
     "画面", "镜头", "旁白", "体现", "展现", "展示", "表现", "强调", "需要",
@@ -1152,8 +1231,8 @@ def _build_shot_visuals_prompt(shot_items: list[dict], full_script: str) -> str:
 
 
 def ai_generate_shot_visuals(shots: list[dict], full_script: str) -> dict[str, dict]:
-    """Use GLM to generate visual_need and search_keywords for each shot."""
-    api_key = os.getenv("BIGMODEL_API_KEY", "").strip()
+    """Use MiniMax to generate visual_need and search_keywords for each shot."""
+    api_key = os.getenv("MINIMAX_API_KEY", "").strip()
     if not api_key:
         return {}
 
@@ -1166,7 +1245,7 @@ def ai_generate_shot_visuals(shots: list[dict], full_script: str) -> dict[str, d
         ]
         prompt = _build_shot_visuals_prompt(shot_items, full_script)
         payload = {
-            "model": bigmodel_model(),
+        "model": minimax_model(),
             "messages": [
                 {"role": "system", "content": "你只输出可解析 JSON。"},
                 {"role": "user", "content": prompt},
@@ -1180,14 +1259,25 @@ def ai_generate_shot_visuals(shots: list[dict], full_script: str) -> dict[str, d
         }
         try:
             data = json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(
-                f"{bigmodel_endpoint().rstrip('/')}/chat/completions",
-                data=data,
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=90) as response:
-                body = json.loads(response.read().decode("utf-8"))
+            body = None
+            last_error: Exception | None = None
+            for attempt in range(3):
+                req = urllib.request.Request(
+                    f"{minimax_endpoint().rstrip('/')}/chat/completions",
+                    data=data,
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    method="POST",
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=90) as response:
+                        body = json.loads(response.read().decode("utf-8"))
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < 2:
+                        time.sleep(1.5 * (attempt + 1))
+            if body is None:
+                raise RuntimeError(f"MiniMax 分镜画面描述连续请求失败：{last_error}")
             content = body["choices"][0]["message"]["content"]
             if isinstance(content, list):
                 content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
@@ -1221,8 +1311,32 @@ def ai_generate_shot_visuals(shots: list[dict], full_script: str) -> dict[str, d
                         "scene_tags": scene_tags,
                         "keywords": keywords,
                     }
-        except Exception:
-            continue
+        except Exception as exc:
+            indexes = [shot.get("shot_index") for shot in batch]
+            LOGGER.exception("MiniMax shot visual batch failed for shots %s: %s", indexes, exc)
+            # Isolate a malformed item instead of losing every shot in the batch.
+            if len(batch) > 1:
+                for shot in batch:
+                    all_visuals.update(ai_generate_shot_visuals([shot], full_script))
+                continue
+            # A single item already exhausted its retries. Keep a meaningful
+            # fallback and derive any safe local tags instead of emptying all fields.
+            for shot in batch:
+                shot_id = str(shot["shot_index"])
+                voice_text = str(shot.get("voice_text") or "").strip()
+                local_tags = keywords_from_text(voice_text)
+                objects = list(local_tags.get("people") or [])
+                scenes = list(local_tags.get("scene") or [])
+                all_visuals[shot_id] = {
+                    "visual_need": f"根据旁白呈现具体历史纪实画面：{voice_text[:80]}",
+                    "person_gender": "unknown",
+                    "person_names": [],
+                    "person_description": "",
+                    "search_keywords": list(dict.fromkeys([*objects, *scenes]))[:3],
+                    "object_tags": objects[:3],
+                    "scene_tags": scenes[:2],
+                    "keywords": list(local_tags.get("keywords") or [])[:3],
+                }
 
     return all_visuals
 
@@ -1240,15 +1354,34 @@ def cover_title_needs_rewrite(line1: str, line2: str) -> bool:
         return True
     if any(left in combined and right in combined for left, right in COVER_TITLE_SPOILER_COMBOS):
         return True
+    if any(ending in line2 for ending in TITLE_SUMMARY_ENDINGS):
+        return True
     if len(combined) >= 6 and not any(word in combined for word in COVER_TITLE_ATTRACTION_WORDS):
         return True
+    if len(combined) >= 8 and not any(word in combined for word in TITLE_OPEN_LOOP_WORDS):
+        return True
     return False
+
+
+def cover_title_score(line1: str, line2: str, script: str) -> int:
+    combined = f"{line1}{line2}"
+    score = 0
+    score += sum(5 for word in COVER_TITLE_ATTRACTION_WORDS if word in combined)
+    score += sum(3 for char in combined if char.isdigit())
+    score += 6 if any(word in combined for word in ("却", "竟", "不敢", "不能", "没", "最后", "凭什么", "到底")) else 0
+    score += 10 if any(word in combined for word in TITLE_OPEN_LOOP_WORDS) else 0
+    score += 8 if any(word in line2 for word in ("却", "竟", "反而", "偏偏", "为何", "为什么", "到底", "凭什么", "谁")) else 0
+    score += 4 if line1 in script or line2 in script else 0
+    score += 3 if 8 <= len(combined) <= 16 else 0
+    score -= sum(8 for pattern in WEAK_COVER_TITLE_PATTERNS if pattern in combined)
+    score -= sum(12 for ending in TITLE_SUMMARY_ENDINGS if ending in line2)
+    return score
 
 
 def extract_json_array(text: str) -> str:
     match = re.search(r"\[.*\]", text, flags=re.S)
     if not match:
-        raise ValueError("GLM response does not contain JSON array")
+        raise ValueError("MiniMax response does not contain JSON array")
     return match.group(0)
 
 
@@ -1261,7 +1394,7 @@ def parse_title_candidates(content: str) -> list[dict]:
 
 def generate_viral_title(script: str) -> dict:
     """Generate a two-line cover title; retry instead of truncating overlong lines."""
-    api_key = os.getenv("BIGMODEL_API_KEY", "").strip()
+    api_key = os.getenv("MINIMAX_API_KEY", "").strip()
     if not api_key:
         return {"line1": "", "line2": "", "full_title": ""}
 
@@ -1273,6 +1406,8 @@ def generate_viral_title(script: str) -> dict:
         "\n标题不是文章标题，不是新闻标题，不是中心思想，不是文案摘要。"
         "\n标题只需要抓住文案里最有冲突、最反常识、最心疼、最不公平、最有画面感的一个局部爆点。"
         "\n宁可抓一个狠瞬间，也不要写得全面、平衡、正确但没人想点。"
+        "\n必须通读整篇文案后再选爆点，不能只根据开头、人物身份或最终成就起标题。"
+        "\n爆点必须来自文案中的真实具体事实，优先选择全篇冲突强度最高、最让普通人意外的那一件事。"
         "\n\n【生成前的内部步骤】"
         "\n在生成标题前，请你先在内部完成以下判断，但不要输出过程："
         "\n1. 从文案里提炼5个最有停留价值的爆点瞬间。"
@@ -1280,6 +1415,8 @@ def generate_viral_title(script: str) -> dict:
         "\n3. 优先选择有具体画面、具体动作、具体物品、具体数字的爆点。"
         "\n4. 不要优先选择抽象主题、人物贡献、中心思想。"
         "\n5. 站在普通视频号用户视角反审：如果我刷到这个标题，会不会停下来？如果不会，必须重写。"
+        "\n6. 给5个爆点按冲突强度、反常识程度、具体画面感、情绪代价分别打分，最终标题必须围绕总分最高的爆点。"
+        "\n7. 不得因为某个爆点出现在文案开头就优先选它；后文爆点更强时必须选择后文。"
         "\n\n【标题格式】"
         "\n1. 必须生成两行文字。"
         "\n2. 每行1到9个字，任何一行都不能超过9个字。"
@@ -1290,6 +1427,9 @@ def generate_viral_title(script: str) -> dict:
         "\n\n【两行分工】"
         "\n第一行优先放：冲突现场、反常动作、具体物品、身份反差、强结果。"
         "\n第二行优先放：悬念补刀、情绪放大、代价、反差、追问、亏欠感。"
+        "\n两行之间必须形成认知落差：第一行建立预期，第二行打破预期或留下一个没有解释完的问题。"
+        "\n禁止写成完整的因果总结、人物评价或功绩概括，例如“隐姓埋名二十年/铸就雷达千里眼”。"
+        "\n第二行禁止用铸就、成就、奉献、贡献、功勋、报国、守护中国、照亮中国等词收束主题。"
         "\n\n好的结构示例："
         "\n第一行：父亲去世那天\n第二行：他不敢回家"
         "\n第一行：美国扣下箱子\n第二行：到底怕什么"
@@ -1326,6 +1466,7 @@ def generate_viral_title(script: str) -> dict:
         "\n\n【输出数量】"
         "\n请一次生成12组标题。"
         "\n12组标题要尽量覆盖不同类型，不要全是疑问句，不要全是同一种模板。"
+        "\n第1组必须是你判断的全篇最强爆点，后续各组才允许尝试其他角度。"
         "\n每组必须包含：first_line、second_line、style。"
         "\nstyle只能从以下类型中选择：悬念型、反差型、冲突型、心疼型、爽感型、亏欠型、误区型、画面型。"
         "\n\n【最终自检】"
@@ -1343,7 +1484,7 @@ def generate_viral_title(script: str) -> dict:
         "\n格式如下："
         '\n[{"first_line": "第一行", "second_line": "第二行", "style": "悬念型"}]'
         "\n\n下面是文案内容："
-        f"\n{script[:1200]}"
+        f"\n{script[:6000]}"
     )
 
     last_error = ""
@@ -1351,7 +1492,7 @@ def generate_viral_title(script: str) -> dict:
         for _ in range(3):
             retry_note = f"\n\n上一版不合格：{last_error}。请重新生成，不要截断原句。" if last_error else ""
             payload = {
-                "model": bigmodel_model(),
+        "model": minimax_model(),
                 "messages": [
                     {"role": "system", "content": "你只输出可解析JSON。"},
                     {"role": "user", "content": base_prompt + retry_note},
@@ -1364,7 +1505,7 @@ def generate_viral_title(script: str) -> dict:
             }
             data = json.dumps(payload).encode("utf-8")
             req = urllib.request.Request(
-                f"{bigmodel_endpoint().rstrip('/')}/chat/completions",
+            f"{minimax_endpoint().rstrip('/')}/chat/completions",
                 data=data,
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 method="POST",
@@ -1376,16 +1517,25 @@ def generate_viral_title(script: str) -> dict:
                 content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
             candidates = parse_title_candidates(str(content))
             last_error = "12组标题里没有合格候选"
-            for item in candidates:
+            valid_candidates = []
+            for candidate_index, item in enumerate(candidates):
                 line1 = strip_title_punctuation(item.get("first_line") or item.get("line1") or "")
                 line2 = strip_title_punctuation(item.get("second_line") or item.get("line2") or "")
                 if 1 <= len(line1) <= 9 and 1 <= len(line2) <= 9 and not cover_title_needs_rewrite(line1, line2):
-                    return {
+                    valid_candidates.append({
                         "line1": line1,
                         "line2": line2,
                         "full_title": f"{line1} {line2}",
                         "style": str(item.get("style") or "").strip(),
-                    }
+                        # The prompt requires the model to rank its strongest title
+                        # first. Preserve that semantic judgement while still using
+                        # local scoring to break ties and reject weak structures.
+                        "score": cover_title_score(line1, line2, script) + max(0, 12 - candidate_index) * 4,
+                    })
+            if valid_candidates:
+                best = max(valid_candidates, key=lambda item: item["score"])
+                best.pop("score", None)
+                return best
         return {"line1": "", "line2": "", "full_title": "", "error": last_error or "Title generation failed"}
     except Exception as exc:
         return {"line1": "", "line2": "", "full_title": "", "error": str(exc)[:200]}
@@ -1417,7 +1567,7 @@ def fallback_publish_assistant(script: str) -> dict:
 
 def generate_publish_assistant(script: str) -> dict:
     """Generate a platform-ready description and a punctuation-free short title."""
-    api_key = os.getenv("BIGMODEL_API_KEY", "").strip()
+    api_key = os.getenv("MINIMAX_API_KEY", "").strip()
     if not api_key:
         return fallback_publish_assistant(script)
 
@@ -1438,7 +1588,7 @@ def generate_publish_assistant(script: str) -> dict:
     )
 
     payload = {
-        "model": bigmodel_model(),
+        "model": minimax_model(),
         "messages": [
             {"role": "system", "content": "你只输出可解析 JSON。"},
             {"role": "user", "content": prompt},
@@ -1454,7 +1604,7 @@ def generate_publish_assistant(script: str) -> dict:
     try:
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
-            f"{bigmodel_endpoint().rstrip('/')}/chat/completions",
+            f"{minimax_endpoint().rstrip('/')}/chat/completions",
             data=data,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             method="POST",
@@ -1532,7 +1682,7 @@ def generate_shots(script: str) -> list[dict]:
         })
         cursor += duration
 
-    # Use GLM to generate more accurate visual descriptions and search keywords
+    # Use MiniMax to generate more accurate visual descriptions and search keywords
     visuals = ai_generate_shot_visuals(shots, script)
     for shot in shots:
         visual = visuals.get(str(shot["shot_index"]))

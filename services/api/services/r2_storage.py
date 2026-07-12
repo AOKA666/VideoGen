@@ -136,6 +136,38 @@ def upload_asset(asset: dict[str, Any], path: Path) -> None:
             pass
 
 
+def list_asset_metadata() -> list[dict[str, Any]]:
+    """Return all valid material records stored in R2 without downloading media."""
+    if not r2_enabled():
+        raise R2StorageError("Cloudflare R2 is not enabled")
+    records: list[dict[str, Any]] = []
+    try:
+        paginator = _client().get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=_bucket(), Prefix="assets/"):
+            for item in page.get("Contents", []):
+                key = str(item.get("Key") or "")
+                if not key.endswith(".json"):
+                    continue
+                response = _client().get_object(Bucket=_bucket(), Key=key)
+                payload = json.loads(response["Body"].read().decode("utf-8"))
+                if not isinstance(payload, dict) or not str(payload.get("id") or "").strip():
+                    continue
+                object_key = str(payload.get("object_key") or "").strip()
+                if not object_key.startswith(f"assets/{payload['id']}/"):
+                    continue
+                payload["storage_provider"] = "cloudflare_r2"
+                payload["metadata_object_key"] = key
+                payload["file_url"] = asset_content_url(str(payload["id"]))
+                if payload.get("file_type") == "image" or not payload.get("thumbnail_url"):
+                    payload["thumbnail_url"] = payload["file_url"]
+                records.append(payload)
+    except R2StorageError:
+        raise
+    except Exception as exc:
+        raise R2StorageError(f"Failed to list asset metadata from R2: {exc}") from exc
+    return records
+
+
 def ensure_asset_local(asset: dict[str, Any]) -> Path:
     local_value = str(asset.get("local_path") or "").strip()
     if local_value and Path(local_value).is_file():

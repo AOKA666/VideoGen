@@ -35,14 +35,10 @@
 下面列出了项目支持的全部配置项。不要把真实密钥提交到 Git。
 
 ```env
-# 智谱 GLM：文案改写和搜索意图
-BIGMODEL_API_KEY=your_bigmodel_api_key
-BIGMODEL_ENDPOINT=https://open.bigmodel.cn/api/paas/v4
-BIGMODEL_MODEL=glm-5.1
-
-# MiniMax：素材库图片识别
+# MiniMax：文案改写、搜索意图和素材库图片识别
 MINIMAX_API_KEY=your_minimax_api_key
 MINIMAX_ENDPOINT=https://api.minimaxi.com/v1
+MINIMAX_MODEL=MiniMax-M3
 MINIMAX_IMAGE_MODEL=MiniMax-M3
 WHISPERX_COMMAND=whisperx
 WHISPERX_MODEL=small
@@ -90,8 +86,7 @@ JIANYING_DRAFTS_DIR=E:\JianyingPro Drafts
 
 | 功能 | 必填变量 |
 | --- | --- |
-| 文案改写和搜索意图 | `BIGMODEL_API_KEY` |
-| 素材库图片识别 | `MINIMAX_API_KEY` |
+| 文案改写、搜索意图和素材库图片识别 | `MINIMAX_API_KEY` |
 | Seedream 分镜图片与去水印 | `ARK_API_KEY` |
 | 腾讯图片搜索 | `TENCENT_CLOUD_SECRET_ID`、`TENCENT_CLOUD_SECRET_KEY` |
 | 豆包配音与时间戳 | `VOLC_TTS_APP_ID`、`VOLC_TTS_ACCESS_KEY` |
