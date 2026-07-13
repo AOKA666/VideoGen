@@ -144,18 +144,26 @@ def _numbered_keyword_variants(candidate: str, shot_text: str) -> list[str]:
 
 def sanitize_intent(result: dict, _shot_text: str = "", fallback_values: list[str] | None = None) -> dict:
     last_error: ValueError | None = None
+    valid_keywords: list[str] = []
     for candidate in _candidate_values(result, fallback_values):
         for value in [candidate, *_numbered_keyword_variants(candidate, _shot_text)]:
             try:
                 keyword = validate_core_keyword(value)
-                return {
-                    "core_keyword": keyword,
-                    "search_keywords": [keyword],
-                    "provider": result.get("provider") or "ai",
-                    "error": "",
-                }
+                if keyword not in valid_keywords:
+                    valid_keywords.append(keyword)
+                if len(valid_keywords) >= 3:
+                    break
             except ValueError as exc:
                 last_error = exc
+        if len(valid_keywords) >= 3:
+            break
+    if valid_keywords:
+        return {
+            "core_keyword": valid_keywords[0],
+            "search_keywords": valid_keywords,
+            "provider": result.get("provider") or "ai",
+            "error": "",
+        }
     if last_error:
         raise last_error
     keyword = validate_core_keyword(_raw_core_keyword(result))
@@ -221,8 +229,8 @@ def ai_search_intent(shot_text: str, full_text: str = "") -> dict:
 
 规则：
 1. 只输出严格 JSON，不要 Markdown。
-2. 只返回 core_keyword，不要输出搜索意图、画面意图、人物列表或英文关键词。
-3. core_keyword 必须是完整、自然、可以直接复制到图片搜索框里的词组，长度 2-12 个字符。
+2. 返回 core_keyword 和 search_keywords，不要输出搜索意图、画面意图、人物列表或英文关键词。
+3. core_keyword 是最精确的主查询词；search_keywords 返回 2-3 个互补查询词，依次覆盖“具体人物/事件”“人物动作/地点”“纪实照片表达”。每个词都必须完整、自然、可直接复制到中文图片搜索框，长度 2-12 个字符，不能只是机械追加无关后缀。
 4. 优先选择明确人物、历史事件、地点、载具或动作画面，例如“中美阿拉斯加会谈”“王伟81192事件”“撤侨专机”“导弹命中爆炸”。
 5. 禁止从镜头描述中机械截取连续几个字，禁止输出“方强硬回击”“时侨民登”这类残片。
 6. 禁止输出只有编号的关键词，编号必须和人物或事件主体组合。
@@ -237,7 +245,7 @@ def ai_search_intent(shot_text: str, full_text: str = "") -> dict:
 {shot_text}
 
 返回格式：
-{{"core_keyword": "一个完整核心关键词"}}
+{{"core_keyword": "最精确的主查询词", "search_keywords": ["具体人物或事件", "人物动作或地点", "纪实照片表达"]}}
 """.strip()
     payload = {
         "model": minimax_model(),
@@ -277,8 +285,8 @@ def ai_search_intents(shots: list[dict], full_text: str, *, timeout: int = 90, r
 
 规则：
 1. 只输出严格 JSON，不要 Markdown。
-2. 每个分镜只返回 id 和 core_keyword，不要输出搜索意图、画面意图、人物列表或英文关键词。
-3. core_keyword 必须是完整、自然、可以直接复制到图片搜索框里的词组，长度 2-12 个字符。
+2. 每个分镜返回 id、core_keyword 和 search_keywords，不要输出搜索意图、画面意图、人物列表或英文关键词。
+3. core_keyword 是最精确的主查询词；search_keywords 返回 2-3 个互补查询词，依次覆盖“具体人物/事件”“人物动作/地点”“纪实照片表达”。每个词都必须完整、自然、可直接复制到中文图片搜索框，长度 2-12 个字符。
 4. 优先选择明确人物、历史事件、地点、载具或动作画面，例如：
    - “你们没有资格从实力地位出发同中国谈话” -> “中美阿拉斯加会谈”
    - “王伟烈士为守海疆壮烈牺牲” -> “王伟81192事件”
@@ -299,7 +307,7 @@ def ai_search_intents(shots: list[dict], full_text: str, *, timeout: int = 90, r
 返回格式：
 {{
   "shots": [
-    {{"id": "分镜 id", "core_keyword": "一个完整核心关键词"}}
+    {{"id": "分镜 id", "core_keyword": "最精确的主查询词", "search_keywords": ["具体人物或事件", "人物动作或地点", "纪实照片表达"]}}
   ]
 }}
 """.strip()
@@ -361,10 +369,10 @@ def ai_search_intents(shots: list[dict], full_text: str, *, timeout: int = 90, r
 
 
 def apply_intent_to_shot(shot: dict, intent: dict) -> dict:
-    keyword = validate_core_keyword(intent.get("core_keyword") or (intent.get("search_keywords") or [""])[0])
-    shot["search_keywords"] = [keyword]
+    sanitized = sanitize_intent(intent, str(shot.get("voice_text") or ""))
+    shot["search_keywords"] = sanitized["search_keywords"]
     shot.pop("archive_keywords", None)
     shot.pop("visual_intent", None)
-    shot["search_intent_provider"] = intent.get("provider", "")
-    shot["search_intent_error"] = intent.get("error", "")
+    shot["search_intent_provider"] = sanitized.get("provider", "")
+    shot["search_intent_error"] = sanitized.get("error", "")
     return shot

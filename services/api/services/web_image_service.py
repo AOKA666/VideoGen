@@ -6,7 +6,6 @@ import json
 import logging
 import mimetypes
 import os
-import random
 import re
 import time
 import urllib.error
@@ -29,7 +28,6 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
 )
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
-RANDOM = random.SystemRandom()
 TENCENT_IMAGE_HOST = "wimgs.tencentcloudapi.com"
 TENCENT_IMAGE_SERVICE = "wimgs"
 TENCENT_IMAGE_VERSION = "2025-11-06"
@@ -90,25 +88,33 @@ def is_blocked_image_source(*values: str | None) -> bool:
 
 
 class WebImageSearchProvider:
-    def __init__(self, timeout: int = 10, provider_name: str = "so"):
+    def __init__(self, timeout: int = 10, provider_name: str = "so", *, enable_secondary: bool = True):
         self.timeout = timeout
-        self.provider_name = provider_name if provider_name in {"so", "tencent"} else "so"
+        self.provider_name = provider_name if provider_name in {"so", "tencent", "brave"} else "so"
+        self.enable_secondary = enable_secondary
         self.failures: list[dict] = []
         self.diagnostics: list[dict] = []
 
     def search(self, keyword: str, limit: int = 12) -> list[ImageResult]:
         results: list[ImageResult] = []
-        primary_limit = max(6, limit)
-        source_queries = [(
-            self._search_tencent if self.provider_name == "tencent" else self._search_so,
-            keyword,
-            primary_limit,
-        )]
+        brave_enabled = (
+            self.enable_secondary
+            and self.provider_name != "brave"
+            and bool(os.getenv("BRAVE_SEARCH_API_KEY", "").strip())
+        )
+        primary_limit = max(6, limit if not brave_enabled else round(limit * 0.7))
+        primary_source = {
+            "tencent": self._search_tencent,
+            "brave": self._search_brave,
+        }.get(self.provider_name, self._search_so)
+        source_queries = [(primary_source, keyword, primary_limit)]
+        if brave_enabled:
+            source_queries.append((self._search_brave, keyword, max(6, limit - primary_limit)))
         for source, query, source_limit in source_queries:
             if not query:
                 continue
             started = time.monotonic()
-            source_name = source.__name__.removeprefix("_search_")
+            source_name = getattr(source, "__name__", "search_provider").removeprefix("_search_")
             try:
                 source_results = source(query, source_limit)
                 results.extend(source_results)
@@ -153,7 +159,7 @@ class WebImageSearchProvider:
 
     def _search_so(self, keyword: str, limit: int) -> list[ImageResult]:
         pool_size = max(20, min(30, limit * 3))
-        start = RANDOM.choice((0, 10, 20, 30, 40))
+        start = 0
         logger.info(
             "[搜图] 360请求 关键词=%s 随机起点=%d 候选池=%d 最多返回=%d",
             keyword,
@@ -186,7 +192,48 @@ class WebImageSearchProvider:
                 source_page=_clean_url(item.get("link")),
                 source="so_image_fallback",
             ))
-        RANDOM.shuffle(results)
+        return results[:limit]
+
+    def _search_brave(self, keyword: str, limit: int) -> list[ImageResult]:
+        api_key = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError("Brave Search API 密钥未配置")
+        params = urllib.parse.urlencode({
+            "q": keyword,
+            "count": str(max(1, min(200, limit))),
+            "country": "ALL",
+            "search_lang": "zh-hans",
+            "safesearch": "strict",
+            "spellcheck": "true",
+        })
+        request = urllib.request.Request(
+            f"https://api.search.brave.com/res/v1/images/search?{params}",
+            headers={
+                "Accept": "application/json",
+                "X-Subscription-Token": api_key,
+                "User-Agent": USER_AGENT,
+            },
+        )
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        results: list[ImageResult] = []
+        for item in body.get("results") or []:
+            properties = item.get("properties") or {}
+            thumbnail = item.get("thumbnail") or {}
+            image_url = _clean_url(properties.get("url") or thumbnail.get("src"))
+            thumb_url = _clean_url(thumbnail.get("src") or properties.get("placeholder"))
+            source_page = _clean_url(item.get("url"))
+            title = str(item.get("title") or keyword)
+            if not image_url or is_blocked_image_source(source_page, image_url, thumb_url, title):
+                continue
+            results.append(ImageResult(
+                keyword=keyword,
+                title=title,
+                thumb_url=thumb_url,
+                image_url=image_url,
+                source_page=source_page,
+                source="brave_image",
+            ))
         return results[:limit]
 
 
@@ -283,7 +330,6 @@ class WebImageSearchProvider:
                 source_page=source_page,
                 source="tencent_wimgs",
             ))
-        RANDOM.shuffle(results)
         return results[:limit]
 
 
@@ -425,8 +471,13 @@ def download_images_for_shot(
     exclude_hashes: set[str] | None = None,
     exclude_sources: set[str] | None = None,
     provider_name: str = "so",
+    enable_secondary_provider: bool = True,
 ) -> tuple[list[ImageResult], list[dict], list[dict], list[dict]]:
-    provider = WebImageSearchProvider(timeout=timeout, provider_name=provider_name)
+    provider = WebImageSearchProvider(
+        timeout=timeout,
+        provider_name=provider_name,
+        enable_secondary=enable_secondary_provider,
+    )
     download_batch_id = uuid4().hex[:8]
     search_results: list[ImageResult] = []
     downloaded: list[dict] = []
