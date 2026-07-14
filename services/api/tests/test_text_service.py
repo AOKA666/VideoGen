@@ -123,6 +123,15 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertTrue(cover_title_needs_rewrite("隐姓埋名二十年", "铸就雷达千里眼"))
         self.assertTrue(cover_title_needs_rewrite("扎根荒原六十年", "为国奉献一生"))
         self.assertFalse(cover_title_needs_rewrite("庆功名单翻遍", "为什么没有他"))
+        self.assertTrue(cover_title_needs_rewrite("丈夫被关监狱", "她没先带娃回国"))
+        self.assertTrue(cover_title_needs_rewrite("丈夫被关监狱", "她没有先回国"))
+
+    def test_cover_title_rejects_invented_sequence_modifiers(self) -> None:
+        script = "丈夫被关进美国监狱，她带着孩子四处奔走营救。"
+
+        self.assertTrue(cover_title_needs_rewrite("丈夫被关监狱", "她先带孩子回国", script))
+        self.assertFalse(cover_title_needs_rewrite("丈夫被关监狱", "她四处奔走营救", script))
+        self.assertFalse(cover_title_needs_rewrite("普通老先生", "护住公文包", "老人护住了公文包。"))
 
     def test_generate_viral_title_fails_instead_of_using_fallback(self) -> None:
         class FakeResponse:
@@ -184,6 +193,36 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertEqual("她捐出千万", title["line1"])
         self.assertEqual("却穿15块鞋", title["line2"])
         self.assertEqual("反差型", title["style"])
+
+    def test_generate_viral_title_skips_fake_contrast_candidate(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "choices": [{
+                        "message": {
+                            "content": json.dumps([
+                                {"first_line": "丈夫被关监狱", "second_line": "她没先带娃回国", "style": "悬念型"},
+                                {"first_line": "丈夫被关监狱", "second_line": "她四处奔走营救", "style": "冲突型"},
+                            ], ensure_ascii=False)
+                        }
+                    }]
+                }, ensure_ascii=False).encode("utf-8")
+
+        script = "丈夫被关进美国监狱，她带着孩子四处奔走营救。"
+        with patch.dict("os.environ", {"MINIMAX_API_KEY": "test"}), patch(
+            "services.text_service.urllib.request.urlopen",
+            return_value=FakeResponse(),
+        ):
+            title = generate_viral_title(script)
+
+        self.assertEqual("丈夫被关监狱", title["line1"])
+        self.assertEqual("她四处奔走营救", title["line2"])
 
     def test_parse_title_candidates_reads_json_array(self) -> None:
         candidates = parse_title_candidates('[{"first_line":"美国扣下箱子","second_line":"到底怕什么","style":"悬念型"}]')

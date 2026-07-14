@@ -65,6 +65,7 @@ COVER_TITLE_ATTRACTION_WORDS = (
     "不许",
     "被骂",
     "被拦",
+    "被关",
     "被藏",
     "护住",
     "捐出",
@@ -119,11 +120,30 @@ COVER_TITLE_SPOILER_COMBOS = (
 TITLE_OPEN_LOOP_WORDS = (
     "却", "竟", "反而", "偏偏", "不敢", "不能", "不许", "没", "没有", "为何",
     "为什么", "到底", "凭什么", "谁", "真相", "最后", "消失", "扣下", "被骂",
-    "被拦", "炸掉", "抹掉", "坠毁", "病危", "临终", "拒绝", "撕毁", "封锁", "普通",
+    "被拦", "被关", "炸掉", "抹掉", "坠毁", "病危", "临终", "拒绝", "撕毁", "封锁", "普通",
 )
 TITLE_SUMMARY_ENDINGS = (
     "铸就", "成就", "造就", "建成", "研制成功", "创造奇迹", "为国争光", "奉献一生",
     "守护祖国", "守护中国", "改变中国", "照亮中国", "功勋卓著", "终获成功",
+)
+TITLE_FAKE_CONTRAST_PATTERNS = (
+    "没先",
+    "没有先",
+    "不先",
+    "并未先",
+    "并没有先",
+)
+TITLE_FACT_SENSITIVE_MODIFIERS = (
+    "独自",
+    "独自一人",
+    "立刻",
+    "立即",
+    "马上",
+    "转身",
+    "掉头",
+)
+TITLE_SEQUENCE_ACTION_PATTERN = re.compile(
+    r"先(?:回|走|带|救|做|去|离|送|逃|撤|留|拿|找|赶|处理|安排|开|说|问|看|吃|睡|买|卖|给|让|把)"
 )
 RANDOM = random.SystemRandom()
 GUOZHIJILIANG_STORY_SEEDS = [
@@ -1346,10 +1366,20 @@ def strip_title_punctuation(text: str) -> str:
     return re.sub(r"\s+", "", punctuation.sub("", str(text or ""))).strip()
 
 
-def cover_title_needs_rewrite(line1: str, line2: str) -> bool:
+def cover_title_needs_rewrite(line1: str, line2: str, script: str = "") -> bool:
     combined = f"{line1}{line2}"
     if not combined:
         return True
+    # “没先做某事”通常只是把一个正常选择硬包装成反常行为，而且隐藏了
+    # 真正发生的动作。封面标题应直接写实际选择及其代价，而不是虚构预期。
+    if any(pattern in combined for pattern in TITLE_FAKE_CONTRAST_PATTERNS):
+        return True
+    # 时间顺序、独自行动等修饰语会实质改变事实；原文没有时不能为制造冲突添加。
+    if script:
+        if any(modifier in combined and modifier not in script for modifier in TITLE_FACT_SENSITIVE_MODIFIERS):
+            return True
+        if TITLE_SEQUENCE_ACTION_PATTERN.search(combined) and "先" not in script:
+            return True
     if any(pattern in combined for pattern in WEAK_COVER_TITLE_PATTERNS):
         return True
     if any(left in combined and right in combined for left, right in COVER_TITLE_SPOILER_COMBOS):
@@ -1368,7 +1398,7 @@ def cover_title_score(line1: str, line2: str, script: str) -> int:
     score = 0
     score += sum(5 for word in COVER_TITLE_ATTRACTION_WORDS if word in combined)
     score += sum(3 for char in combined if char.isdigit())
-    score += 6 if any(word in combined for word in ("却", "竟", "不敢", "不能", "没", "最后", "凭什么", "到底")) else 0
+    score += 6 if any(word in combined for word in ("却", "竟", "不敢", "不能", "最后", "凭什么", "到底")) else 0
     score += 10 if any(word in combined for word in TITLE_OPEN_LOOP_WORDS) else 0
     score += 8 if any(word in line2 for word in ("却", "竟", "反而", "偏偏", "为何", "为什么", "到底", "凭什么", "谁")) else 0
     score += 4 if line1 in script or line2 in script else 0
@@ -1408,6 +1438,10 @@ def generate_viral_title(script: str) -> dict:
         "\n宁可抓一个狠瞬间，也不要写得全面、平衡、正确但没人想点。"
         "\n必须通读整篇文案后再选爆点，不能只根据开头、人物身份或最终成就起标题。"
         "\n爆点必须来自文案中的真实具体事实，优先选择全篇冲突强度最高、最让普通人意外的那一件事。"
+        "\n标题的逻辑必须独立成立：前一行是处境，后一行必须是真正出人意料的选择或后果，不能仅靠却、竟、没、反而等词假装反常。"
+        "\n判断反常时必须使用普通人的现实常识：只有相反选择明显更正常、更合理时，当前选择才算反常；如果多数人处在同样处境也会这么做，就不是爆点。"
+        "\n尤其禁止把正常的不作为包装成反常，例如丈夫被关押时，妻子没有先带孩子回国本身很正常，不能写成悬念；若真正爆点是她掉头回国、留下营救或作出其他主动选择，应直接写那个真实动作。"
+        "\n不得为了制造反差擅自添加先、独自、立即、马上、转身、掉头等会改变事实或时间顺序的词，除非文案明确写出。"
         "\n\n【生成前的内部步骤】"
         "\n在生成标题前，请你先在内部完成以下判断，但不要输出过程："
         "\n1. 从文案里提炼5个最有停留价值的爆点瞬间。"
@@ -1417,6 +1451,8 @@ def generate_viral_title(script: str) -> dict:
         "\n5. 站在普通视频号用户视角反审：如果我刷到这个标题，会不会停下来？如果不会，必须重写。"
         "\n6. 给5个爆点按冲突强度、反常识程度、具体画面感、情绪代价分别打分，最终标题必须围绕总分最高的爆点。"
         "\n7. 不得因为某个爆点出现在文案开头就优先选它；后文爆点更强时必须选择后文。"
+        "\n8. 对每个候选做反事实检查：去掉却、竟、没等转折词后，后一行是否仍是一件客观异常且值得追问的事；若只是正常选择，整组淘汰。"
+        "\n9. 检查两行的主体、时间和因果是否衔接；不能偷换人物，不能把先后顺序或普通反应硬说成反差。"
         "\n\n【标题格式】"
         "\n1. 必须生成两行文字。"
         "\n2. 每行1到9个字，任何一行都不能超过9个字。"
@@ -1428,6 +1464,7 @@ def generate_viral_title(script: str) -> dict:
         "\n第一行优先放：冲突现场、反常动作、具体物品、身份反差、强结果。"
         "\n第二行优先放：悬念补刀、情绪放大、代价、反差、追问、亏欠感。"
         "\n两行之间必须形成认知落差：第一行建立预期，第二行打破预期或留下一个没有解释完的问题。"
+        "\n认知落差必须来自事实本身，而不是由却、竟、没、反而等连接词强行制造。没有真实反常点时，宁可写具体困境、主动动作或明确代价。"
         "\n禁止写成完整的因果总结、人物评价或功绩概括，例如“隐姓埋名二十年/铸就雷达千里眼”。"
         "\n第二行禁止用铸就、成就、奉献、贡献、功勋、报国、守护中国、照亮中国等词收束主题。"
         "\n\n好的结构示例："
@@ -1478,6 +1515,8 @@ def generate_viral_title(script: str) -> dict:
         "\n5. 普通用户扫一眼是否有停留理由。"
         "\n6. 是否避免了空洞大词。"
         "\n7. 是否有足够反差或悬念。"
+        "\n8. 去掉转折词后，所谓反常是否仍然成立；如果只是正常人的正常选择，必须淘汰。"
+        "\n9. 标题中的先后顺序、人物动作和因果关系是否都能在原文中找到依据。"
         "\n如果不合格，必须重写后再输出。"
         "\n\n【输出格式】"
         "\n只返回JSON数组，不要Markdown，不要解释。"
@@ -1521,7 +1560,7 @@ def generate_viral_title(script: str) -> dict:
             for candidate_index, item in enumerate(candidates):
                 line1 = strip_title_punctuation(item.get("first_line") or item.get("line1") or "")
                 line2 = strip_title_punctuation(item.get("second_line") or item.get("line2") or "")
-                if 1 <= len(line1) <= 9 and 1 <= len(line2) <= 9 and not cover_title_needs_rewrite(line1, line2):
+                if 1 <= len(line1) <= 9 and 1 <= len(line2) <= 9 and not cover_title_needs_rewrite(line1, line2, script):
                     valid_candidates.append({
                         "line1": line1,
                         "line2": line2,
