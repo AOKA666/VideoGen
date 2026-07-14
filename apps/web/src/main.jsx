@@ -309,6 +309,12 @@ function App() {
     const hasProcessingVideo = assets.some((asset) => (
       asset.file_type === 'video' && ['analyzing', 'probing', 'splitting'].includes(asset.analysis_status)
     ));
+    // 上传视频后会在 message 里挂一句"素材已上传，正在识别标签"，
+    // 但没有任何路径去覆盖它。这里在所有视频都离开处理中状态时把
+    // 这条提示清掉，让徽标回落到默认的"就绪"。
+    if (!hasProcessingVideo && message === '素材已上传，正在识别标签') {
+      setMessage('');
+    }
     if (!hasProcessingVideo) return undefined;
     const timer = window.setInterval(async () => {
       try {
@@ -319,7 +325,7 @@ function App() {
       }
     }, 3000);
     return () => window.clearInterval(timer);
-  }, [assets]);
+  }, [assets, message]);
 
   useEffect(() => {
     if (!project) return;
@@ -2111,6 +2117,8 @@ function AssetCard({ asset, selected, onSelect, onPreview, onEdit, onDelete, ima
   const imageReason = asset.score_result?.reason;
   const src = assetImageUrl(asset);
   const canPreview = Boolean(onPreview && asset.file_type === 'image');
+  // 视频处理有三阶段：probing → splitting → analyzing，单看 'analyzing' 会漏掉前两步。
+  const isAnalyzing = ['analyzing', 'probing', 'splitting'].includes(asset.analysis_status);
   function openPreview(event) {
     if (!canPreview) return;
     if (event.type === 'keydown' && !['Enter', ' '].includes(event.key)) return;
@@ -2118,7 +2126,7 @@ function AssetCard({ asset, selected, onSelect, onPreview, onEdit, onDelete, ima
     onPreview();
   }
   return (
-    <article className={`${asset.analysis_status === 'analyzing' ? 'asset-card analyzing' : 'asset-card'}${libraryCard ? ' library-asset-card' : ''}${selected ? ' selected' : ''}`}>
+    <article className={`${isAnalyzing ? 'asset-card analyzing' : 'asset-card'}${libraryCard ? ' library-asset-card' : ''}${selected ? ' selected' : ''}`}>
       {onSelect && (
         <label className="asset-checkbox" onClick={(e) => e.stopPropagation()}>
           <input type="checkbox" checked={!!selected} onChange={onSelect} />
@@ -2146,12 +2154,12 @@ function AssetCard({ asset, selected, onSelect, onPreview, onEdit, onDelete, ima
       {asset.file_type === 'video' && asset.duration_ms && <small>{(asset.duration_ms / 1000).toFixed(1)} 秒 · 代理片段</small>}
       {asset.file_type === 'video' && asset.clip_count !== undefined && <small>已生成 {asset.clip_count} 个片段</small>}
       {imageScore !== undefined && imageScore !== null && <p>图片评分：{imageScore}</p>}
-      <p>{asset.analysis_status === 'analyzing' ? '识别中' : [...(asset.object || asset.people || []), ...(asset.scene || []), ...(asset.keywords || [])].slice(0, 6).join(' / ') || '待补充标签'}</p>
-      <small>{asset.analysis_status === 'analyzing' ? '识别标签中，请稍候' : `${asset.analysis_provider || 'local_fallback'} · ${asset.copyright_note}`}</small>
+      <p>{isAnalyzing ? '识别中' : [...(asset.object || asset.people || []), ...(asset.scene || []), ...(asset.keywords || [])].slice(0, 6).join(' / ') || '待补充标签'}</p>
+      <small>{isAnalyzing ? '识别标签中，请稍候' : `${asset.analysis_provider || 'local_fallback'} · ${asset.copyright_note}`}</small>
       {imageReason && <small>{imageReason}</small>}
       {(onEdit || onDelete) && (
         <div className="asset-actions">
-          {onEdit && <button disabled={asset.analysis_status === 'analyzing'} onClick={onEdit}><Tags size={16} /> 编辑标签</button>}
+          {onEdit && <button disabled={isAnalyzing} onClick={onEdit}><Tags size={16} /> 编辑标签</button>}
           {onDelete && <button className="danger" onClick={onDelete}><Trash2 size={16} /> 删除</button>}
         </div>
       )}
