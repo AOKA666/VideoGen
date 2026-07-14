@@ -31,13 +31,15 @@ ACTIVE_SEARCH_STATUSES = {"pending_search", "analyzing_intent", "searching"}
 MIN_ACCEPT_SCORE = 30
 MAX_SEARCH_ROUNDS = 2
 INTENT_BATCH_SIZE = 5
-DEFAULT_CANDIDATE_LIMIT = 2
-FAST_IMAGES_PER_SHOT = 2
-FAST_IMAGES_PER_KEYWORD = 2
-FULL_IMAGES_PER_SHOT = 8
-FULL_IMAGES_PER_KEYWORD = 4
-FAST_VISUAL_SCORE_LIMIT = 0
-FULL_VISUAL_SCORE_LIMIT = 0
+DEFAULT_CANDIDATE_LIMIT = 6
+FAST_IMAGES_PER_SHOT = 8
+FAST_IMAGES_PER_KEYWORD = 4
+FULL_IMAGES_PER_SHOT = 15
+FULL_IMAGES_PER_KEYWORD = 5
+FAST_VISUAL_SCORE_LIMIT = 4
+FULL_VISUAL_SCORE_LIMIT = 6
+EARLY_STOP_MATCH_SCORE = 70
+EARLY_STOP_MATCH_COUNT = 3
 SEARCH_BATCH_TIMEOUT_SECONDS = 180
 STALE_SEARCH_SECONDS = 180
 TENCENT_RETRY_SUFFIXES = [
@@ -564,19 +566,19 @@ def _download_and_rank_shot(project_id: str, shot: dict) -> dict:
         {
             "images_per_shot": FAST_IMAGES_PER_SHOT,
             "images_per_keyword": FAST_IMAGES_PER_KEYWORD,
-            "results_per_keyword": 10,
-            "timeout": 3,
+            "results_per_keyword": 20,
+            "timeout": 6,
             "visual_limit": FAST_VISUAL_SCORE_LIMIT,
             "keyword_start": 0,
-            "keyword_limit": 1,
+            "keyword_limit": 2,
         },
         {
             "images_per_shot": FULL_IMAGES_PER_SHOT,
             "images_per_keyword": FULL_IMAGES_PER_KEYWORD,
             "results_per_keyword": 30,
-            "timeout": 3,
+            "timeout": 8,
             "visual_limit": FULL_VISUAL_SCORE_LIMIT,
-            "keyword_start": 0,
+            "keyword_start": 2,
             "keyword_limit": 1,
         },
     ][:MAX_SEARCH_ROUNDS]
@@ -597,7 +599,9 @@ def _download_and_rank_shot(project_id: str, shot: dict) -> dict:
             round_config["images_per_keyword"],
         )
         search_queries = search_keywords_for_shot(shot)
-        keyword_start = round_index - 1 if provider_name == "tencent" and len(search_queries) > 1 else round_config["keyword_start"]
+        keyword_start = round_config["keyword_start"]
+        if keyword_start >= len(search_queries):
+            keyword_start = 0
         search_results, downloaded, round_failures, round_diagnostics = download_images_for_shot(
             shot,
             output_dir,
@@ -612,6 +616,7 @@ def _download_and_rank_shot(project_id: str, shot: dict) -> dict:
             exclude_hashes=seen_hashes,
             exclude_sources=seen_sources,
             provider_name=provider_name,
+            enable_secondary_provider=round_index > 1,
         )
         failures.extend({**failure, "round": round_index} for failure in round_failures)
         diagnostics.extend({**entry, "round": round_index} for entry in round_diagnostics)
@@ -633,12 +638,24 @@ def _download_and_rank_shot(project_id: str, shot: dict) -> dict:
             [item.get("score_result", {}).get("score", 0) for item in top_items],
             time.monotonic() - round_started,
         )
-        if len(top_items) >= DEFAULT_CANDIDATE_LIMIT:
+        high_match_count = sum(
+            1 for item in top_items
+            if int((item.get("score_result") or {}).get("score") or 0) >= EARLY_STOP_MATCH_SCORE
+            and (item.get("score_result") or {}).get("scoring_provider") == "visual"
+        )
+        if round_index == 1 and high_match_count >= EARLY_STOP_MATCH_COUNT:
+            logger.info(
+                "[搜图] 镜头=%s 第一轮已有%d张高匹配图片，提前结束",
+                shot.get("shot_index"),
+                high_match_count,
+            )
             for item in top_items:
                 _cleanup_watermark(item, shot)
             break
-        _cleanup_unselected(all_downloaded, top_items)
-        all_downloaded = list(top_items)
+        if round_index == len(search_rounds) and len(top_items) >= DEFAULT_CANDIDATE_LIMIT:
+            for item in top_items:
+                _cleanup_watermark(item, shot)
+            break
         if _project_stop_requested(project_id):
             _cleanup_unselected(all_downloaded, None)
             return {

@@ -38,6 +38,10 @@ function stripScriptParagraphNumbers(value) {
   return String(value || '').replace(/(^|\n)([ \t]*)\[\d+\][ \t]*/g, '$1$2').trim();
 }
 
+function scriptCharacterCount(value) {
+  return Array.from(stripScriptParagraphNumbers(value).replace(/\s+/g, '')).length;
+}
+
 function numberScriptParagraphs(value) {
   const script = stripScriptParagraphNumbers(value).replace(/\r\n?/g, '\n');
   if (!script) return '';
@@ -1427,7 +1431,10 @@ function App() {
         {tab === 'script' && project && (
           <section className="band two-col script-grid">
             <div className="panel">
-              <h2>原始文案</h2>
+              <div className="script-title">
+                <h2>原始文案</h2>
+                <span className="script-character-count">{scriptCharacterCount(project.raw_script)} 字</span>
+              </div>
               <textarea
                 ref={rawScriptRef}
                 readOnly
@@ -1474,7 +1481,10 @@ function App() {
             </div>
             <div className="panel">
               <div className="row">
-                <h2>二创口播稿</h2>
+                <div className="script-title">
+                  <h2>二创口播稿</h2>
+                  <span className="script-character-count">{scriptCharacterCount(rewrittenScriptEditor)} 字</span>
+                </div>
                 <div className="actions">
                   <button onClick={mergeScriptParagraphs}><Archive size={18} /> 合并段落</button>
                   <button onClick={rewrite}><RefreshCw size={18} /> 生成</button>

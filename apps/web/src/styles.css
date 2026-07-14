@@ -455,6 +455,17 @@ h3 { font-size: 16px; line-height: 1.48; }
 }
 .source-strategy { margin-top: 14px; }
 .raw-script-actions { margin-top: 14px; }
+.script-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.script-title h2 { margin-bottom: 12px; }
+.script-character-count {
+  color: var(--muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
 .raw-script-hint {
   display: block;
   color: var(--muted);

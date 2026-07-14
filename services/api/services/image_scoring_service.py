@@ -634,8 +634,8 @@ def rank_images_for_shot(shot: dict, downloaded: list[dict], *, visual_limit: in
     for item in downloaded:
         scored = {**item, "score_result": quick_score_image_for_shot(shot, item)}
         ranked.append(scored)
-    ranked.sort(key=lambda item: (aspect_ratio_score(item), item["score_result"]["score"]), reverse=True)
+    ranked.sort(key=lambda item: (item["score_result"]["score"], aspect_ratio_score(item)), reverse=True)
 
     for index, item in enumerate(ranked[:max(0, visual_limit)]):
         ranked[index] = {**item, "score_result": score_image_for_shot(shot, item)}
-    return sorted(ranked, key=lambda item: (aspect_ratio_score(item), item["score_result"]["score"]), reverse=True)
+    return sorted(ranked, key=lambda item: (item["score_result"]["score"], aspect_ratio_score(item)), reverse=True)

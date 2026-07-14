@@ -144,6 +144,9 @@ def _shot_person_names(shot: dict) -> list[str]:
 
 
 def _anonymous_person_description(shot: dict, person_names: list[str]) -> str:
+    if infer_shot_person_gender(shot) == "none":
+        return ""
+
     description = str(shot.get("person_description") or "").strip()
     for name in person_names:
         description = description.replace(name, "")
