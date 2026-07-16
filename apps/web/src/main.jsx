@@ -803,24 +803,6 @@ function App() {
     }
   }
 
-  async function mergeScriptParagraphs() {
-    const data = await run('合并段落', () => request(`/api/projects/${projectId}/merge-script-paragraphs`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ rewritten_script: stripScriptParagraphNumbers(rewrittenScriptEditor) }),
-    }));
-    if (!data) return;
-    setProject((current) => ({
-      ...current,
-      rewritten_script: data.rewritten_script,
-      rewrite_comparison: data.rewrite_comparison,
-      rewrite_difference: data.rewrite_comparison?.overall_difference,
-    }));
-    rewrittenScriptDirtyRef.current = false;
-    setRewrittenScriptEditor(numberScriptParagraphs(data.rewritten_script));
-    setMessage(`段落已从 ${data.before_count} 段合并为 ${data.after_count} 段，文案内容保持不变`);
-  }
-
   async function reanalyzeShotImage(shotId) {
     setRecognizingShotIds((current) => new Set(current).add(shotId));
     setMessage('正在重新识别图片，可继续识别其他分镜');
@@ -1474,14 +1456,26 @@ function App() {
                 </select>
               </label>
               <div className="actions raw-script-actions">
-                <button className="primary" onClick={() => skipToStoryboard('so')}><Archive size={18} /> 直接生成分镜</button>
-                <button
-                  className="tencent-storyboard"
-                  title="使用原始文案生成分镜，并使用腾讯云联网图像搜索"
-                  onClick={() => skipToStoryboard('tencent')}
-                >
-                  <Search size={18} /> 直接生成分镜
-                </button>
+                {materialSourceStrategy === 'ai_only' ? (
+                  <button
+                    className="primary"
+                    title="使用原始文案生成分镜，并为每个镜头生成 AI 图片"
+                    onClick={() => skipToStoryboard()}
+                  >
+                    <Wand2 size={18} /> AI 生成分镜
+                  </button>
+                ) : (
+                  <>
+                    <button className="primary" onClick={() => skipToStoryboard('so')}><Archive size={18} /> 直接生成分镜</button>
+                    <button
+                      className="tencent-storyboard"
+                      title="使用原始文案生成分镜，并使用腾讯云联网图像搜索"
+                      onClick={() => skipToStoryboard('tencent')}
+                    >
+                      <Search size={18} /> 直接生成分镜
+                    </button>
+                  </>
+                )}
               </div>
               <small className="raw-script-hint">跳过二创，使用原始文案直接拆分镜头</small>
             </div>
@@ -1492,15 +1486,15 @@ function App() {
                   <span className="script-character-count">{scriptCharacterCount(rewrittenScriptEditor)} 字</span>
                 </div>
                 <div className="actions">
-                  <button onClick={mergeScriptParagraphs}><Archive size={18} /> 合并段落</button>
                   <button onClick={rewrite}><RefreshCw size={18} /> 生成</button>
                 </div>
               </div>
               {project.rewrite_comparison && (
                 <p>
                   总体差异度：{project.rewrite_comparison.overall_difference ?? project.rewrite_difference ?? '-'}%
-                  {' · '}字符相似度：{project.rewrite_comparison.character_similarity ?? '-'}%
-                  {' · '}语义相似度：{project.rewrite_comparison.semantic_similarity ?? '-'}%
+                  {' · '}连续照抄率：{project.rewrite_comparison.continuous_reuse ?? project.rewrite_comparison.character_similarity ?? '-'}%
+                  {' · '}长短语重合率：{project.rewrite_comparison.phrase_overlap ?? '-'}%
+                  {' · '}关键词重合率：{project.rewrite_comparison.keyword_overlap ?? project.rewrite_comparison.semantic_similarity ?? '-'}%
                 </p>
               )}
               <textarea
@@ -1512,7 +1506,7 @@ function App() {
                 }}
                 onBlur={() => setRewrittenScriptEditor((current) => numberScriptParagraphs(current))}
               />
-              <small className="raw-script-hint">可直接修改文案，段落长度和段内换行不受限制；[1]、[2] 等序号仅用于查看段数，保存和生成分镜时不会写入正文。</small>
+              <small className="raw-script-hint">AI 按完整画面分段，每段建议 40-60 字、通常不超过 80 字，避免短碎段落；可继续手动修改。[1]、[2] 等序号仅用于查看段数，保存和生成分镜时不会写入正文。</small>
               <label className="source-strategy">
                 素材来源策略
                 <select value={materialSourceStrategy} onChange={(event) => setMaterialSourceStrategy(event.target.value)}>
@@ -1524,14 +1518,26 @@ function App() {
               </label>
               <div className="actions">
                 <button onClick={saveScript}><Save size={18} /> 保存</button>
-                <button className="primary" onClick={() => generateShots('so')}><Archive size={18} /> 生成分镜</button>
-                <button
-                  className="tencent-storyboard"
-                  title="生成分镜并使用腾讯云联网图像搜索"
-                  onClick={() => generateShots('tencent')}
-                >
-                  <Search size={18} /> 生成分镜
-                </button>
+                {materialSourceStrategy === 'ai_only' ? (
+                  <button
+                    className="primary"
+                    title="生成分镜，并为每个镜头生成 AI 图片"
+                    onClick={() => generateShots()}
+                  >
+                    <Wand2 size={18} /> AI 生成分镜
+                  </button>
+                ) : (
+                  <>
+                    <button className="primary" onClick={() => generateShots('so')}><Archive size={18} /> 生成分镜</button>
+                    <button
+                      className="tencent-storyboard"
+                      title="生成分镜并使用腾讯云联网图像搜索"
+                      onClick={() => generateShots('tencent')}
+                    >
+                      <Search size={18} /> 生成分镜
+                    </button>
+                  </>
+                )}
               </div>
             </div>
           </section>

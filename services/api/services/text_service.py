@@ -8,8 +8,12 @@ import re
 import time
 import urllib.error
 import urllib.request
-from collections import Counter
 from difflib import SequenceMatcher
+
+try:
+    import jieba
+except ImportError:  # Keyword overlap is diagnostic only; rewriting must still work without jieba.
+    jieba = None
 
 GUOZHIJILIANG_PEOPLE = [
     "李四光", "竺可桢", "茅以升", "叶企孙", "俞大绂", "林巧稚", "周培源", "裴文中",
@@ -23,7 +27,7 @@ SCENE_HINTS = ["实验室", "会议", "档案", "照片", "火箭", "导弹", "�
 ERA_HINTS = ["1950", "1960", "1970", "上世纪", "建国", "抗战"]
 MIN_REWRITE_LENGTH_RATIO = 0.85
 MAX_REWRITE_LENGTH_RATIO = 1.25
-MIN_REWRITE_DIFFERENCE = 40
+MIN_REWRITE_DIFFERENCE = 50
 MAX_REWRITE_ATTEMPTS = 3
 MAX_AUTO_TITLE_LENGTH = 9
 MAX_PUBLISH_SHORT_TITLE_LENGTH = 16
@@ -36,7 +40,6 @@ WEAK_COVER_TITLE_PATTERNS = (
     "民族脊梁",
     "大国",
     "传奇",
-    "一生",
     "故事",
     "感动",
     "震撼",
@@ -52,6 +55,14 @@ WEAK_COVER_TITLE_PATTERNS = (
     "报国",
     "守护中国",
     "照亮中国",
+    "不敢抬头",
+    "低下了头",
+    "低下头",
+    "红了眼眶",
+    "红了眼",
+    "流下眼泪",
+    "泪流满面",
+    "沉默不语",
 )
 COVER_TITLE_ATTRACTION_WORDS = (
     "扣下",
@@ -61,7 +72,6 @@ COVER_TITLE_ATTRACTION_WORDS = (
     "病危",
     "临终",
     "不能",
-    "不敢",
     "不许",
     "被骂",
     "被拦",
@@ -103,6 +113,9 @@ COVER_TITLE_ATTRACTION_WORDS = (
     "没回头",
     "反常",
     "离谱",
+    "潜伏",
+    "地下党",
+    "卧底",
 )
 COVER_TITLE_SPOILER_COMBOS = (
     ("病危", "绝密"),
@@ -118,7 +131,7 @@ COVER_TITLE_SPOILER_COMBOS = (
     ("真相", "曝光"),
 )
 TITLE_OPEN_LOOP_WORDS = (
-    "却", "竟", "反而", "偏偏", "不敢", "不能", "不许", "没", "没有", "为何",
+    "却", "竟", "反而", "偏偏", "不能", "不许", "没", "没有", "为何",
     "为什么", "到底", "凭什么", "谁", "真相", "最后", "消失", "扣下", "被骂",
     "被拦", "被关", "炸掉", "抹掉", "坠毁", "病危", "临终", "拒绝", "撕毁", "封锁", "普通",
 )
@@ -145,6 +158,7 @@ TITLE_FACT_SENSITIVE_MODIFIERS = (
 TITLE_SEQUENCE_ACTION_PATTERN = re.compile(
     r"先(?:回|走|带|救|做|去|离|送|逃|撤|留|拿|找|赶|处理|安排|开|说|问|看|吃|睡|买|卖|给|让|把)"
 )
+TITLE_VAGUE_PRONOUN_DIALOGUE_PATTERN = re.compile(r"^[他她](?:说|问|喊|哭|劝|求|答|回|告诉)")
 RANDOM = random.SystemRandom()
 GUOZHIJILIANG_STORY_SEEDS = [
     ("李四光", "从一块让少年困惑的大石头，写到他后来用地质力学为中国寻找石油"),
@@ -246,74 +260,78 @@ def content_length(text: str) -> int:
     return len(re.sub(r"\s+", "", text or ""))
 
 
-def lcs_length(text1: str, text2: str) -> int:
-    if not text1 or not text2:
-        return 0
-    previous = [0] * (len(text2) + 1)
-    for char1 in text1:
-        current = [0]
-        for index2, char2 in enumerate(text2, start=1):
-            if char1 == char2:
-                current.append(previous[index2 - 1] + 1)
-            else:
-                current.append(max(previous[index2], current[-1]))
-        previous = current
-    return previous[-1]
+def compact_similarity_text(text: str) -> str:
+    return re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", text or "")
 
 
-def segment_for_similarity(text: str) -> list[str]:
-    cleaned = re.sub(r"[，。！？；：、“”‘’《》【】（）,.!?;:'\"<>\[\]\(\)]", " ", text or "")
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    words: list[str] = []
-    for length in range(4, 1, -1):
-        for index in range(0, max(0, len(cleaned) - length + 1)):
-            word = cleaned[index:index + length]
-            if not re.search(r"\s", word):
-                words.append(word)
-    words.extend(char for char in cleaned if not re.search(r"\s", char))
-    return words
+def phrase_shingles(text: str, size: int = 6) -> set[str]:
+    cleaned = compact_similarity_text(text)
+    if len(cleaned) < size:
+        return {cleaned} if cleaned else set()
+    return {cleaned[index:index + size] for index in range(len(cleaned) - size + 1)}
 
 
-def cosine_similarity(words1: list[str], words2: list[str]) -> float:
-    counter1 = Counter(words1)
-    counter2 = Counter(words2)
-    all_words = set(counter1) | set(counter2)
-    if not all_words:
-        return 0.0
-    dot_product = sum(counter1[word] * counter2[word] for word in all_words)
-    magnitude1 = sum(value * value for value in counter1.values()) ** 0.5
-    magnitude2 = sum(value * value for value in counter2.values()) ** 0.5
-    if not magnitude1 or not magnitude2:
-        return 0.0
-    return dot_product / (magnitude1 * magnitude2)
+def keyword_terms(text: str) -> set[str]:
+    stopwords = {
+        "一个", "这个", "那个", "他们", "我们", "你们", "自己", "什么", "怎么", "就是",
+        "不是", "没有", "已经", "后来", "当时", "因为", "所以", "但是", "而且", "如果",
+        "为了", "可以", "还是", "直到", "终于", "开始", "这样", "那样", "这里", "那里",
+    }
+    if jieba is not None:
+        tokens = jieba.cut(str(text or ""), cut_all=False)
+    else:
+        tokens = re.findall(r"[\u4e00-\u9fff]{2,8}|[A-Za-z]+|\d+(?:年|月|日|岁)?", str(text or ""))
+    return {
+        token.strip().lower()
+        for token in tokens
+        if len(token.strip()) >= 2 and token.strip() not in stopwords
+    }
 
 
 def compare_scripts(text1: str, text2: str) -> dict:
-    text1 = text1 or ""
-    text2 = text2 or ""
-    total_chars = len(text1) + len(text2)
-    char_similarity = round((lcs_length(text1, text2) * 2 / total_chars) * 100) if total_chars else 0
+    compact1 = compact_similarity_text(text1)
+    compact2 = compact_similarity_text(text2)
+    total_chars = len(compact1) + len(compact2)
+    matcher = SequenceMatcher(None, compact1, compact2, autojunk=False)
+    min_reuse_chars = min(8, max(1, min(len(compact1), len(compact2))))
+    reused_blocks = [block for block in matcher.get_matching_blocks() if block.size >= min_reuse_chars]
+    reused_chars = sum(block.size for block in reused_blocks)
+    continuous_reuse = round((reused_chars * 2 / total_chars) * 100) if total_chars else 0
 
-    words1 = segment_for_similarity(text1)
-    words2 = segment_for_similarity(text2)
-    set1 = set(words1)
-    set2 = set(words2)
-    intersection = set1 & set2
-    union = set1 | set2
-    jaccard_similarity = len(intersection) / len(union) if union else 0
-    semantic_similarity = round(((jaccard_similarity + cosine_similarity(words1, words2)) / 2) * 100)
-    overall_similarity = round((char_similarity + semantic_similarity) / 2)
+    shingles1 = phrase_shingles(compact1)
+    shingles2 = phrase_shingles(compact2)
+    phrase_union = shingles1 | shingles2
+    phrase_overlap = round((len(shingles1 & shingles2) / len(phrase_union)) * 100) if phrase_union else 0
+
+    terms1 = keyword_terms(text1)
+    terms2 = keyword_terms(text2)
+    term_union = terms1 | terms2
+    keyword_overlap = round((len(terms1 & terms2) / len(term_union)) * 100) if term_union else 0
+
+    # Only verbatim passage reuse affects acceptance. Shared names, dates and factual
+    # keywords remain visible as a diagnostic but do not penalize a legitimate rewrite.
+    overall_similarity = round((continuous_reuse * 0.75) + (phrase_overlap * 0.25))
     overall_difference = max(0, min(100, 100 - overall_similarity))
+    reused_passages = sorted(
+        {compact1[block.a:block.a + block.size] for block in reused_blocks},
+        key=len,
+        reverse=True,
+    )[:8]
 
     return {
-        "character_similarity": char_similarity,
-        "semantic_similarity": semantic_similarity,
+        "continuous_reuse": continuous_reuse,
+        "phrase_overlap": phrase_overlap,
+        "keyword_overlap": keyword_overlap,
+        # Backward-compatible aliases for existing stored projects and API clients.
+        "character_similarity": continuous_reuse,
+        "semantic_similarity": keyword_overlap,
         "overall_difference": overall_difference,
-        "text1_length": len(text1),
-        "text2_length": len(text2),
-        "common_keywords": [word for word in intersection if len(word) >= 2][:10],
-        "unique_keywords1": [word for word in set1 - set2 if len(word) >= 2][:10],
-        "unique_keywords2": [word for word in set2 - set1 if len(word) >= 2][:10],
+        "text1_length": len(compact1),
+        "text2_length": len(compact2),
+        "reused_passages": reused_passages,
+        "common_keywords": sorted(terms1 & terms2, key=len, reverse=True)[:10],
+        "unique_keywords1": sorted(terms1 - terms2, key=len, reverse=True)[:10],
+        "unique_keywords2": sorted(terms2 - terms1, key=len, reverse=True)[:10],
         "passed": overall_difference >= MIN_REWRITE_DIFFERENCE,
     }
 
@@ -682,10 +700,21 @@ def build_rewrite_prompt(raw_script: str, style: str, attempt: int, previous: di
     retry_instruction = ""
     if previous:
         comparison = previous.get("rewrite_comparison") or {}
+        previous_script = str(previous.get("rewritten_script") or "").strip()
+        reused_passages = [
+            str(item).strip()
+            for item in comparison.get("reused_passages", [])
+            if str(item).strip()
+        ]
+        reused_summary = "；".join(reused_passages[:8]) or "系统未定位到单一长句，请全面检查正文表达"
         retry_instruction = (
             f"上一版总体差异度只有 {comparison.get('overall_difference', 0)}%，未达到 {MIN_REWRITE_DIFFERENCE}%。"
-            f"字符相似度 {comparison.get('character_similarity', 0)}%，语义相似度 {comparison.get('semantic_similarity', 0)}%。"
-            "这说明上一版仍然太像原文。请不要继续做同义词替换，必须重新组织正文：改变叙述视角、句子顺序、铺垫方式、转折方式和情绪推进。"
+            f"连续照抄率 {comparison.get('continuous_reuse', comparison.get('character_similarity', 0))}%，"
+            f"长短语重合率 {comparison.get('phrase_overlap', 0)}%。"
+            f"重点重复片段：{reused_summary}。"
+            "固定开头仍须原样保留；请重点重写固定开头之后的重复句段。保持原文事件顺序、因果关系和信息揭示顺序，"
+            "但更换句子组织、叙述落点、段内铺垫、转折表达和情绪推进，不要继续在上一版上做少量换词。"
+            f"\n<previous_rewrite>{previous_script}</previous_rewrite>"
         )
     prompt = f"""
 你是一名视频号爆款短视频文案改写专家，擅长改写卖书类、历史人物类、大国情绪类、爱国教育类短视频口播文案。
@@ -697,6 +726,13 @@ def build_rewrite_prompt(raw_script: str, style: str, attempt: int, previous: di
 你只能从这段受保护内容之后开始优化。即使你判断开头不够好，也不能擅自改动。
 必须原样保留的开头是：{opening_hook}
 
+【固定开头后的连续叙事】
+固定开头不是一段可以独立放置的引子，而是整篇文案正在发生的第一段剧情。后续正文必须紧接固定开头最后一句继续讲，不能另起一个开头。
+改写时要尊重原文在固定开头之后的结构、叙事顺序和段落功能。原文接下来是在推进现场、补人物背景、倒叙往事、解释原因还是揭晓悬念，改写稿也应沿着这个结构自然展开，不要擅自强迫它提前揭晓悬念或重排剧情。
+固定开头后的第一句必须承担过渡作用，让观众知道后文和开头是同一个故事。它可以继续当前场景，也可以按照原文结构转入背景或往事，但要用人物关系、因果、时间或话题连接起来，不能无视前文重新制造钩子。
+禁止在固定开头后再次使用“谁能想到”“你敢相信吗”“很多人不知道”“他到底是谁”等二次钩子来重启文案；也不要像第一次出场一样重新介绍同一个人物，造成两个独立开头。原文确实转入人物背景时，可以保留这一结构，但必须写成承接上文的背景补充。
+例如固定开头以“妻子追出来说了一番话，把他感动得老泪纵横”结束，而原文接下来转入他早年的经历，可以写“而这场迟到了四十二年的重逢，还要从他当年离开广东说起”，不能直接写“谁能想到，一个广东读书人……”另起一个开头。
+
 【改写目标】
 保留原文的短视频味道，不要改成书面文章。
 改写后的文案要像一个懂视频号的人在口播，而不是像公众号社论、新闻评论、AI润色稿、学生作文。
@@ -704,10 +740,10 @@ def build_rewrite_prompt(raw_script: str, style: str, attempt: int, previous: di
 不要追求文采高级，要追求用户愿意听下去、愿意点赞、愿意评论、愿意转发。
 
 【只允许原样保留的内容】
-1. 只有原文前三秒钩子必须逐字保留。
+1. 只有用户选定的固定开头必须逐字保留；未手动选择时，保留系统识别的前三秒钩子。
 2. 人名、地名、年份、数字、事件等客观事实可以保留，但承载这些事实的句子必须重新表达。
-3. 除前三秒钩子和无法改写的专有名词外，原文中的完整句子、金句、狠话、过渡句、情绪表达和带书话术都不要照抄。
-4. 不要求保留原文的句式、段落顺序、叙述视角、情绪推进方式或表达风格；这些内容必须重新组织。
+3. 除固定开头和无法改写的专有名词外，原文中的完整句子、金句、狠话、过渡句、情绪表达和带书话术都不要照抄。
+4. 保留原文的事件先后、因果关系、信息揭示顺序和各段叙事功能；不要照搬原文句式、段内组织、叙述落点、转折表达和措辞。
 
 【禁止事项】
 不要做简单同义词替换。
@@ -718,39 +754,43 @@ def build_rewrite_prompt(raw_script: str, style: str, attempt: int, previous: di
 不要把文案改成端着的播音腔。
 不要一上来介绍背景，不要平铺直叙。
 不要用背景、环境、天气、时代、氛围、人物状态来开头。开头必须先给爆点、冲突、结果、反差或悬念。
-如果原文前三秒之后需要承接，承接句也不要写“在那个年代”“当时的环境”“故事要从某年说起”，要直接进入具体事件和具体动作。
+固定开头后的第一句不要生硬套用“在那个年代”“当时的环境”“故事要从某年说起”。需要按原文结构转入背景时，要先建立它与固定开头的联系，再自然过渡。
 不要削弱原文的爽感、反差感和情绪冲击。
 
 【短视频改写原则】
 一、句子要短。适合真人口播。能用短句就不要用长句。能用人话就不要用书面话。
 二、表达要狠。该硬的地方要硬。比如：“你可以试试敢不敢将它击落。”这种句子不要改成：“那便试试看是否敢于动用武力击落。”
 三、要有画面。多保留或强化具体画面：飞机起飞、国旗铺满街道、地图包围、旧照片、病房电脑、公文包、胶鞋、行李箱、实验室灯光、戈壁风沙。少写抽象评价。
-四、要有情绪递进。文案结构尽量按照：前三秒钩子不变 → 具体事件暴击 → 关键冲突 → 必要背景解释 → 历史伤痛/现实困境 → 今日反转 → 情绪爆发 → 跟随原文主题自然收束。背景只能在爆点之后补，不能放在开头。
+四、要有情绪递进。固定开头保持不变，后文优先尊重原文已有的叙事结构和信息揭示顺序，在此基础上强化具体事件、关键冲突、必要背景、转折和情绪爆发。可以在悬念揭晓前补背景，但必须自然承接，不能紧跟固定开头另起炉灶。
 五、带书内容跟随原文：{conversion_instruction}
 
 【分段要求】
-按画面逻辑组织自然段，但不限制每段字数，也不限制自然段内部换行。
-每段应尽量对应一个完整画面，方便后续 AI 配图、素材搜索和剪映剪辑。
+按画面逻辑组织自然段，画面和语义完整优先于字数。每段建议控制在 40 到 60 个中文字符，通常不要超过 80 个字符，但不能只因为达到某个字数就强行拆段。
+用户选定的固定开头必须完整原样保留，不受段落字数建议限制，不得为了控制段落长度删改或拆碎固定开头。
+每段应尽量对应一个完整画面，方便后续 AI 配图、素材搜索和剪映剪辑。只有出现时间、地点、人物动作、画面主体或情绪节点变化时才换段；同一人物、同一时间地点、同一连续动作应尽量放在一段。
+去除空白后少于 25 个字符的段落，除非它本身是一个独立且有冲击力的完整画面，否则应与相邻段落合并。超过 80 个字符时，也只能在自然的语义或画面转换处拆段，不能从一句话中间生硬截断。
+一个自然段内部不要换行，段落之间使用空行分隔。
 换段标准是：时间变化、地点变化、人物动作变化、画面主体变化、情绪节点变化。
 不要按朗读断句分段，而要按画面分段。
 不要在 rewritten_script 中添加 [1]、[2] 等序号，序号由前端界面展示。
 
 【改写尺度】
-不是洗稿式同义替换，而是在保留前三秒和事实边界的前提下重新写一篇文案。
+不是洗稿式同义替换，而是在保留固定开头、原文叙事骨架和事实边界的前提下重新表达整篇文案。
 可以删掉重复啰嗦的句子。
 可以强化画面感和冲突感。
-必须调整正文结构、叙述顺序、句式、转折方式和情绪推进。
-可以更换叙述视角，可以把后文爆点前置；只有原文包含带书内容时，才可以重新设计其表达方式。
-除前三秒外，不得连续照抄原文句子；不得只靠换词、增删标点或重新分段制造改写效果。
+必须调整固定开头之后的句子组织、段内铺垫、叙述落点、转折方式和情绪推进，但不得为了制造差异擅自打乱事件顺序或提前揭晓原文悬念。
+可以在不改变事实主体和叙事顺序的前提下更换叙述视角；只有原文包含带书内容时，才可以重新设计其表达方式。
+除固定开头外，不得连续照抄原文句子；不得只靠换词、增删标点或重新分段制造改写效果。
 
 【长度和质量约束】
 原文去除空白后的长度约 {raw_len} 个中文字符。
 rewritten_script 去除空白后的长度必须控制在 {min_len} 到 {max_len} 个中文字符之间。
 不要压缩成摘要、提纲或短版解说，也不要省略原文中的重要事实。
 事实边界：不虚构；不添加没有依据的具体时间、地点、人物关系；人物、年代、事件、因果关系必须保留。
-除必须原样保留的前三秒开头、专有名词、年份、数字和固定称谓之外，整体内容必须重新组织。
-系统会用字符相似度和语义相似度自动对比，最终总体差异度必须达到 {MIN_REWRITE_DIFFERENCE}% 以上。
-40% 是硬性验收线：不能通过重新换行、调整标点或少量同义词替换达成，正文必须让读者明显感到是重新讲述。
+除必须原样保留的固定开头、专有名词、年份、数字和固定称谓之外，整体表达必须重新组织。
+系统会检测连续照抄片段和六字以上长短语重合，最终总体差异度必须达到 {MIN_REWRITE_DIFFERENCE}% 以上。固定开头也参与相似度计算，不得为了提高分数改动固定开头。
+人名、地点、年份和事实关键词的正常重合只单独展示，不计入差异度；不要为了降低关键词重合而篡改事实。
+{MIN_REWRITE_DIFFERENCE}% 是硬性验收线：不能通过重新换行、调整标点或少量同义词替换达成，固定开头之后的正文必须让读者明显感到是重新讲述。
 
 【本次生成信息】
 文案风格：{style}。
@@ -760,6 +800,8 @@ rewritten_script 去除空白后的长度必须控制在 {min_len} 到 {max_len}
 只返回可解析 JSON，字段必须包含 title, hook, rewritten_script, script_style。
 rewritten_script 字段里只能放改写后的完整文案正文，禁止包含原文、原始文案、对照稿、解释、标题标签或“二创口播稿：”这类前缀。
 不要先输出一遍原文再输出二创稿，也不要把原文和二创内容混在一起。
+输出前自检固定开头与第一句新正文：如果第一句像与前文无关的新钩子，或像同一人物第一次出场一样重新介绍，必须在不改变原文叙事结构的前提下重写成自然过渡。
+输出前检查分段是否过碎：不能为了凑 40 到 60 字拆散同一个连续画面；少于 25 字且不能独立成画面的段落要与相邻段合并，超过 80 字的段落只在确有画面转换时自然拆分。
 
 <raw_script>{raw_script}</raw_script>
 """
@@ -794,7 +836,7 @@ def request_minimax_rewrite(prompt: str, raw_script: str, style: str, api_key: s
     payload = {
         "model": minimax_model(),
         "messages": [
-            {"role": "system", "content": "你只输出可解析 JSON。rewritten_script 按画面逻辑自然分段，不限制每段字数或段内换行，不要在正文中添加段落序号。"},
+            {"role": "system", "content": "你只输出可解析 JSON。rewritten_script 按完整画面自然分段，不能为了字数把连续画面拆碎；每段建议 40 到 60 个中文字符，通常不超过 80 字，少于 25 字且不能独立成画面的段落应合并。用户选定的固定开头不受字数限制并必须原样保留。一个自然段内部不要换行，段落之间使用空行，不要在正文中添加段落序号。"},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.65,
@@ -1366,31 +1408,59 @@ def strip_title_punctuation(text: str) -> str:
     return re.sub(r"\s+", "", punctuation.sub("", str(text or ""))).strip()
 
 
-def cover_title_needs_rewrite(line1: str, line2: str, script: str = "") -> bool:
+def title_evidence_is_valid(line1: str, line2: str, evidence_quote: str, script: str) -> bool:
+    evidence = compact_similarity_text(evidence_quote)
+    source = compact_similarity_text(script)
+    if not 6 <= len(evidence) <= 80 or evidence not in source:
+        return False
+    evidence_bigrams = phrase_shingles(evidence, size=2)
+    line1_supported = bool(phrase_shingles(line1, size=2) & evidence_bigrams)
+    line2_is_question = any(word in line2 for word in ("为何", "为什么", "到底", "凭什么", "谁", "真相"))
+    line2_supported = line2_is_question or bool(phrase_shingles(line2, size=2) & evidence_bigrams)
+    return line1_supported and line2_supported
+
+
+def cover_title_rejection_reasons(
+    line1: str,
+    line2: str,
+    script: str = "",
+    evidence_quote: str | None = None,
+) -> list[str]:
     combined = f"{line1}{line2}"
+    reasons: list[str] = []
+    evidence_valid = (
+        title_evidence_is_valid(line1, line2, evidence_quote, script)
+        if evidence_quote is not None else False
+    )
     if not combined:
-        return True
+        return ["标题为空"]
+    if TITLE_VAGUE_PRONOUN_DIALOGUE_PATTERN.search(line1) or TITLE_VAGUE_PRONOUN_DIALOGUE_PATTERN.search(line2):
+        reasons.append("包含主体不明的代词对话")
     # “没先做某事”通常只是把一个正常选择硬包装成反常行为，而且隐藏了
     # 真正发生的动作。封面标题应直接写实际选择及其代价，而不是虚构预期。
     if any(pattern in combined for pattern in TITLE_FAKE_CONTRAST_PATTERNS):
-        return True
+        reasons.append("使用没先等词制造虚假反差")
     # 时间顺序、独自行动等修饰语会实质改变事实；原文没有时不能为制造冲突添加。
     if script:
         if any(modifier in combined and modifier not in script for modifier in TITLE_FACT_SENSITIVE_MODIFIERS):
-            return True
+            reasons.append("加入了原文没有的时间或行动修饰语")
         if TITLE_SEQUENCE_ACTION_PATTERN.search(combined) and "先" not in script:
-            return True
+            reasons.append("加入了原文没有的先后顺序")
     if any(pattern in combined for pattern in WEAK_COVER_TITLE_PATTERNS):
-        return True
+        reasons.append("包含空洞总结或泛情绪反应")
     if any(left in combined and right in combined for left, right in COVER_TITLE_SPOILER_COMBOS):
-        return True
+        reasons.append("标题直接说完了爆点")
     if any(ending in line2 for ending in TITLE_SUMMARY_ENDINGS):
-        return True
-    if len(combined) >= 6 and not any(word in combined for word in COVER_TITLE_ATTRACTION_WORDS):
-        return True
-    if len(combined) >= 8 and not any(word in combined for word in TITLE_OPEN_LOOP_WORDS):
-        return True
-    return False
+        reasons.append("第二行是总结式收束")
+    if len(combined) >= 8 and not any(word in combined for word in TITLE_OPEN_LOOP_WORDS) and not evidence_valid:
+        reasons.append("没有形成有效悬念或认知落差")
+    if evidence_quote is not None and not evidence_valid:
+        reasons.append("原文依据无效或不能支持标题核心内容")
+    return list(dict.fromkeys(reasons))
+
+
+def cover_title_needs_rewrite(line1: str, line2: str, script: str = "") -> bool:
+    return bool(cover_title_rejection_reasons(line1, line2, script))
 
 
 def cover_title_score(line1: str, line2: str, script: str) -> int:
@@ -1398,7 +1468,7 @@ def cover_title_score(line1: str, line2: str, script: str) -> int:
     score = 0
     score += sum(5 for word in COVER_TITLE_ATTRACTION_WORDS if word in combined)
     score += sum(3 for char in combined if char.isdigit())
-    score += 6 if any(word in combined for word in ("却", "竟", "不敢", "不能", "最后", "凭什么", "到底")) else 0
+    score += 6 if any(word in combined for word in ("却", "竟", "不能", "最后", "凭什么", "到底")) else 0
     score += 10 if any(word in combined for word in TITLE_OPEN_LOOP_WORDS) else 0
     score += 8 if any(word in line2 for word in ("却", "竟", "反而", "偏偏", "为何", "为什么", "到底", "凭什么", "谁")) else 0
     score += 4 if line1 in script or line2 in script else 0
@@ -1426,110 +1496,51 @@ def generate_viral_title(script: str) -> dict:
     """Generate a two-line cover title; retry instead of truncating overlong lines."""
     api_key = os.getenv("MINIMAX_API_KEY", "").strip()
     if not api_key:
-        return {"line1": "", "line2": "", "full_title": ""}
+        return {"line1": "", "line2": "", "full_title": "", "error": "MINIMAX_API_KEY is not configured"}
 
     base_prompt = (
-        "你是视频号和抖音爆款封面标题专家，擅长为历史人物、爱国教育、大国叙事、卖书转化类短视频生成高停留率封面标题。"
-        "\n\n请根据我提供的文案内容，生成两行式短视频封面标题。"
-        "\n\n目标：让用户在推荐流里扫一眼就想停下来，产生“为什么会这样”“这也太离谱了”“这个人是谁”“我得看下去”的反应。"
-        "\n\n【最重要原则】"
-        "\n标题不是文章标题，不是新闻标题，不是中心思想，不是文案摘要。"
-        "\n标题只需要抓住文案里最有冲突、最反常识、最心疼、最不公平、最有画面感的一个局部爆点。"
-        "\n宁可抓一个狠瞬间，也不要写得全面、平衡、正确但没人想点。"
-        "\n必须通读整篇文案后再选爆点，不能只根据开头、人物身份或最终成就起标题。"
-        "\n爆点必须来自文案中的真实具体事实，优先选择全篇冲突强度最高、最让普通人意外的那一件事。"
-        "\n标题的逻辑必须独立成立：前一行是处境，后一行必须是真正出人意料的选择或后果，不能仅靠却、竟、没、反而等词假装反常。"
-        "\n判断反常时必须使用普通人的现实常识：只有相反选择明显更正常、更合理时，当前选择才算反常；如果多数人处在同样处境也会这么做，就不是爆点。"
-        "\n尤其禁止把正常的不作为包装成反常，例如丈夫被关押时，妻子没有先带孩子回国本身很正常，不能写成悬念；若真正爆点是她掉头回国、留下营救或作出其他主动选择，应直接写那个真实动作。"
-        "\n不得为了制造反差擅自添加先、独自、立即、马上、转身、掉头等会改变事实或时间顺序的词，除非文案明确写出。"
-        "\n\n【生成前的内部步骤】"
-        "\n在生成标题前，请你先在内部完成以下判断，但不要输出过程："
-        "\n1. 从文案里提炼5个最有停留价值的爆点瞬间。"
-        "\n2. 判断哪个爆点最适合做封面标题。"
-        "\n3. 优先选择有具体画面、具体动作、具体物品、具体数字的爆点。"
-        "\n4. 不要优先选择抽象主题、人物贡献、中心思想。"
-        "\n5. 站在普通视频号用户视角反审：如果我刷到这个标题，会不会停下来？如果不会，必须重写。"
-        "\n6. 给5个爆点按冲突强度、反常识程度、具体画面感、情绪代价分别打分，最终标题必须围绕总分最高的爆点。"
-        "\n7. 不得因为某个爆点出现在文案开头就优先选它；后文爆点更强时必须选择后文。"
-        "\n8. 对每个候选做反事实检查：去掉却、竟、没等转折词后，后一行是否仍是一件客观异常且值得追问的事；若只是正常选择，整组淘汰。"
-        "\n9. 检查两行的主体、时间和因果是否衔接；不能偷换人物，不能把先后顺序或普通反应硬说成反差。"
-        "\n\n【标题格式】"
-        "\n1. 必须生成两行文字。"
-        "\n2. 每行1到9个字，任何一行都不能超过9个字。"
-        "\n3. 每组标题由“第一行”和“第二行”组成。"
-        "\n4. 标题中禁止出现任何标点符号，包括逗号、句号、感叹号、问号、冒号、破折号、引号等。"
-        "\n5. 如果一句话超过9个字，必须重新概括成更短的完整表达，严禁直接截断。"
-        "\n6. 只返回JSON，不要Markdown，不要解释。"
-        "\n\n【两行分工】"
-        "\n第一行优先放：冲突现场、反常动作、具体物品、身份反差、强结果。"
-        "\n第二行优先放：悬念补刀、情绪放大、代价、反差、追问、亏欠感。"
-        "\n两行之间必须形成认知落差：第一行建立预期，第二行打破预期或留下一个没有解释完的问题。"
-        "\n认知落差必须来自事实本身，而不是由却、竟、没、反而等连接词强行制造。没有真实反常点时，宁可写具体困境、主动动作或明确代价。"
-        "\n禁止写成完整的因果总结、人物评价或功绩概括，例如“隐姓埋名二十年/铸就雷达千里眼”。"
-        "\n第二行禁止用铸就、成就、奉献、贡献、功勋、报国、守护中国、照亮中国等词收束主题。"
-        "\n\n好的结构示例："
-        "\n第一行：父亲去世那天\n第二行：他不敢回家"
-        "\n第一行：美国扣下箱子\n第二行：到底怕什么"
-        "\n第一行：她捐出千万\n第二行：却穿15块鞋"
-        "\n第一行：名单上没她\n第二行：她自己划掉"
-        "\n第一行：法国领奖台\n第二行：他却不笑"
-        "\n第一行：病床前电脑\n第二行：他还在敲字"
-        "\n\n【标题风格】"
-        "\n标题必须口语化、狠一点、像人话。"
-        "\n可以大胆使用爆款短视频写法：悬念、反差、冲突、误区纠正、身份反差、强结果、强代价、心疼感、不公平感、亏欠感。"
-        "\n不要端着。不要像纪念馆展板。不要像作文题目。不要像新闻标题。不要像领导题词。不要像百科词条。"
-        "\n\n【优先使用的爆点类型】"
-        "\n1. 认知误区：用户以为是A，其实是B。"
-        "\n2. 身份反差：看起来普通的人，做了极不普通的事。"
-        "\n3. 荣誉缺席：明明立大功，却没有名字。"
-        "\n4. 亲情亏欠：父亲去世不能回家，母亲骂他不孝。"
-        "\n5. 生死瞬间：临终前、坠毁前、病床上、最后一天。"
-        "\n6. 屈辱反击：被外国人看不起，后来用结果打回去。"
-        "\n7. 具体物品：公文包、旧胶鞋、行李箱、手稿、算盘、病号服、轮椅、饭盘、抽屉、奖章。"
-        "\n8. 数字反差：15块鞋、1000万、52人、30年、90岁、最后一天。"
-        "\n\n【高停留词优先】"
-        "\n可以优先使用这些词：扣下、炸掉、抹掉、坠毁、不能回家、被骂、捐出、消失、千万、15块、普通老太太、亲手、名单、功劳簿、凭什么、为什么、到底、没人敢、谁也没想到、最后一天、没名字、没热搜、被忘了、全额赔钱、他却不笑、她自己划掉。"
-        "\n\n【禁止使用】"
-        "\n不要用这些空洞词：震惊、惊人、不可思议、伟大、精神、民族脊梁、大国、传奇、一生、值得铭记、感人至深、无私奉献、家国情怀、时代楷模、光辉事迹。"
-        "\n不要写成这种：国之脊梁、民族英雄、伟大科学家、致敬先辈、孩子该看、中国骄傲、隐姓埋名一生、共和国不会忘记。"
-        "\n这些太正、太空、太像展板，不能作为封面标题。"
-        "\n\n【避免自我解谜】"
-        "\n不要写一眼就把故事讲完的标题。"
-        "\n比如：第一行：女儿病危那天\n第二行：他死盯图纸"
-        "\n这种用户一眼就猜到“为国家舍小家”，张力已经被解释完。"
-        "\n要留一点空，让用户想知道为什么。"
-        "\n更好的方式：第一行：女儿病危那天\n第二行：他不敢抬头"
-        "\n或者：第一行：病危通知来了\n第二行：他却没回家"
-        "\n\n【输出数量】"
-        "\n请一次生成12组标题。"
-        "\n12组标题要尽量覆盖不同类型，不要全是疑问句，不要全是同一种模板。"
-        "\n第1组必须是你判断的全篇最强爆点，后续各组才允许尝试其他角度。"
-        "\n每组必须包含：first_line、second_line、style。"
-        "\nstyle只能从以下类型中选择：悬念型、反差型、冲突型、心疼型、爽感型、亏欠型、误区型、画面型。"
-        "\n\n【最终自检】"
-        "\n输出前请内部自检："
-        "\n1. 每行是否不超过9个字。"
-        "\n2. 是否没有标点符号。"
-        "\n3. 是否像封面大字，而不是文章标题。"
-        "\n4. 是否抓住了具体爆点，而不是全文概括。"
-        "\n5. 普通用户扫一眼是否有停留理由。"
-        "\n6. 是否避免了空洞大词。"
-        "\n7. 是否有足够反差或悬念。"
-        "\n8. 去掉转折词后，所谓反常是否仍然成立；如果只是正常人的正常选择，必须淘汰。"
-        "\n9. 标题中的先后顺序、人物动作和因果关系是否都能在原文中找到依据。"
-        "\n如果不合格，必须重写后再输出。"
-        "\n\n【输出格式】"
-        "\n只返回JSON数组，不要Markdown，不要解释。"
-        "\n格式如下："
-        '\n[{"first_line": "第一行", "second_line": "第二行", "style": "悬念型"}]'
+        "你是短视频封面标题策划。请通读整篇文案，生成两行式封面标题。"
+        "\n\n【选择标题角度】"
+        "\n先提炼全文核心命题：主人公是谁、完成了什么任务、持续多久、付出什么代价、最终出现什么结果。"
+        "\n再提炼文中的局部冲突、反常选择、关键动作和具体后果，并把它们与全文核心命题比较。"
+        "\n最终应选择普通观众最容易一眼理解、信息含量最高、最值得继续看的真实事实。局部瞬间并不天然优于全文核心事实。"
+        "\n当人物的特殊身份、极端时长、任务风险或人生代价本身已经足够反常时，可以直接围绕这些核心事实起标题，不得因为它属于人物身份或全文概括就降级。"
+        "\n如果全文没有足够强的局部悬念，可以写有具体身份、数字、任务或结果的事实概括标题；宁可准确、清楚、有信息量，也不要硬凑反差和悬念。"
+        "\n不得只抓红烛、眼泪、旧照片、低头等装饰性细节，而忽略贯穿全文的重大身份、任务、时间跨度和人生代价。"
+        "\n\n【真实性】"
+        "\n标题的身份、数字、动作、人物关系、先后顺序和因果必须能在原文中找到直接依据。"
+        "\n不得添加原文没有的独自、立即、马上、转身、掉头等修饰语，不得把正常反应包装成反常选择。"
+        "\n禁止使用主体不明的代词对话，禁止把不敢抬头、低下头、红了眼、流泪、沉默等普通情绪反应当成核心爆点。"
+        "\n两行脱离正文后也必须逻辑完整、主体清楚。疑问或反差只能来自事实本身，不能依靠却、竟、没、到底等词硬造。"
+        "\n\n【表达要求】"
+        "\n标题要口语化、具体、简洁，避免空洞评价、口号、人物颂词、中心思想和没有事实信息的情绪词。"
+        "\n第一行和第二行可以组成冲突、反差、悬念，也可以共同构成一条有力度的核心事实概括，不强制套用固定结构。"
+        "\n每行1到9个字，不得有任何标点；超过9字必须重新概括，严禁直接截断。"
+        "\n\n【候选与依据】"
+        "\n一次生成12组不同角度的候选。候选必须同时覆盖全文核心事实和局部关键事件，不得全部围绕同一种小细节。"
+        "\n第1组必须是综合全文后判断的最强标题。"
+        "\n每组必须包含 first_line、second_line、style、evidence_quote。"
+        "\nstyle 只能是悬念型、反差型、冲突型、心疼型、爽感型、亏欠型、误区型、画面型、事实型之一。"
+        "\nevidence_quote 必须从原文逐字复制6到80字，直接支撑标题两行的身份、数字、动作和人物关系，不得改写或编造。"
+        "\n\n【输出前自检】"
+        "\n比较全文核心事实与局部瞬间，确认没有用次要细节遮住更强的身份、时长、任务或代价。"
+        "\n检查标题是否脱离正文也能看懂，是否有真实信息，是否存在空洞情绪、假反差、事实篡改或无效依据。"
+        "\n不合格必须重写。只返回JSON数组，不要Markdown或解释。"
+        '\n返回格式：[{"first_line":"第一行","second_line":"第二行","style":"事实型","evidence_quote":"原文直接依据"}]'
         "\n\n下面是文案内容："
         f"\n{script[:6000]}"
     )
 
     last_error = ""
     try:
-        for _ in range(3):
-            retry_note = f"\n\n上一版不合格：{last_error}。请重新生成，不要截断原句。" if last_error else ""
+        for attempt in range(1, 4):
+            retry_note = f"\n\n上一版不合格，具体原因：{last_error}。请针对这些原因重新生成，不要重复上一版的问题。" if last_error else ""
+            if attempt == 3:
+                retry_note += (
+                    "\n\n这是最后一次生成。不要再从零散小细节中硬凑悬念。"
+                    "请回到全文核心命题，优先使用有原文依据的特殊身份、明确数字、时间跨度、核心任务、重大结果或人生代价。"
+                    "允许输出事实型概括标题，不强制制造疑问或反差。"
+                )
             payload = {
         "model": minimax_model(),
                 "messages": [
@@ -1557,24 +1568,39 @@ def generate_viral_title(script: str) -> dict:
             candidates = parse_title_candidates(str(content))
             last_error = "12组标题里没有合格候选"
             valid_candidates = []
+            rejection_details: list[str] = []
+            seen_titles: set[tuple[str, str]] = set()
             for candidate_index, item in enumerate(candidates):
                 line1 = strip_title_punctuation(item.get("first_line") or item.get("line1") or "")
                 line2 = strip_title_punctuation(item.get("second_line") or item.get("line2") or "")
-                if 1 <= len(line1) <= 9 and 1 <= len(line2) <= 9 and not cover_title_needs_rewrite(line1, line2, script):
-                    valid_candidates.append({
-                        "line1": line1,
-                        "line2": line2,
-                        "full_title": f"{line1} {line2}",
-                        "style": str(item.get("style") or "").strip(),
-                        # The prompt requires the model to rank its strongest title
-                        # first. Preserve that semantic judgement while still using
-                        # local scoring to break ties and reject weak structures.
-                        "score": cover_title_score(line1, line2, script) + max(0, 12 - candidate_index) * 4,
-                    })
+                evidence_quote = str(item.get("evidence_quote") or "").strip()
+                title_key = (line1, line2)
+                reasons: list[str] = []
+                if not 1 <= len(line1) <= 9 or not 1 <= len(line2) <= 9:
+                    reasons.append("单行超过9字或为空")
+                if title_key in seen_titles:
+                    reasons.append("候选标题重复")
+                reasons.extend(cover_title_rejection_reasons(line1, line2, script, evidence_quote))
+                seen_titles.add(title_key)
+                if reasons:
+                    rejection_details.append(f"{line1}/{line2}：{'、'.join(dict.fromkeys(reasons))}")
+                    continue
+                valid_candidates.append({
+                    "line1": line1,
+                    "line2": line2,
+                    "full_title": f"{line1} {line2}",
+                    "style": str(item.get("style") or "").strip(),
+                    "evidence_quote": evidence_quote,
+                    "score": cover_title_score(line1, line2, script),
+                    "model_rank": candidate_index,
+                })
             if valid_candidates:
-                best = max(valid_candidates, key=lambda item: item["score"])
+                best = max(valid_candidates, key=lambda item: (item["score"], -item["model_rank"]))
                 best.pop("score", None)
+                best.pop("model_rank", None)
                 return best
+            if rejection_details:
+                last_error = "；".join(rejection_details[:4])
         return {"line1": "", "line2": "", "full_title": "", "error": last_error or "Title generation failed"}
     except Exception as exc:
         return {"line1": "", "line2": "", "full_title": "", "error": str(exc)[:200]}

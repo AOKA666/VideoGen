@@ -15,12 +15,15 @@ from services.text_service import (  # noqa: E402
     GUOZHIJILIANG_STORY_SEEDS,
     MIN_GUOZHIJILIANG_SCRIPT_CHARS,
     MIN_GUOZHIJILIANG_SCRIPT_PARAGRAPHS,
+    MIN_REWRITE_DIFFERENCE,
     RECENT_GUOZHIJILIANG_OPENINGS,
     RECENT_GUOZHIJILIANG_PEOPLE,
     build_guozhijiliang_script_prompt_v2,
     build_rewrite_prompt,
     choose_guozhijiliang_seed,
     clean_shot_visual_terms,
+    compare_scripts,
+    cover_title_rejection_reasons,
     cover_title_needs_rewrite,
     ensure_original_opening,
     extract_opening_hook,
@@ -34,6 +37,9 @@ from services.text_service import (  # noqa: E402
 
 
 class ShotTagGenerationTests(unittest.TestCase):
+    def test_rewrite_requires_fifty_percent_difference(self) -> None:
+        self.assertEqual(50, MIN_REWRITE_DIFFERENCE)
+
     def test_opening_hook_uses_complete_sentences_between_20_and_35_chars(self) -> None:
         source = "他拒绝了所有人的劝告。因为那个箱子里，藏着不能公开的秘密。后面的故事继续。"
 
@@ -133,6 +139,20 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertFalse(cover_title_needs_rewrite("丈夫被关监狱", "她四处奔走营救", script))
         self.assertFalse(cover_title_needs_rewrite("普通老先生", "护住公文包", "老人护住了公文包。"))
 
+    def test_cover_title_rejects_vague_dialogue_and_generic_emotion(self) -> None:
+        script = "妻子告诉他自己回不来了，让他别再等。听完以后，他一直低着头。"
+
+        self.assertTrue(cover_title_needs_rewrite("她说回不来别等了", "他不敢抬头", script))
+        self.assertTrue(cover_title_needs_rewrite("等了整整四十年", "他流下眼泪", script))
+
+    def test_cover_title_accepts_evidence_backed_core_fact_without_forced_suspense(self) -> None:
+        script = "他是地下党员，在台湾潜伏42年，为了等妻子一生没有再娶。"
+        evidence = "他是地下党员，在台湾潜伏42年，为了等妻子一生没有再娶"
+
+        reasons = cover_title_rejection_reasons("地下党潜伏42年", "一生没有再娶", script, evidence)
+
+        self.assertEqual([], reasons)
+
     def test_generate_viral_title_fails_instead_of_using_fallback(self) -> None:
         class FakeResponse:
             def __enter__(self):
@@ -177,8 +197,8 @@ class ShotTagGenerationTests(unittest.TestCase):
                     "choices": [{
                         "message": {
                             "content": json.dumps([
-                                {"first_line": "她捐出千万", "second_line": "却穿15块鞋", "style": "反差型"},
-                                {"first_line": "伟大一生", "second_line": "民族脊梁", "style": "亏欠型"},
+                                {"first_line": "她捐出千万", "second_line": "却穿15块鞋", "style": "反差型", "evidence_quote": "她捐出1000万，自己却穿15块钱胶鞋"},
+                                {"first_line": "伟大一生", "second_line": "民族脊梁", "style": "亏欠型", "evidence_quote": "她捐出1000万，自己却穿15块钱胶鞋"},
                             ], ensure_ascii=False)
                         }
                     }]
@@ -207,8 +227,8 @@ class ShotTagGenerationTests(unittest.TestCase):
                     "choices": [{
                         "message": {
                             "content": json.dumps([
-                                {"first_line": "丈夫被关监狱", "second_line": "她没先带娃回国", "style": "悬念型"},
-                                {"first_line": "丈夫被关监狱", "second_line": "她四处奔走营救", "style": "冲突型"},
+                                {"first_line": "丈夫被关监狱", "second_line": "她没先带娃回国", "style": "悬念型", "evidence_quote": "丈夫被关进美国监狱，她带着孩子四处奔走营救"},
+                                {"first_line": "丈夫被关监狱", "second_line": "她四处奔走营救", "style": "冲突型", "evidence_quote": "丈夫被关进美国监狱，她带着孩子四处奔走营救"},
                             ], ensure_ascii=False)
                         }
                     }]
@@ -229,15 +249,20 @@ class ShotTagGenerationTests(unittest.TestCase):
 
         self.assertEqual("美国扣下箱子", candidates[0]["first_line"])
 
-    def test_cover_title_prompt_allows_local_conflict_focus(self) -> None:
+    def test_cover_title_prompt_balances_core_fact_and_local_conflict_without_templates(self) -> None:
         import inspect
         from services import text_service
 
         source = inspect.getsource(text_service.generate_viral_title)
-        self.assertIn("不是文案摘要", source)
-        self.assertIn("最重要原则", source)
-        self.assertIn("一个局部爆点", source)
-        self.assertIn("请一次生成12组标题", source)
+        self.assertIn("局部瞬间并不天然优于全文核心事实", source)
+        self.assertIn("可以写有具体身份、数字、任务或结果的事实概括标题", source)
+        self.assertIn("一次生成12组不同角度的候选", source)
+        self.assertIn("允许输出事实型概括标题", source)
+        self.assertIn("evidence_quote", source)
+        self.assertNotIn("好的结构示例", source)
+        self.assertNotIn("高停留词优先", source)
+        self.assertNotIn("第一行：父亲去世那天", source)
+        self.assertNotIn("她说回不来别等了", source)
 
     def test_rewrite_prompt_only_keeps_book_promotion_when_source_has_it(self) -> None:
         plain_prompt = build_rewrite_prompt("他拒绝高薪，回到祖国继续研究。", "纪实故事型", 1)
@@ -246,6 +271,76 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertIn("原文不包含带书或图书推荐内容", plain_prompt)
         self.assertIn("禁止主动添加书名", plain_prompt)
         self.assertIn("原文包含带书或图书推荐内容", book_prompt)
+
+    def test_rewrite_prompt_requires_body_to_continue_protected_opening(self) -> None:
+        source = (
+            "他在台湾潜伏四十二年后终于回乡，却发现妻子身边早已儿孙满堂。"
+            "正当他准备转身时，妻子追出来说了一番话，把他感动得老泪纵横。"
+            "他原本是一个广东读书人，后来去了台湾。"
+        )
+
+        prompt = build_rewrite_prompt(source, "纪实故事型", 1, preserve_rule="chars_67")
+
+        self.assertIn("后续正文必须紧接固定开头最后一句继续讲", prompt)
+        self.assertIn("尊重原文在固定开头之后的结构、叙事顺序和段落功能", prompt)
+        self.assertIn("不要擅自强迫它提前揭晓悬念", prompt)
+        self.assertIn("可以在悬念揭晓前补背景", prompt)
+        self.assertIn("不能直接写“谁能想到，一个广东读书人……”", prompt)
+        self.assertIn("在不改变原文叙事结构的前提下重写成自然过渡", prompt)
+
+    def test_rewrite_prompt_avoids_fragmented_paragraphs_and_preserves_fixed_opening(self) -> None:
+        prompt = build_rewrite_prompt(
+            "这是一段由用户选择并且需要完整保留的固定开头，即使它本身超过五十个中文字符也不能删改或者生硬截断。后续正文继续展开。",
+            "纪实故事型",
+            1,
+            preserve_rule="chars_55",
+        )
+
+        self.assertIn("画面和语义完整优先于字数", prompt)
+        self.assertIn("每段建议控制在 40 到 60 个中文字符", prompt)
+        self.assertIn("少于 25 个字符的段落", prompt)
+        self.assertIn("不能只因为达到某个字数就强行拆段", prompt)
+        self.assertIn("固定开头必须完整原样保留", prompt)
+        self.assertIn("不能从一句话中间生硬截断", prompt)
+
+    def test_rewrite_comparison_counts_fixed_opening_as_continuous_reuse(self) -> None:
+        fixed_opening = "这段固定开头必须一字不改而且仍然参与相似度计算"
+        original = f"{fixed_opening}。他在一九八零年来到北京，随后进入实验室工作。"
+        rewritten = f"{fixed_opening}。抵达首都以后，他把余下的时间都交给了科研。"
+
+        comparison = compare_scripts(original, rewritten)
+
+        self.assertGreater(comparison["continuous_reuse"], 0)
+        self.assertTrue(any(fixed_opening in passage for passage in comparison["reused_passages"]))
+        self.assertIn("keyword_overlap", comparison)
+        self.assertIn("phrase_overlap", comparison)
+
+    def test_rewrite_comparison_rejects_identical_text(self) -> None:
+        comparison = compare_scripts("完全相同的文案", "完全相同的文案")
+
+        self.assertEqual(100, comparison["continuous_reuse"])
+        self.assertEqual(100, comparison["phrase_overlap"])
+        self.assertEqual(0, comparison["overall_difference"])
+        self.assertFalse(comparison["passed"])
+
+    def test_rewrite_retry_receives_previous_draft_and_reused_passages(self) -> None:
+        previous_script = "固定开头保持不变。这里是一段仍然照着原文写的重复表达。"
+        previous = {
+            "rewritten_script": previous_script,
+            "rewrite_comparison": {
+                "overall_difference": 25,
+                "continuous_reuse": 70,
+                "phrase_overlap": 62,
+                "reused_passages": ["仍然照着原文写的重复表达"],
+            },
+        }
+
+        prompt = build_rewrite_prompt("固定开头保持不变。后续原文内容。", "纪实故事型", 2, previous)
+
+        self.assertIn(previous_script, prompt)
+        self.assertIn("重点重复片段：仍然照着原文写的重复表达", prompt)
+        self.assertIn("固定开头也参与相似度计算", prompt)
+        self.assertIn("保持原文事件顺序、因果关系和信息揭示顺序", prompt)
 
     def test_keywords_from_text_does_not_slice_script_fragments(self) -> None:
         tags = keywords_from_text("alpha beta gamma delta epsilon")
