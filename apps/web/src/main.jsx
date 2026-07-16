@@ -38,6 +38,17 @@ function stripScriptParagraphNumbers(value) {
   return String(value || '').replace(/(^|\n)([ \t]*)\[\d+\][ \t]*/g, '$1$2').trim();
 }
 
+function copyScriptWithoutParagraphNumbers(event) {
+  const textarea = event.currentTarget;
+  const start = textarea.selectionStart ?? 0;
+  const end = textarea.selectionEnd ?? start;
+  if (end <= start) return;
+  const selectedText = textarea.value.slice(start, end);
+  const cleanText = selectedText.replace(/(^|\n)([ \t]*)\[\d+\][ \t]*/g, '$1$2');
+  event.preventDefault();
+  event.clipboardData.setData('text/plain', cleanText);
+}
+
 function scriptCharacterCount(value) {
   return Array.from(stripScriptParagraphNumbers(value).replace(/\s+/g, '')).length;
 }
@@ -499,9 +510,11 @@ function App() {
     const data = await run('二创文案', () => request(`/api/projects/${projectId}/rewrite`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(openingPreserveChars
-        ? { opening_preserve_chars: openingPreserveChars }
-        : { opening_preserve_rule: 'auto' }),
+      body: JSON.stringify({
+        ...(openingPreserveChars
+          ? { opening_preserve_chars: openingPreserveChars }
+          : { opening_preserve_rule: 'auto' }),
+      }),
     }));
     if (data) await refreshAll(projectId);
   }
@@ -1486,14 +1499,15 @@ function App() {
                   <span className="script-character-count">{scriptCharacterCount(rewrittenScriptEditor)} 字</span>
                 </div>
                 <div className="actions">
-                  <button onClick={rewrite}><RefreshCw size={18} /> 生成</button>
+                  <button onClick={rewrite}><RefreshCw size={18} /> 改写</button>
                 </div>
               </div>
               {project.rewrite_comparison && (
                 <p>
-                  总体差异度：{project.rewrite_comparison.overall_difference ?? project.rewrite_difference ?? '-'}%
-                  {' · '}连续照抄率：{project.rewrite_comparison.continuous_reuse ?? project.rewrite_comparison.character_similarity ?? '-'}%
-                  {' · '}长短语重合率：{project.rewrite_comparison.phrase_overlap ?? '-'}%
+                  总体重构度：{project.rewrite_comparison.overall_difference ?? project.rewrite_difference ?? '-'}%
+                  {' · '}正文连续照抄率：{project.rewrite_comparison.continuous_reuse ?? project.rewrite_comparison.character_similarity ?? '-'}%
+                  {' · '}原文短语复用率：{project.rewrite_comparison.source_phrase_reuse ?? project.rewrite_comparison.phrase_overlap ?? '-'}%
+                  {' · '}逐句模仿率：{project.rewrite_comparison.sentence_imitation ?? '-'}%
                   {' · '}关键词重合率：{project.rewrite_comparison.keyword_overlap ?? project.rewrite_comparison.semantic_similarity ?? '-'}%
                 </p>
               )}
@@ -1504,9 +1518,10 @@ function App() {
                   rewrittenScriptDirtyRef.current = true;
                   setRewrittenScriptEditor(event.target.value);
                 }}
+                onCopy={copyScriptWithoutParagraphNumbers}
                 onBlur={() => setRewrittenScriptEditor((current) => numberScriptParagraphs(current))}
               />
-              <small className="raw-script-hint">AI 按完整画面分段，每段建议 40-60 字、通常不超过 80 字，避免短碎段落；可继续手动修改。[1]、[2] 等序号仅用于查看段数，保存和生成分镜时不会写入正文。</small>
+              <small className="raw-script-hint">AI 只保留固定开头，通读原文后重建叙事主线、信息顺序和段落功能；正文按完整画面分段。复制、保存和生成分镜时会自动去掉 [1]、[2] 等段落序号。</small>
               <label className="source-strategy">
                 素材来源策略
                 <select value={materialSourceStrategy} onChange={(event) => setMaterialSourceStrategy(event.target.value)}>

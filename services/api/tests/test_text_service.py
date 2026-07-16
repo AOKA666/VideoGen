@@ -26,19 +26,34 @@ from services.text_service import (  # noqa: E402
     cover_title_rejection_reasons,
     cover_title_needs_rewrite,
     ensure_original_opening,
+    fallback_infer_title,
     extract_opening_hook,
     generate_viral_title,
     generate_shots,
     guozhijiliang_opening_needs_rewrite,
     guozhijiliang_script_stats,
     keywords_from_text,
+    normalize_auto_title,
     parse_title_candidates,
 )
 
 
 class ShotTagGenerationTests(unittest.TestCase):
-    def test_rewrite_requires_fifty_percent_difference(self) -> None:
-        self.assertEqual(50, MIN_REWRITE_DIFFERENCE)
+    def test_title_fallback_does_not_treat_parent_words_as_the_main_theme(self) -> None:
+        wang_demin = "这个人叫王德民，父亲留美归来，母亲是瑞士人。他高考接近满分，却被清华和北大拒绝。"
+        song_sisters = "宋氏三姐妹，一个爱钱，一个爱国，一个爱权。父亲宋嘉树支持革命。"
+
+        self.assertEqual("王德民名校拒录", fallback_infer_title(wang_demin))
+        self.assertEqual("宋氏三姐妹命运沉浮", fallback_infer_title(song_sisters))
+        self.assertNotEqual("家书背后", fallback_infer_title(wang_demin))
+
+    def test_unrelated_ai_title_is_replaced_with_grounded_fallback(self) -> None:
+        source = "这个人叫王德民，他高考接近满分，却被清华和北大拒绝。"
+
+        self.assertEqual("王德民名校拒录", normalize_auto_title("家书背后", source))
+
+    def test_rewrite_requires_seventy_percent_reconstruction(self) -> None:
+        self.assertEqual(70, MIN_REWRITE_DIFFERENCE)
 
     def test_opening_hook_uses_complete_sentences_between_20_and_35_chars(self) -> None:
         source = "他拒绝了所有人的劝告。因为那个箱子里，藏着不能公开的秘密。后面的故事继续。"
@@ -282,11 +297,11 @@ class ShotTagGenerationTests(unittest.TestCase):
         prompt = build_rewrite_prompt(source, "纪实故事型", 1, preserve_rule="chars_67")
 
         self.assertIn("后续正文必须紧接固定开头最后一句继续讲", prompt)
-        self.assertIn("尊重原文在固定开头之后的结构、叙事顺序和段落功能", prompt)
-        self.assertIn("不要擅自强迫它提前揭晓悬念", prompt)
-        self.assertIn("可以在悬念揭晓前补背景", prompt)
+        self.assertIn("不得沿着原文的段落结构逐段改写", prompt)
+        self.assertIn("重新选择一条更有吸引力的叙事主线", prompt)
+        self.assertIn("原文叙事骨架必须推翻重建", prompt)
         self.assertIn("不能直接写“谁能想到，一个广东读书人……”", prompt)
-        self.assertIn("在不改变原文叙事结构的前提下重写成自然过渡", prompt)
+        self.assertIn("信息揭示顺序、段落顺序、各段功能", prompt)
 
     def test_rewrite_prompt_avoids_fragmented_paragraphs_and_preserves_fixed_opening(self) -> None:
         prompt = build_rewrite_prompt(
@@ -303,17 +318,36 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertIn("固定开头必须完整原样保留", prompt)
         self.assertIn("不能从一句话中间生硬截断", prompt)
 
-    def test_rewrite_comparison_counts_fixed_opening_as_continuous_reuse(self) -> None:
+    def test_rewrite_comparison_excludes_the_protected_opening(self) -> None:
         fixed_opening = "这段固定开头必须一字不改而且仍然参与相似度计算"
         original = f"{fixed_opening}。他在一九八零年来到北京，随后进入实验室工作。"
         rewritten = f"{fixed_opening}。抵达首都以后，他把余下的时间都交给了科研。"
 
-        comparison = compare_scripts(original, rewritten)
+        comparison = compare_scripts(original, rewritten, fixed_opening)
 
-        self.assertGreater(comparison["continuous_reuse"], 0)
-        self.assertTrue(any(fixed_opening in passage for passage in comparison["reused_passages"]))
+        self.assertNotIn(fixed_opening, comparison["reused_passages"])
+        self.assertEqual(len(fixed_opening), comparison["protected_opening_length"])
         self.assertIn("keyword_overlap", comparison)
-        self.assertIn("phrase_overlap", comparison)
+        self.assertIn("source_phrase_reuse", comparison)
+
+    def test_rewrite_comparison_cannot_be_diluted_by_appending_new_text(self) -> None:
+        opening = "固定开头保持不变。"
+        body = "他拒绝了高薪回到祖国。此后他进入实验室，连续多年解决关键难题。最后项目终于成功。"
+        padded_copy = f"{opening}{body}\n\n这里再新增两段完全不同的话，用来人为拉开长度。又补充一些无关表达。"
+
+        comparison = compare_scripts(f"{opening}{body}", padded_copy, opening)
+
+        self.assertEqual(100, comparison["source_phrase_reuse"])
+        self.assertFalse(comparison["passed"])
+
+    def test_rewrite_comparison_rejects_sentence_by_sentence_imitation(self) -> None:
+        source = "他放弃国外高薪回到祖国。回国以后，他立即进入实验室攻关。多年之后，关键项目终于成功。"
+        imitation = "他舍弃海外优厚待遇选择归国。回来之后，他马上走进实验室解决难题。经过许多年，核心工程最终取得成功。"
+
+        comparison = compare_scripts(source, imitation)
+
+        self.assertGreater(comparison["sentence_imitation"], 35)
+        self.assertFalse(comparison["passed"])
 
     def test_rewrite_comparison_rejects_identical_text(self) -> None:
         comparison = compare_scripts("完全相同的文案", "完全相同的文案")
@@ -339,8 +373,8 @@ class ShotTagGenerationTests(unittest.TestCase):
 
         self.assertIn(previous_script, prompt)
         self.assertIn("重点重复片段：仍然照着原文写的重复表达", prompt)
-        self.assertIn("固定开头也参与相似度计算", prompt)
-        self.assertIn("保持原文事件顺序、因果关系和信息揭示顺序", prompt)
+        self.assertIn("固定开头不参与差异度验收", prompt)
+        self.assertIn("放弃上一版的段落、句序和叙事路径", prompt)
 
     def test_keywords_from_text_does_not_slice_script_fragments(self) -> None:
         tags = keywords_from_text("alpha beta gamma delta epsilon")

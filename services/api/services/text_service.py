@@ -27,7 +27,10 @@ SCENE_HINTS = ["实验室", "会议", "档案", "照片", "火箭", "导弹", "�
 ERA_HINTS = ["1950", "1960", "1970", "上世纪", "建国", "抗战"]
 MIN_REWRITE_LENGTH_RATIO = 0.85
 MAX_REWRITE_LENGTH_RATIO = 1.25
-MIN_REWRITE_DIFFERENCE = 50
+MIN_REWRITE_DIFFERENCE = 70
+MAX_REWRITE_CONTINUOUS_REUSE = 12
+MAX_REWRITE_SOURCE_PHRASE_REUSE = 20
+MAX_REWRITE_SENTENCE_IMITATION = 35
 MAX_REWRITE_ATTEMPTS = 3
 MAX_AUTO_TITLE_LENGTH = 9
 MAX_PUBLISH_SHORT_TITLE_LENGTH = 16
@@ -252,7 +255,12 @@ class RewriteQualityError(RuntimeError):
     def __init__(self, result: dict):
         comparison = result.get("rewrite_comparison") or {}
         difference = comparison.get("overall_difference", 0)
-        super().__init__(f"rewrite difference {difference}% below {MIN_REWRITE_DIFFERENCE}%")
+        super().__init__(
+            f"rewrite quality rejected: difference={difference}%, "
+            f"continuous_reuse={comparison.get('continuous_reuse', 0)}%, "
+            f"source_phrase_reuse={comparison.get('source_phrase_reuse', comparison.get('phrase_overlap', 0))}%, "
+            f"sentence_imitation={comparison.get('sentence_imitation', 0)}%"
+        )
         self.result = result
 
 
@@ -288,9 +296,66 @@ def keyword_terms(text: str) -> set[str]:
     }
 
 
-def compare_scripts(text1: str, text2: str) -> dict:
-    compact1 = compact_similarity_text(text1)
-    compact2 = compact_similarity_text(text2)
+def sentence_imitation_rate(text1: str, text2: str) -> int:
+    source_sentences = [item for item in split_sentences(text1) if content_length(item) >= 6]
+    target_sentences = [item for item in split_sentences(text2) if content_length(item) >= 6]
+    if not source_sentences or not target_sentences:
+        return 0
+    imitated = 0
+    for source in source_sentences:
+        source_compact = compact_similarity_text(source)
+        source_terms = keyword_terms(source)
+        best_score = 0.0
+        for target in target_sentences:
+            target_compact = compact_similarity_text(target)
+            char_score = SequenceMatcher(None, source_compact, target_compact, autojunk=False).ratio()
+            target_terms = keyword_terms(target)
+            term_union = source_terms | target_terms
+            term_score = len(source_terms & target_terms) / len(term_union) if term_union else 0.0
+            best_score = max(best_score, (char_score * 0.45) + (term_score * 0.55))
+        if best_score >= 0.40:
+            imitated += 1
+    semantic_rate = round((imitated / len(source_sentences)) * 100)
+
+    # Detect sentence-for-sentence rewriting even when most words were replaced
+    # with synonyms. A genuinely reconstructed draft should not preserve nearly
+    # the same sentence count, relative positions and sentence sizes throughout.
+    aligned_rate = 0
+    count_ratio = len(target_sentences) / len(source_sentences)
+    if 0.7 <= count_ratio <= 1.4:
+        aligned = 0
+        for index, source in enumerate(source_sentences):
+            target_index = min(
+                len(target_sentences) - 1,
+                round(index * (len(target_sentences) - 1) / max(1, len(source_sentences) - 1)),
+            )
+            target = target_sentences[target_index]
+            source_compact = compact_similarity_text(source)
+            target_compact = compact_similarity_text(target)
+            length_ratio = len(target_compact) / max(1, len(source_compact))
+            char_score = SequenceMatcher(None, source_compact, target_compact, autojunk=False).ratio()
+            shared_terms = keyword_terms(source) & keyword_terms(target)
+            if 0.65 <= length_ratio <= 1.55 and (char_score >= 0.18 or bool(shared_terms)):
+                aligned += 1
+        aligned_rate = round((aligned / len(source_sentences)) * 100)
+    return max(semantic_rate, aligned_rate)
+
+
+def remove_protected_opening(text: str, protected_opening: str) -> str:
+    if not protected_opening:
+        return str(text or "")
+    source = str(text or "").lstrip()
+    opening = str(protected_opening).strip()
+    if source.startswith(opening):
+        return source[len(opening):].lstrip(" \t\r\n，。！？!?；;")
+    return source
+
+
+def compare_scripts(text1: str, text2: str, protected_opening: str = "") -> dict:
+    body1 = remove_protected_opening(text1, protected_opening)
+    body2 = remove_protected_opening(text2, protected_opening)
+    compact1 = compact_similarity_text(body1)
+    compact2 = compact_similarity_text(body2)
     total_chars = len(compact1) + len(compact2)
     matcher = SequenceMatcher(None, compact1, compact2, autojunk=False)
     min_reuse_chars = min(8, max(1, min(len(compact1), len(compact2))))
@@ -300,17 +365,24 @@ def compare_scripts(text1: str, text2: str) -> dict:
 
     shingles1 = phrase_shingles(compact1)
     shingles2 = phrase_shingles(compact2)
+    shared_phrases = shingles1 & shingles2
     phrase_union = shingles1 | shingles2
-    phrase_overlap = round((len(shingles1 & shingles2) / len(phrase_union)) * 100) if phrase_union else 0
+    phrase_overlap = round((len(shared_phrases) / len(phrase_union)) * 100) if phrase_union else 0
+    # Measure how much of the source survives in the rewrite. Unlike Jaccard,
+    # this cannot be diluted by appending unrelated new paragraphs.
+    source_phrase_reuse = round((len(shared_phrases) / len(shingles1)) * 100) if shingles1 else 0
 
-    terms1 = keyword_terms(text1)
-    terms2 = keyword_terms(text2)
+    terms1 = keyword_terms(body1)
+    terms2 = keyword_terms(body2)
     term_union = terms1 | terms2
     keyword_overlap = round((len(terms1 & terms2) / len(term_union)) * 100) if term_union else 0
 
-    # Only verbatim passage reuse affects acceptance. Shared names, dates and factual
-    # keywords remain visible as a diagnostic but do not penalize a legitimate rewrite.
-    overall_similarity = round((continuous_reuse * 0.75) + (phrase_overlap * 0.25))
+    sentence_imitation = sentence_imitation_rate(body1, body2)
+    overall_similarity = round(
+        (continuous_reuse * 0.35)
+        + (source_phrase_reuse * 0.35)
+        + (sentence_imitation * 0.30)
+    )
     overall_difference = max(0, min(100, 100 - overall_similarity))
     reused_passages = sorted(
         {compact1[block.a:block.a + block.size] for block in reused_blocks},
@@ -318,9 +390,17 @@ def compare_scripts(text1: str, text2: str) -> dict:
         reverse=True,
     )[:8]
 
+    passed = (
+        overall_difference >= MIN_REWRITE_DIFFERENCE
+        and continuous_reuse <= MAX_REWRITE_CONTINUOUS_REUSE
+        and source_phrase_reuse <= MAX_REWRITE_SOURCE_PHRASE_REUSE
+        and sentence_imitation <= MAX_REWRITE_SENTENCE_IMITATION
+    )
     return {
         "continuous_reuse": continuous_reuse,
         "phrase_overlap": phrase_overlap,
+        "source_phrase_reuse": source_phrase_reuse,
+        "sentence_imitation": sentence_imitation,
         "keyword_overlap": keyword_overlap,
         # Backward-compatible aliases for existing stored projects and API clients.
         "character_similarity": continuous_reuse,
@@ -328,16 +408,17 @@ def compare_scripts(text1: str, text2: str) -> dict:
         "overall_difference": overall_difference,
         "text1_length": len(compact1),
         "text2_length": len(compact2),
+        "protected_opening_length": content_length(protected_opening),
         "reused_passages": reused_passages,
         "common_keywords": sorted(terms1 & terms2, key=len, reverse=True)[:10],
         "unique_keywords1": sorted(terms1 - terms2, key=len, reverse=True)[:10],
         "unique_keywords2": sorted(terms2 - terms1, key=len, reverse=True)[:10],
-        "passed": overall_difference >= MIN_REWRITE_DIFFERENCE,
+        "passed": passed,
     }
 
 
 def split_sentences(text: str) -> list[str]:
-    parts = re.split(r"(?<=[。！？!?；;])\s*", text.strip())
+    parts = re.findall(r"[^。！？!?；;]+[。！？!?；;]?", str(text or "").strip())
     return [p.strip() for p in parts if p.strip()]
 
 
@@ -364,15 +445,63 @@ def looks_like_truncated_sentence(title: str, raw_script: str) -> bool:
     return len(first) > len(title) + 3 and first.startswith(title)
 
 
+def extract_title_subject(raw_script: str) -> str:
+    text = re.sub(r"\s+", "", raw_script or "")
+    if not text:
+        return ""
+    opening_subject = re.match(r"^([\u4e00-\u9fff]{2,6})(?=[，。])", text)
+    if opening_subject and any(
+        marker in opening_subject.group(1)
+        for marker in ("三姐妹", "两兄弟", "父子", "母女", "夫妻", "团队")
+    ):
+        return opening_subject.group(1)
+    known_people = [
+        item for item in PERSON_HINTS
+        if item not in {"两弹一星"}
+    ] + ["巴金", "鲁迅", "茅盾", "宋庆龄", "宋美龄", "宋霭龄"]
+    person = next((item for item in sorted(set(known_people), key=len, reverse=True) if item in text), "")
+    if person:
+        return person
+    patterns = [
+        r"(?:这个人叫|这个人就是|他叫|她叫|名叫|名字叫)([\u4e00-\u9fff]{2,4})",
+        r"(?:科学家|作家|院士|专家|工程师|英雄)([\u4e00-\u9fff]{2,4})(?=[，。！？])",
+        r"^([\u4e00-\u9fff]{2,6})(?=[，。])",
+    ]
+    weak_subjects = {"一个年轻人", "一个中国人", "很多人", "你知道吗", "谁能想到"}
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            candidate = match.group(1)
+            if candidate not in weak_subjects and not candidate.startswith(("一个", "这位", "这个")):
+                return candidate
+    return ""
+
+
+def auto_title_is_grounded(title: str, raw_script: str) -> bool:
+    cleaned = clean_auto_title(title)
+    text = re.sub(r"\s+", "", raw_script or "")
+    if not cleaned or not text:
+        return False
+    subject = extract_title_subject(raw_script)
+    if subject and subject in cleaned:
+        return True
+    generic_pairs = {"故事", "背后", "往事", "人生", "命运", "选择", "时刻", "传奇"}
+    title_pairs = {
+        cleaned[index:index + 2]
+        for index in range(max(0, len(cleaned) - 1))
+        if cleaned[index:index + 2] not in generic_pairs
+    }
+    return any(pair in text for pair in title_pairs)
+
+
 def fallback_infer_title(raw_script: str) -> str:
     text = re.sub(r"\s+", "", raw_script or "")
     if not text:
         return "未命名项目"
-    people = [
-        "钱学森", "邓稼先", "于敏", "黄旭华", "郭永怀", "袁隆平", "王淦昌",
-        "孙家栋", "屠呦呦", "王承书", "彭士禄", "林俊德",
-    ]
     themes = [
+        ("骨灰", "三十三年守候"),
+        ("高考", "名校拒录"),
+        ("三姐妹", "命运沉浮"),
         ("两弹一星", "两弹一星"),
         ("回国", "归国"),
         ("归国", "归国"),
@@ -384,11 +513,9 @@ def fallback_infer_title(raw_script: str) -> str:
         ("导弹", "导弹往事"),
         ("绝密", "绝密往事"),
         ("牺牲", "最后时刻"),
-        ("母亲", "家书背后"),
-        ("父亲", "家书背后"),
         ("国家", "国家选择"),
     ]
-    person = next((item for item in people if item in text), "")
+    person = extract_title_subject(raw_script)
     theme = next((label for needle, label in themes if needle in text), "")
     candidates: list[str] = []
     if person and theme:
@@ -411,7 +538,11 @@ def fallback_infer_title(raw_script: str) -> str:
 
 def normalize_auto_title(title: str, raw_script: str) -> str:
     cleaned = clean_auto_title(title)
-    if 2 <= len(cleaned) <= MAX_AUTO_TITLE_LENGTH and not looks_like_truncated_sentence(cleaned, raw_script):
+    if (
+        2 <= len(cleaned) <= MAX_AUTO_TITLE_LENGTH
+        and not looks_like_truncated_sentence(cleaned, raw_script)
+        and auto_title_is_grounded(cleaned, raw_script)
+    ):
         return cleaned
     return fallback_infer_title(raw_script)
 
@@ -422,10 +553,11 @@ def infer_title(raw_script: str) -> str:
         return fallback_infer_title(raw_script)
     prompt = (
         "请根据下面的中文短视频文案，生成一个项目标题。\n"
-        "要求：1. 必须根据文案主题提炼，不要直接截取原文开头。"
+        "要求：1. 必须准确概括文案的核心人物和核心事件，不要被父亲、母亲、家人等次要词带偏，也不要直接截取原文开头。"
         "2. 不要截断句子，优先使用完整短语。3. 不要标点符号。"
         "4. 必须是完整短标题，不要像一句话被截断。"
-        "5. 只返回JSON，不要解释。\n\n"
+        "5. 标题中的人物或事件必须能在原文中找到依据，禁止使用与正文无关的套话。"
+        "6. 只返回JSON，不要解释。\n\n"
         f"文案：\n{(raw_script or '')[:900]}\n\n"
         '{"title": "项目标题"}'
     )
@@ -457,7 +589,8 @@ def infer_title(raw_script: str) -> str:
             content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
         result = json.loads(extract_json(str(content)))
         return normalize_auto_title(str(result.get("title") or ""), raw_script)
-    except Exception:
+    except Exception as exc:
+        logging.getLogger(__name__).warning("AI project title generation failed; using grounded fallback: %s", exc)
         return fallback_infer_title(raw_script)
 
 
@@ -653,9 +786,12 @@ def fallback_rewrite_script(raw_script: str, style: str = "纪实故事型", pre
 def ensure_min_rewrite_difference(result: dict) -> dict:
     comparison = result.get("rewrite_comparison") or {}
     difference = comparison.get("overall_difference", 0)
-    if difference < MIN_REWRITE_DIFFERENCE:
+    if not comparison.get("passed", False):
         result["rewrite_error"] = (
-            f"rewrite difference {difference}% below {MIN_REWRITE_DIFFERENCE}%"
+            f"rewrite rejected: difference {difference}%, continuous reuse "
+            f"{comparison.get('continuous_reuse', 0)}%, source phrase reuse "
+            f"{comparison.get('source_phrase_reuse', comparison.get('phrase_overlap', 0))}%, "
+            f"sentence imitation {comparison.get('sentence_imitation', 0)}%"
         )
         raise RewriteQualityError(result)
     return result
@@ -670,7 +806,7 @@ def normalize_rewrite_result(result: dict, raw_script: str, style: str, preserve
     rewritten_script = clean_rewritten_script(raw_script, rewritten_script)
     rewritten_script = ensure_original_opening(raw_script, rewritten_script, preserve_rule)
     rewritten_script = add_blank_lines_between_paragraphs(rewritten_script)
-    comparison = compare_scripts(raw_script, rewritten_script)
+    comparison = compare_scripts(raw_script, rewritten_script, hook)
     return {
         "title": normalize_auto_title(title, raw_script),
         "hook": hook,
@@ -708,12 +844,13 @@ def build_rewrite_prompt(raw_script: str, style: str, attempt: int, previous: di
         ]
         reused_summary = "；".join(reused_passages[:8]) or "系统未定位到单一长句，请全面检查正文表达"
         retry_instruction = (
-            f"上一版总体差异度只有 {comparison.get('overall_difference', 0)}%，未达到 {MIN_REWRITE_DIFFERENCE}%。"
-            f"连续照抄率 {comparison.get('continuous_reuse', comparison.get('character_similarity', 0))}%，"
-            f"长短语重合率 {comparison.get('phrase_overlap', 0)}%。"
+            f"上一版没有通过真正重写验收：总体重构度 {comparison.get('overall_difference', 0)}%，"
+            f"固定开头之外的连续照抄率 {comparison.get('continuous_reuse', comparison.get('character_similarity', 0))}%，"
+            f"原文短语复用率 {comparison.get('source_phrase_reuse', comparison.get('phrase_overlap', 0))}%，"
+            f"逐句模仿率 {comparison.get('sentence_imitation', 0)}%。"
             f"重点重复片段：{reused_summary}。"
-            "固定开头仍须原样保留；请重点重写固定开头之后的重复句段。保持原文事件顺序、因果关系和信息揭示顺序，"
-            "但更换句子组织、叙述落点、段内铺垫、转折表达和情绪推进，不要继续在上一版上做少量换词。"
+            "固定开头仍须原样保留。放弃上一版的段落、句序和叙事路径，回到事实素材重新构思。"
+            "不得逐句找同义词，不得按原文段落一一对应；应重新选择主冲突、重新编排信息出现顺序、重新组织场景和情绪递进。"
             f"\n<previous_rewrite>{previous_script}</previous_rewrite>"
         )
     prompt = f"""
@@ -728,8 +865,8 @@ def build_rewrite_prompt(raw_script: str, style: str, attempt: int, previous: di
 
 【固定开头后的连续叙事】
 固定开头不是一段可以独立放置的引子，而是整篇文案正在发生的第一段剧情。后续正文必须紧接固定开头最后一句继续讲，不能另起一个开头。
-改写时要尊重原文在固定开头之后的结构、叙事顺序和段落功能。原文接下来是在推进现场、补人物背景、倒叙往事、解释原因还是揭晓悬念，改写稿也应沿着这个结构自然展开，不要擅自强迫它提前揭晓悬念或重排剧情。
-固定开头后的第一句必须承担过渡作用，让观众知道后文和开头是同一个故事。它可以继续当前场景，也可以按照原文结构转入背景或往事，但要用人物关系、因果、时间或话题连接起来，不能无视前文重新制造钩子。
+固定开头之后，不得沿着原文的段落结构逐段改写。你必须先通读全文，在心里把原文拆成“不可改变的事实清单”和“可以完全推翻的表达结构”，再重新选择一条更有吸引力的叙事主线。
+固定开头后的第一句必须承担过渡作用，让观众知道后文和开头是同一个故事；但后续信息出现顺序、场景组合、铺垫位置、冲突展开和情绪递进都要重新设计。
 禁止在固定开头后再次使用“谁能想到”“你敢相信吗”“很多人不知道”“他到底是谁”等二次钩子来重启文案；也不要像第一次出场一样重新介绍同一个人物，造成两个独立开头。原文确实转入人物背景时，可以保留这一结构，但必须写成承接上文的背景补充。
 例如固定开头以“妻子追出来说了一番话，把他感动得老泪纵横”结束，而原文接下来转入他早年的经历，可以写“而这场迟到了四十二年的重逢，还要从他当年离开广东说起”，不能直接写“谁能想到，一个广东读书人……”另起一个开头。
 
@@ -743,7 +880,16 @@ def build_rewrite_prompt(raw_script: str, style: str, attempt: int, previous: di
 1. 只有用户选定的固定开头必须逐字保留；未手动选择时，保留系统识别的前三秒钩子。
 2. 人名、地名、年份、数字、事件等客观事实可以保留，但承载这些事实的句子必须重新表达。
 3. 除固定开头和无法改写的专有名词外，原文中的完整句子、金句、狠话、过渡句、情绪表达和带书话术都不要照抄。
-4. 保留原文的事件先后、因果关系、信息揭示顺序和各段叙事功能；不要照搬原文句式、段内组织、叙述落点、转折表达和措辞。
+4. 必须保留客观事实、真实时间关系和因果关系；原文的信息揭示顺序、段落顺序、各段功能、叙述落点和转折方式不属于事实，必须重新设计。
+
+【真正大改：把原文当素材库，不当模板】
+1. 除固定开头外，禁止按原文从第一段到最后一段逐段对应改写。
+2. 禁止“读一句、换一种说法”；即使每句话都换了词，只要句子顺序、段落功能和信息出现位置仍与原文一一对应，也是不合格。
+3. 先找出全文最值得讲的核心冲突和人物选择，以它为主轴；背景、履历、评价只在推动主轴时出现。
+4. 可以合并原文中分散的同类事实，可以把后文的重要结果提前，可以把背景延后，可以删除重复观点；但不能篡改真实时间、因果和事实。
+5. 每一段都要有新的叙述任务：推进冲突、揭示代价、制造反差、补关键证据或完成情绪转折。不要让新稿段落与原文段落一一配对。
+6. 使用新的句式、新的观察角度、新的场景切入和新的转折。不要保留原文的金句、排比、设问、比喻、段尾结论和情绪口号。
+7. 输出前在心里做一次“遮住原文测试”：如果读者能明显看出新稿是在沿着原文一句句改，必须推翻固定开头之后的全部内容重新写。
 
 【禁止事项】
 不要做简单同义词替换。
@@ -761,7 +907,7 @@ def build_rewrite_prompt(raw_script: str, style: str, attempt: int, previous: di
 一、句子要短。适合真人口播。能用短句就不要用长句。能用人话就不要用书面话。
 二、表达要狠。该硬的地方要硬。比如：“你可以试试敢不敢将它击落。”这种句子不要改成：“那便试试看是否敢于动用武力击落。”
 三、要有画面。多保留或强化具体画面：飞机起飞、国旗铺满街道、地图包围、旧照片、病房电脑、公文包、胶鞋、行李箱、实验室灯光、戈壁风沙。少写抽象评价。
-四、要有情绪递进。固定开头保持不变，后文优先尊重原文已有的叙事结构和信息揭示顺序，在此基础上强化具体事件、关键冲突、必要背景、转折和情绪爆发。可以在悬念揭晓前补背景，但必须自然承接，不能紧跟固定开头另起炉灶。
+四、要有情绪递进。固定开头保持不变，后文围绕重新选定的核心冲突推进，重新安排事实、背景、转折和情绪爆发；不能复刻原文的信息揭示节奏。
 五、带书内容跟随原文：{conversion_instruction}
 
 【分段要求】
@@ -775,11 +921,11 @@ def build_rewrite_prompt(raw_script: str, style: str, attempt: int, previous: di
 不要在 rewritten_script 中添加 [1]、[2] 等序号，序号由前端界面展示。
 
 【改写尺度】
-不是洗稿式同义替换，而是在保留固定开头、原文叙事骨架和事实边界的前提下重新表达整篇文案。
+不是洗稿式同义替换。只保留固定开头和事实边界，原文叙事骨架必须推翻重建。
 可以删掉重复啰嗦的句子。
 可以强化画面感和冲突感。
-必须调整固定开头之后的句子组织、段内铺垫、叙述落点、转折方式和情绪推进，但不得为了制造差异擅自打乱事件顺序或提前揭晓原文悬念。
-可以在不改变事实主体和叙事顺序的前提下更换叙述视角；只有原文包含带书内容时，才可以重新设计其表达方式。
+必须重建固定开头之后的句子组织、信息顺序、段落功能、叙述落点、转折方式和情绪推进。真实时间与因果不能打乱，但原文的讲述顺序可以而且应当改变。
+可以在不改变事实主体、真实时间关系和因果关系的前提下更换叙述视角；只有原文包含带书内容时，才可以重新设计其表达方式。
 除固定开头外，不得连续照抄原文句子；不得只靠换词、增删标点或重新分段制造改写效果。
 
 【长度和质量约束】
@@ -788,9 +934,10 @@ rewritten_script 去除空白后的长度必须控制在 {min_len} 到 {max_len}
 不要压缩成摘要、提纲或短版解说，也不要省略原文中的重要事实。
 事实边界：不虚构；不添加没有依据的具体时间、地点、人物关系；人物、年代、事件、因果关系必须保留。
 除必须原样保留的固定开头、专有名词、年份、数字和固定称谓之外，整体表达必须重新组织。
-系统会检测连续照抄片段和六字以上长短语重合，最终总体差异度必须达到 {MIN_REWRITE_DIFFERENCE}% 以上。固定开头也参与相似度计算，不得为了提高分数改动固定开头。
+系统只检查固定开头之后的正文。总体重构度必须达到 {MIN_REWRITE_DIFFERENCE}% 以上，连续照抄率不得超过 {MAX_REWRITE_CONTINUOUS_REUSE}%，原文六字短语复用率不得超过 {MAX_REWRITE_SOURCE_PHRASE_REUSE}%，逐句模仿率不得超过 {MAX_REWRITE_SENTENCE_IMITATION}%。
+新增一两句话、增加段落、换行、调整标点、调换少量句子都不能稀释这些指标；任何一项超限都会整篇退回重写。固定开头不参与差异度验收，也绝不能为了提高分数而改动。
 人名、地点、年份和事实关键词的正常重合只单独展示，不计入差异度；不要为了降低关键词重合而篡改事实。
-{MIN_REWRITE_DIFFERENCE}% 是硬性验收线：不能通过重新换行、调整标点或少量同义词替换达成，固定开头之后的正文必须让读者明显感到是重新讲述。
+{MIN_REWRITE_DIFFERENCE}% 是硬性验收线：不能通过加句、换行、调整标点、段落错位或同义词替换达成，固定开头之后的正文必须让读者明显感到作者重新构思、重新组织、重新讲述了一遍。
 
 【本次生成信息】
 文案风格：{style}。
@@ -800,7 +947,7 @@ rewritten_script 去除空白后的长度必须控制在 {min_len} 到 {max_len}
 只返回可解析 JSON，字段必须包含 title, hook, rewritten_script, script_style。
 rewritten_script 字段里只能放改写后的完整文案正文，禁止包含原文、原始文案、对照稿、解释、标题标签或“二创口播稿：”这类前缀。
 不要先输出一遍原文再输出二创稿，也不要把原文和二创内容混在一起。
-输出前自检固定开头与第一句新正文：如果第一句像与前文无关的新钩子，或像同一人物第一次出场一样重新介绍，必须在不改变原文叙事结构的前提下重写成自然过渡。
+输出前自检固定开头与第一句新正文：如果第一句像与前文无关的新钩子，或像同一人物第一次出场一样重新介绍，必须在不改变事实与因果关系的前提下重写成自然过渡。
 输出前检查分段是否过碎：不能为了凑 40 到 60 字拆散同一个连续画面；少于 25 字且不能独立成画面的段落要与相邻段合并，超过 80 字的段落只在确有画面转换时自然拆分。
 
 <raw_script>{raw_script}</raw_script>
@@ -818,7 +965,7 @@ def rewrite_script_with_minimax(raw_script: str, style: str, api_key: str, prese
         comparison = result.get("rewrite_comparison") or {}
         if not best_result or comparison.get("overall_difference", 0) > (best_result.get("rewrite_comparison") or {}).get("overall_difference", 0):
             best_result = result
-        if comparison.get("overall_difference", 0) >= MIN_REWRITE_DIFFERENCE:
+        if comparison.get("passed", False):
             result["rewrite_attempts"] = attempt
             return result
         last_result = result
@@ -827,7 +974,11 @@ def rewrite_script_with_minimax(raw_script: str, style: str, api_key: str, prese
     comparison = best_result.get("rewrite_comparison") or {}
     best_result["rewrite_attempts"] = MAX_REWRITE_ATTEMPTS
     best_result["rewrite_error"] = (
-        f"rewrite difference {comparison.get('overall_difference', 0)}% below {MIN_REWRITE_DIFFERENCE}% after {MAX_REWRITE_ATTEMPTS} attempts"
+        f"rewrite quality rejected after {MAX_REWRITE_ATTEMPTS} attempts: "
+        f"difference {comparison.get('overall_difference', 0)}%, "
+        f"continuous reuse {comparison.get('continuous_reuse', 0)}%, "
+        f"source phrase reuse {comparison.get('source_phrase_reuse', 0)}%, "
+        f"sentence imitation {comparison.get('sentence_imitation', 0)}%"
     )
     raise RewriteQualityError(best_result)
 
