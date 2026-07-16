@@ -1,0 +1,12 @@
+services:
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    env_file:
+      - .env.deploy
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    depends_on:
+      web:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true

@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { Archive, Check, Crop, Download, Eraser, Film, FolderOpen, ImagePlus, Library, Mic, Music, RefreshCw, Save, Scissors, Search, Tags, Trash2, Wand2 } from 'lucide-react';
 import './styles.css';
 
-const API = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
+const API = import.meta.env.VITE_API_URL ?? (import.meta.env.DEV ? 'http://127.0.0.1:8000' : '');
 const ASSET_PAGE_SIZE = 60;
 const VOICE_OPTIONS = [
   { value: 'zh_male_m191_uranus_bigtts', label: '男声 · 沉稳叙事' },

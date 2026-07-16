@@ -540,14 +540,19 @@ def _find_chinese_font(size: int) -> ImageFont.FreeTypeFont:
     """Find a suitable Chinese font, prioritizing 文源圆体, falling back to default."""
     project_root = Path(__file__).resolve().parent.parent.parent.parent
     candidates = [
+        os.getenv("VIDEOGEN_FONT_FILE", "").strip(),
         project_root / "WenYuanRoundedSCVF.ttf",  # 文源圆体 (bundled)
         Path("C:/Windows/Fonts/WenYuanRoundedSCVF.ttf"),  # 文源圆体 (system)
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "C:/Windows/Fonts/msyhbd.ttc",   # Microsoft YaHei Bold
         "C:/Windows/Fonts/msyh.ttc",      # Microsoft YaHei
         "C:/Windows/Fonts/simhei.ttf",    # SimHei
         "C:/Windows/Fonts/simsun.ttc",    # SimSun
     ]
     for font_path in candidates:
+        if not font_path:
+            continue
         if isinstance(font_path, str):
             font_path = Path(font_path)
         if font_path.exists():

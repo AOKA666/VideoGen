@@ -149,6 +149,10 @@ services/api      FastAPI 后端
 storage           素材、项目文件和导出结果
 ```
 
+## 生产部署
+
+生产环境使用 Docker Compose、Nginx、单 FastAPI worker 和持久化 `storage/`。完整步骤、安全约束、备份与回滚方法见 [`docs/deployment.md`](docs/deployment.md)。正式公网开放前必须启用 Cloudflare Access，因为应用当前没有内置登录鉴权。
+
 ## 安全提示
 
 - `.env.local` 已用于存放本地密钥，不要上传或提交到代码仓库。

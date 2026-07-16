@@ -31,6 +31,10 @@ def _find_preferred_font() -> tuple[str, str]:
         for FFmpeg compatibility; font_name is for the subtitles force_style
         FontName parameter.
     """
+    configured_font = os.getenv("VIDEOGEN_FONT_FILE", "").strip()
+    if configured_font and Path(configured_font).is_file():
+        return (configured_font.replace("\\", "/"), "Noto Sans CJK SC")
+
     # 1. Look for 文源圆体 bundled in the project root
     project_root = Path(__file__).resolve().parent.parent.parent.parent
     wenyuan_candidates = [
@@ -43,6 +47,8 @@ def _find_preferred_font() -> tuple[str, str]:
 
     # 2. Fall back to Microsoft YaHei / SimHei
     fallback_candidates = [
+        ("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc", "Noto Sans CJK SC"),
+        ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", "Noto Sans CJK SC"),
         ("C:/Windows/Fonts/msyhbd.ttc", "Microsoft YaHei"),
         ("C:/Windows/Fonts/msyh.ttc", "Microsoft YaHei"),
         ("C:/Windows/Fonts/simhei.ttf", "SimHei"),
@@ -51,7 +57,7 @@ def _find_preferred_font() -> tuple[str, str]:
         if os.path.exists(font_path):
             return (font_path.replace("\\", "/"), font_name)
 
-    # 3. Last resort
+    # 3. Preserve the previous local fallback for Windows development.
     return ("C:/Windows/Fonts/msyhbd.ttc", "Microsoft YaHei")
 
 

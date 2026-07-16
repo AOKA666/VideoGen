@@ -1,0 +1,25 @@
+# Git and local environment
+.git
+.gitignore
+.env
+.env.*
+!.env.local.example
+!.env.production.example
+
+# Dependency and build caches
+**/node_modules
+**/dist
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.venv
+
+# Runtime state must be mounted, never baked into images
+storage
+**/logs
+**/*.log*
+
+# Local/editor files
+.DS_Store
+.vscode
+.idea
