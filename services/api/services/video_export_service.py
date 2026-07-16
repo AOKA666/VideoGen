@@ -56,6 +56,7 @@ def _find_preferred_font() -> tuple[str, str]:
 
 
 def _run(command: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    platform_options = {"creationflags": CREATE_NO_WINDOW} if os.name == "nt" else {}
     try:
         return subprocess.run(
             command,
@@ -65,7 +66,7 @@ def _run(command: list[str], cwd: Path | None = None) -> subprocess.CompletedPro
             text=True,
             encoding="utf-8",
             errors="replace",
-            creationflags=CREATE_NO_WINDOW,
+            **platform_options,
         )
     except FileNotFoundError as exc:
         raise RuntimeError(f"Required executable is not installed: {command[0]}") from exc
@@ -115,7 +116,7 @@ def probe_media(path: Path) -> dict[str, Any]:
         "-v",
         "error",
         "-show_entries",
-        "format=duration:stream=index,codec_type,codec_name,width,height",
+        "format=duration:stream=index,codec_type,codec_name,width,height,duration",
         "-of",
         "json",
         str(path),
@@ -124,9 +125,12 @@ def probe_media(path: Path) -> dict[str, Any]:
     streams = data.get("streams") or []
     video = next((item for item in streams if item.get("codec_type") == "video"), {})
     audio = next((item for item in streams if item.get("codec_type") == "audio"), {})
+    format_duration = float((data.get("format") or {}).get("duration") or 0)
     return {
         "path": path.name,
-        "duration_sec": round(float((data.get("format") or {}).get("duration") or 0), 3),
+        "duration_sec": round(format_duration, 3),
+        "video_duration_sec": round(float(video.get("duration") or 0), 3) if video else None,
+        "audio_duration_sec": round(float(audio.get("duration") or 0), 3) if audio else None,
         "width": video.get("width"),
         "height": video.get("height"),
         "video_codec": video.get("codec_name"),
@@ -233,40 +237,66 @@ def render_project_video(
     total_duration = audio_probe["duration_sec"]
     display_ranges = _shot_display_ranges(shots, total_duration)
     durations = [duration for _, duration in display_ranges]
-    concat_script = output_path.parent / "ffmpeg_scenes.txt"
-    concat_lines = ["ffconcat version 1.0"]
-    for scene_path, duration in zip(scene_paths, durations):
-        escaped_path = str(scene_path.resolve()).replace("\\", "/").replace("'", r"'\''")
-        concat_lines.append(f"file '{escaped_path}'")
-        concat_lines.append(f"duration {duration:.6f}")
-    last_path = str(scene_paths[-1].resolve()).replace("\\", "/").replace("'", r"'\''")
-    concat_lines.append(f"file '{last_path}'")
-    concat_script.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
+    effective_transition_sec = 0.0
+    if len(scene_paths) > 1 and transition_sec > 0:
+        effective_transition_sec = min(float(transition_sec), min(durations) * 0.45)
 
     command = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-f", "concat", "-safe", "0", "-i", str(concat_script.resolve()),
-        "-i", str(audio_path.resolve()),
     ]
+    input_durations = [
+        duration + (effective_transition_sec if index > 0 else 0)
+        for index, duration in enumerate(durations)
+    ]
+    for scene_path, input_duration in zip(scene_paths, input_durations):
+        command.extend([
+            "-loop", "1",
+            "-framerate", "30",
+            "-t", f"{input_duration:.6f}",
+            "-i", str(scene_path.resolve()),
+        ])
+    audio_input_index = len(scene_paths)
+    command.extend(["-i", str(audio_path.resolve())])
+    music_input_index = audio_input_index + 1
     if background_music_path:
         command.extend(["-i", str(background_music_path.resolve())])
 
-    filters = [
-        "[0:v]scale=1080:1080:force_original_aspect_ratio=increase,"
-        "crop=1080:1080,pad=1080:1920:0:420:color=black,"
-        f"fps=30,format=yuv420p,setsar=1,trim=duration={total_duration:.3f},"
-        "setpts=PTS-STARTPTS[vbase]"
-    ]
+    filters = []
+    for index, input_duration in enumerate(input_durations):
+        filters.append(
+            f"[{index}:v]scale=1080:1080:force_original_aspect_ratio=increase,"
+            "crop=1080:1080,pad=1080:1920:0:420:color=black,"
+            f"fps=30,format=yuv420p,setsar=1,trim=duration={input_duration:.6f},"
+            f"setpts=PTS-STARTPTS[vscene{index}]"
+        )
+    if effective_transition_sec > 0:
+        current_label = "vscene0"
+        elapsed_duration = durations[0]
+        for index in range(1, len(scene_paths)):
+            output_label = "vbase" if index == len(scene_paths) - 1 else f"vfade{index}"
+            offset = elapsed_duration - effective_transition_sec
+            filters.append(
+                f"[{current_label}][vscene{index}]"
+                f"xfade=transition=fade:duration={effective_transition_sec:.6f}:"
+                f"offset={offset:.6f}[{output_label}]"
+            )
+            current_label = output_label
+            elapsed_duration += durations[index]
+    elif len(scene_paths) == 1:
+        filters.append("[vscene0]null[vbase]")
+    else:
+        scene_labels = "".join(f"[vscene{index}]" for index in range(len(scene_paths)))
+        filters.append(f"{scene_labels}concat=n={len(scene_paths)}:v=1:a=0[vbase]")
     video_label = "vbase"
 
     preferred_font_path, preferred_font_name = _find_preferred_font()
     preferred_font_dir = _escape_ffmpeg_filter_path(Path(preferred_font_path).parent)
     filters.append(
-        f"[{video_label}]subtitles=filename='subtitles.srt':"
+        f"[{video_label}]subtitles=filename='{_escape_ffmpeg_filter_path(subtitles_path.resolve())}':"
         f"fontsdir='{preferred_font_dir}':"
         f"force_style='FontName={preferred_font_name},FontSize=15,"
         "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-        "BorderStyle=1,Outline=0.8,Shadow=0,MarginV=500,Alignment=2'[vsub]"
+        "BorderStyle=1,Outline=0.8,Shadow=0,MarginV=55,Alignment=2'[vsub]"
     )
 
     # Overlay title text in top blank area if title lines are provided
@@ -282,12 +312,12 @@ def render_project_video(
         # Use the preferred font (文源圆体 with fallback) for title text
         font_path = _escape_ffmpeg_filter_path(preferred_font_path)
 
-        # 16pt-style title text on a 1080x1920 canvas.
+        # Large two-line title in the top safe area of the 1080x1920 canvas.
         if title_line1:
             filters.append(
                 f"[vsub]drawtext=text='{_escape_drawtext(title_line1)}':"
-                f"fontsize=32:fontcolor=white:borderw=3:bordercolor=black:"
-                f"x=(w-text_w)/2:y=45:"
+                f"fontsize=56:fontcolor=white:borderw=4:bordercolor=black:"
+                f"x=(w-text_w)/2:y=50:"
                 f"fontfile='{font_path}'[vt1]"
             )
             current_label = "vt1"
@@ -296,11 +326,10 @@ def render_project_video(
 
         # Title line 2 - centered, below line 1
         if title_line2:
-            underlined_title = "".join(f"{char}\u0332" for char in title_line2)
             filters.append(
-                f"[{current_label}]drawtext=text='{_escape_drawtext(underlined_title)}':"
-                f"fontsize=32:fontcolor=yellow:borderw=3:bordercolor=black:"
-                f"x=(w-text_w)/2:y=110:"
+                f"[{current_label}]drawtext=text='{_escape_drawtext(title_line2)}':"
+                f"fontsize=56:fontcolor=yellow:borderw=4:bordercolor=black:"
+                f"x=(w-text_w)/2:y=130:"
                 f"fontfile='{font_path}'[vout]"
             )
         else:
@@ -310,12 +339,12 @@ def render_project_video(
         # No title - rename vsub to vout
         filters.append("[vsub]null[vout]")
     filters.append(
-        f"[1:a]apad,atrim=duration={total_duration:.3f},"
+        f"[{audio_input_index}:a]apad,atrim=duration={total_duration:.3f},"
         "asetpts=PTS-STARTPTS[voice]"
     )
     if background_music_path:
         filters.append(
-            f"[2:a]apad,atrim=duration={total_duration:.3f},"
+            f"[{music_input_index}:a]apad,atrim=duration={total_duration:.3f},"
             "asetpts=PTS-STARTPTS[music]"
         )
         filters.append(
@@ -358,15 +387,16 @@ def render_project_video(
         _run(command, cwd=output_path.parent)
     finally:
         filter_script.unlink(missing_ok=True)
-        concat_script.unlink(missing_ok=True)
 
     probe = probe_media(output_path)
     duration_delta = abs(probe["duration_sec"] - total_duration)
+    video_duration_delta = abs((probe.get("video_duration_sec") or 0) - total_duration)
     probe.update({
         "expected_duration_sec": round(total_duration, 3),
         "duration_delta_sec": round(duration_delta, 3),
-        "transition": "cut",
-        "transition_sec": 0,
+        "video_duration_delta_sec": round(video_duration_delta, 3),
+        "transition": "fade" if effective_transition_sec > 0 else "cut",
+        "transition_sec": round(effective_transition_sec, 3),
         "subtitles_burned_in": True,
         "passed": (
             probe["width"] == 1080
@@ -374,6 +404,7 @@ def render_project_video(
             and probe["video_codec"] == "h264"
             and probe["audio_codec"] == "aac"
             and duration_delta <= 0.2
+            and video_duration_delta <= 0.2
         ),
     })
     if not probe["passed"]:
