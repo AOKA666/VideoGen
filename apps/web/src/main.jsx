@@ -5,6 +5,8 @@ import './styles.css';
 
 const API = import.meta.env.VITE_API_URL ?? (import.meta.env.DEV ? 'http://127.0.0.1:8000' : '');
 const ASSET_PAGE_SIZE = 60;
+const DEFAULT_PROMOTION_BOOK = '《国之脊梁》';
+const PROMOTION_BOOK_STORAGE_KEY = 'videogen.promotionBookTitle';
 const VOICE_OPTIONS = [
   { value: 'zh_male_m191_uranus_bigtts', label: '男声 · 沉稳叙事' },
   { value: 'zh_male_dongfanghaoran_uranus_bigtts', label: '男声 · 东方浩然' },
@@ -63,6 +65,14 @@ function numberScriptParagraphs(value) {
     .join('\n\n');
 }
 
+function splitScriptParagraphs(value) {
+  const script = stripScriptParagraphNumbers(value).replace(/\r\n?/g, '\n');
+  if (!script) return [];
+  return script.split(/\n\s*\n/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
+}
+
 function projectStage(project) {
   const status = project?.status || 'created';
   if (project?.has_export || project?.export_url || project?.draft_url || project?.last_export_at) return { key: 'done', label: '已完成' };
@@ -101,27 +111,62 @@ function assetImageUrl(asset) {
   return `${API}${asset.file_url}${version ? `?v=${encodeURIComponent(version)}` : ''}`;
 }
 
-function assetCropDisplayStyle(asset) {
+function normalizedAssetCropRegion(asset, naturalSize = null) {
   const crop = asset?.crop_region;
   const width = Number(crop?.image_width || 0);
   const height = Number(crop?.image_height || 0);
   const size = Number(crop?.size || 0);
-  if (!width || !height || !size) return undefined;
-  const assetWidth = Number(asset?.width || 0);
-  const assetHeight = Number(asset?.height || 0);
-  if ((assetWidth && assetWidth !== width) || (assetHeight && assetHeight !== height)) return undefined;
+  if (!width || !height || !size) return null;
+  if (naturalSize && (
+    Number(naturalSize.width || 0) !== width
+    || Number(naturalSize.height || 0) !== height
+  )) return null;
   const safeSize = Math.max(1, Math.min(size, width, height));
   const x = Math.max(0, Math.min(Number(crop.x || 0), width - safeSize));
   const y = Math.max(0, Math.min(Number(crop.y || 0), height - safeSize));
+  return { x, y, size: safeSize, imageWidth: width, imageHeight: height };
+}
+
+function assetCropDisplayStyle(asset, naturalSize = null) {
+  const crop = normalizedAssetCropRegion(asset, naturalSize);
+  if (!crop) return undefined;
   return {
     position: 'absolute',
     maxWidth: 'none',
     maxHeight: 'none',
-    width: `${(width / safeSize) * 100}%`,
-    height: `${(height / safeSize) * 100}%`,
-    left: `${-(x / safeSize) * 100}%`,
-    top: `${-(y / safeSize) * 100}%`,
+    width: `${(crop.imageWidth / crop.size) * 100}%`,
+    height: `${(crop.imageHeight / crop.size) * 100}%`,
+    left: `${-(crop.x / crop.size) * 100}%`,
+    top: `${-(crop.y / crop.size) * 100}%`,
     objectFit: 'fill',
+  };
+}
+
+function assetWithVisibleCropRegion(asset, imageElement) {
+  const imageWidth = Number(imageElement?.naturalWidth || 0);
+  const imageHeight = Number(imageElement?.naturalHeight || 0);
+  if (!imageWidth || !imageHeight) return asset;
+  const savedCrop = normalizedAssetCropRegion(asset, {
+    width: imageWidth,
+    height: imageHeight,
+  });
+  const side = Math.min(imageWidth, imageHeight);
+  const visibleCrop = savedCrop || {
+    x: (imageWidth - side) / 2,
+    y: (imageHeight - side) / 2,
+    size: side,
+    imageWidth,
+    imageHeight,
+  };
+  return {
+    ...asset,
+    crop_region: {
+      x: visibleCrop.x,
+      y: visibleCrop.y,
+      size: visibleCrop.size,
+      image_width: visibleCrop.imageWidth,
+      image_height: visibleCrop.imageHeight,
+    },
   };
 }
 
@@ -142,14 +187,20 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [rawScriptDraft, setRawScriptDraft] = useState('');
   const [rewrittenScriptEditor, setRewrittenScriptEditor] = useState('');
+  const [editingParagraphIndex, setEditingParagraphIndex] = useState(-1);
+  const [paragraphDraft, setParagraphDraft] = useState('');
   const [aiScriptPerson, setAiScriptPerson] = useState('');
   const [aiScriptAngle, setAiScriptAngle] = useState('');
   const [processingImage, setProcessingImage] = useState('');
-  const [generatingShotId, setGeneratingShotId] = useState('');
+  const [generatingShotIds, setGeneratingShotIds] = useState(new Set());
   const [recognizingShotIds, setRecognizingShotIds] = useState(new Set());
   const [imagePromptEditors, setImagePromptEditors] = useState({});
   const [materialSourceStrategy, setMaterialSourceStrategy] = useState('library_first');
   const [openingPreserveChars, setOpeningPreserveChars] = useState(0);
+  const [appendBookPromotion, setAppendBookPromotion] = useState(false);
+  const [promotionBookTitle, setPromotionBookTitle] = useState(
+    () => window.localStorage.getItem(PROMOTION_BOOK_STORAGE_KEY) || DEFAULT_PROMOTION_BOOK,
+  );
   const [voiceType, setVoiceType] = useState(VOICE_OPTIONS[0].value);
   const [speechRate, setSpeechRate] = useState(0);
   const [voicePreviewUrl, setVoicePreviewUrl] = useState('');
@@ -184,8 +235,20 @@ function App() {
   const lastProjectStatusRef = useRef('');
   const rawScriptRef = useRef(null);
   const rewrittenScriptDirtyRef = useRef(false);
+  const paragraphSaveVersionRef = useRef(0);
+  const paragraphSaveQueueRef = useRef(Promise.resolve());
+  const deletingParagraphRef = useRef(false);
+
+  useEffect(() => {
+    const value = promotionBookTitle.trim() || DEFAULT_PROMOTION_BOOK;
+    window.localStorage.setItem(PROMOTION_BOOK_STORAGE_KEY, value);
+  }, [promotionBookTitle]);
 
   const activeLibrary = validLibrary(library) ? library : null;
+  const rewrittenParagraphs = useMemo(
+    () => splitScriptParagraphs(rewrittenScriptEditor),
+    [rewrittenScriptEditor],
+  );
   const selectedAssets = useMemo(() => {
     const map = new Map();
     assets.forEach((asset) => map.set(asset.id, asset));
@@ -341,6 +404,7 @@ function App() {
   useEffect(() => {
     if (!project) return;
     setProjectNameDraft(project.name || '');
+    setAppendBookPromotion(Boolean(project.append_book_promotion));
     setTitleLine1(project.title_line1 || '');
     setTitleLine2(project.title_line2 || '');
     setTitleConfirmed(Boolean(project.title_line1 && project.title_line2) || Boolean(project.cover_url));
@@ -353,6 +417,7 @@ function App() {
   }, [
     project?.id,
     project?.name,
+    project?.append_book_promotion,
     project?.title_line1,
     project?.title_line2,
     project?.publish_short_title,
@@ -372,6 +437,8 @@ function App() {
   useEffect(() => {
     if (rewrittenScriptDirtyRef.current) return;
     setRewrittenScriptEditor(numberScriptParagraphs(project?.rewritten_script || ''));
+    setEditingParagraphIndex(-1);
+    setParagraphDraft('');
   }, [project?.id, project?.rewritten_script]);
 
   useEffect(() => {
@@ -514,22 +581,98 @@ function App() {
         ...(openingPreserveChars
           ? { opening_preserve_chars: openingPreserveChars }
           : { opening_preserve_rule: 'auto' }),
+        append_book_promotion: appendBookPromotion,
+        promotion_book_title: promotionBookTitle.trim() || DEFAULT_PROMOTION_BOOK,
       }),
     }));
-    if (data) await refreshAll(projectId);
+    if (data) {
+      await refreshAll(projectId);
+      if (data.rewrite_warning) setMessage(data.rewrite_warning);
+    }
   }
 
   async function saveScript() {
-    const rewrittenScript = stripScriptParagraphNumbers(rewrittenScriptEditor);
-    const data = await run('保存文案', () => request(`/api/projects/${projectId}/script`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ rewritten_script: rewrittenScript }),
-    }));
-    if (!data) return;
+    const paragraphs = [...rewrittenParagraphs];
+    if (editingParagraphIndex >= 0 && paragraphs[editingParagraphIndex] !== undefined && paragraphDraft.trim()) {
+      paragraphs[editingParagraphIndex] = paragraphDraft.trim();
+    }
+    setEditingParagraphIndex(-1);
+    setParagraphDraft('');
+    rewrittenScriptDirtyRef.current = false;
+    await persistParagraphs(paragraphs, '文案已保存');
+  }
+
+  async function persistParagraphs(paragraphs, successMessage = '段落已自动保存') {
+    const cleanedParagraphs = paragraphs.map((paragraph) => paragraph.trim()).filter(Boolean);
+    if (!cleanedParagraphs.length) {
+      setMessage('文案至少需要保留一个段落');
+      return false;
+    }
+    const rewrittenScript = cleanedParagraphs.join('\n\n');
+    const saveVersion = paragraphSaveVersionRef.current + 1;
+    paragraphSaveVersionRef.current = saveVersion;
     rewrittenScriptDirtyRef.current = false;
     setRewrittenScriptEditor(numberScriptParagraphs(rewrittenScript));
-    await refreshAll(projectId);
+    setMessage('自动保存中...');
+    try {
+      const saveRequest = paragraphSaveQueueRef.current
+        .catch(() => undefined)
+        .then(() => request(`/api/projects/${projectId}/script`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ rewritten_script: rewrittenScript }),
+        }));
+      paragraphSaveQueueRef.current = saveRequest;
+      const data = await saveRequest;
+      if (saveVersion !== paragraphSaveVersionRef.current) return true;
+      setProject((current) => current ? {
+        ...current,
+        rewritten_script: rewrittenScript,
+        rewrite_comparison: data.rewrite_comparison || current.rewrite_comparison,
+        rewrite_difference: data.rewrite_difference ?? current.rewrite_difference,
+      } : current);
+      setMessage(successMessage);
+      return true;
+    } catch (err) {
+      if (saveVersion === paragraphSaveVersionRef.current) {
+        rewrittenScriptDirtyRef.current = true;
+        setMessage(`自动保存失败：${err.message}`);
+      }
+      return false;
+    }
+  }
+
+  function beginParagraphEdit(index) {
+    setEditingParagraphIndex(index);
+    setParagraphDraft(rewrittenParagraphs[index] || '');
+  }
+
+  async function finishParagraphEdit(index) {
+    if (deletingParagraphRef.current || editingParagraphIndex !== index) return;
+    const value = paragraphDraft.trim();
+    setEditingParagraphIndex(-1);
+    setParagraphDraft('');
+    rewrittenScriptDirtyRef.current = false;
+    if (!value) {
+      setMessage('段落内容不能为空；如需移除请点击删除');
+      return;
+    }
+    if (value === rewrittenParagraphs[index]) return;
+    const paragraphs = [...rewrittenParagraphs];
+    paragraphs[index] = value;
+    await persistParagraphs(paragraphs);
+  }
+
+  async function deleteScriptParagraph(event, index) {
+    event.stopPropagation();
+    if (!window.confirm(`确认删除第 ${index + 1} 段吗？删除后序号会自动重排。`)) return;
+    deletingParagraphRef.current = true;
+    setEditingParagraphIndex(-1);
+    setParagraphDraft('');
+    const paragraphs = rewrittenParagraphs.filter((_, paragraphIndex) => paragraphIndex !== index);
+    const savePromise = persistParagraphs(paragraphs, '段落已删除并自动重新编号');
+    window.setTimeout(() => { deletingParagraphRef.current = false; }, 0);
+    await savePromise;
   }
 
   async function saveProjectName() {
@@ -554,10 +697,14 @@ function App() {
     setBusy(true);
     setMessage('生成分镜中...');
     try {
+      const paragraphs = [...rewrittenParagraphs];
+      if (editingParagraphIndex >= 0 && paragraphs[editingParagraphIndex] !== undefined && paragraphDraft.trim()) {
+        paragraphs[editingParagraphIndex] = paragraphDraft.trim();
+      }
       await request(`/api/projects/${projectId}/script`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rewritten_script: stripScriptParagraphNumbers(rewrittenScriptEditor) }),
+        body: JSON.stringify({ rewritten_script: paragraphs.join('\n\n') }),
       });
       await request(
         `/api/projects/${projectId}/shots?image_search_provider=${imageSearchProvider}&material_source_strategy=${materialSourceStrategy}`,
@@ -762,21 +909,28 @@ function App() {
       setMessage('图片提示词不能为空');
       return;
     }
-    setGeneratingShotId(shotId);
+    setGeneratingShotIds((current) => new Set(current).add(shotId));
+    setMessage('AI 图片生成中，可继续生成其他分镜或重新识别提示词');
     try {
-      const result = await run('生成占位图', () => request(
+      const result = await request(
         `/api/projects/${projectId}/shots/${shotId}/generate-image`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ prompt: String(prompt).trim() }),
         },
-      ));
-      if (!result) return;
+      );
       closeImagePromptEditor(shotId);
       await refreshAll(projectId);
+      setMessage(`镜头 ${result.shot_index || ''} AI 图片生成完成`.replace('镜头  AI', 'AI'));
+    } catch (err) {
+      setMessage(`AI 图片生成失败：${err.message}`);
     } finally {
-      setGeneratingShotId('');
+      setGeneratingShotIds((current) => {
+        const next = new Set(current);
+        next.delete(shotId);
+        return next;
+      });
     }
   }
 
@@ -1310,6 +1464,19 @@ function App() {
             <div className="two-col">
               <form onSubmit={createProject} className="panel">
               <h2>创建项目</h2>
+              <label className="promotion-book-setting">
+                带货书籍设置
+                <input
+                  value={promotionBookTitle}
+                  maxLength="60"
+                  onChange={(event) => setPromotionBookTitle(event.target.value)}
+                  onBlur={() => {
+                    if (!promotionBookTitle.trim()) setPromotionBookTitle(DEFAULT_PROMOTION_BOOK);
+                  }}
+                  placeholder={DEFAULT_PROMOTION_BOOK}
+                />
+                <small>二创时开启“结尾带书”后，将在文案末尾自然带出这本书。</small>
+              </label>
               <label>项目名称<input name="name" placeholder="可留空，系统自动取标题" /></label>
               <div className="ai-script-options">
                 <label>人物名称（可选）<input value={aiScriptPerson} onChange={(event) => setAiScriptPerson(event.target.value)} placeholder="留空则随机选择《国之脊梁》院士" /></label>
@@ -1432,12 +1599,13 @@ function App() {
         {tab === 'script' && project && (
           <section className="band two-col script-grid">
             <div className="panel">
-              <div className="script-title">
+              <div className="script-title script-panel-heading">
                 <h2>原始文案</h2>
                 <span className="script-character-count">{scriptCharacterCount(project.raw_script)} 字</span>
               </div>
               <textarea
                 ref={rawScriptRef}
+                className="script-editor-surface raw-script-textarea"
                 readOnly
                 value={project.raw_script}
                 rows="18"
@@ -1493,35 +1661,72 @@ function App() {
               <small className="raw-script-hint">跳过二创，使用原始文案直接拆分镜头</small>
             </div>
             <div className="panel">
-              <div className="row">
+              <div className="row rewrite-toolbar">
                 <div className="script-title">
                   <h2>二创口播稿</h2>
                   <span className="script-character-count">{scriptCharacterCount(rewrittenScriptEditor)} 字</span>
                 </div>
                 <div className="actions">
-                  <button onClick={rewrite}><RefreshCw size={18} /> 改写</button>
+                  <button
+                    type="button"
+                    className={appendBookPromotion ? 'book-promotion-toggle active' : 'book-promotion-toggle'}
+                    aria-pressed={appendBookPromotion}
+                    title={`在二创文案末尾带出 ${promotionBookTitle.trim() || DEFAULT_PROMOTION_BOOK}`}
+                    onClick={() => setAppendBookPromotion((current) => !current)}
+                  >
+                    <Tags size={15} /> {appendBookPromotion ? '已选结尾带书' : '结尾带书'}
+                  </button>
+                  <button className="rewrite-compact-button" onClick={rewrite}><RefreshCw size={15} /> 改写</button>
                 </div>
               </div>
+              <div className="script-editor-surface rewrite-paragraph-list" aria-label="二创文案段落编辑器">
+                {rewrittenParagraphs.length ? rewrittenParagraphs.map((paragraph, index) => (
+                  <div
+                    className={editingParagraphIndex === index ? 'rewrite-paragraph-card editing' : 'rewrite-paragraph-card'}
+                    key={`${index}-${paragraph.slice(0, 18)}`}
+                    onClick={() => beginParagraphEdit(index)}
+                    onMouseLeave={() => finishParagraphEdit(index)}
+                  >
+                    <span className="rewrite-paragraph-number">[{index + 1}]</span>
+                    {editingParagraphIndex === index ? (
+                      <textarea
+                        autoFocus
+                        className="rewrite-paragraph-editor"
+                        value={paragraphDraft}
+                        onClick={(event) => event.stopPropagation()}
+                        onChange={(event) => {
+                          rewrittenScriptDirtyRef.current = true;
+                          setParagraphDraft(event.target.value);
+                        }}
+                      />
+                    ) : (
+                      <div className="rewrite-paragraph-content">{paragraph}</div>
+                    )}
+                    <button
+                      type="button"
+                      className="rewrite-paragraph-delete"
+                      title={`删除第 ${index + 1} 段`}
+                      aria-label={`删除第 ${index + 1} 段`}
+                      onClick={(event) => deleteScriptParagraph(event, index)}
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+                )) : (
+                  <div className="rewrite-paragraph-empty">暂无二创文案，请先点击“改写”。</div>
+                )}
+              </div>
               {project.rewrite_comparison && (
-                <p>
+                <small className="raw-script-hint rewrite-comparison">
                   总体重构度：{project.rewrite_comparison.overall_difference ?? project.rewrite_difference ?? '-'}%
-                  {' · '}正文连续照抄率：{project.rewrite_comparison.continuous_reuse ?? project.rewrite_comparison.character_similarity ?? '-'}%
-                  {' · '}原文短语复用率：{project.rewrite_comparison.source_phrase_reuse ?? project.rewrite_comparison.phrase_overlap ?? '-'}%
+                  {' · '}连续重复率：{project.rewrite_comparison.continuous_reuse ?? project.rewrite_comparison.character_similarity ?? '-'}%
+                  {' · '}短语复用率：{project.rewrite_comparison.source_phrase_reuse ?? project.rewrite_comparison.phrase_overlap ?? '-'}%
                   {' · '}逐句模仿率：{project.rewrite_comparison.sentence_imitation ?? '-'}%
                   {' · '}关键词重合率：{project.rewrite_comparison.keyword_overlap ?? project.rewrite_comparison.semantic_similarity ?? '-'}%
-                </p>
+                </small>
               )}
-              <textarea
-                value={rewrittenScriptEditor}
-                rows="18"
-                onChange={(event) => {
-                  rewrittenScriptDirtyRef.current = true;
-                  setRewrittenScriptEditor(event.target.value);
-                }}
-                onCopy={copyScriptWithoutParagraphNumbers}
-                onBlur={() => setRewrittenScriptEditor((current) => numberScriptParagraphs(current))}
-              />
-              <small className="raw-script-hint">AI 只保留固定开头，通读原文后重建叙事主线、信息顺序和段落功能；正文按完整画面分段。复制、保存和生成分镜时会自动去掉 [1]、[2] 等段落序号。</small>
+              {project.rewrite_warning && <p className="rewrite-warning">{project.rewrite_warning}</p>}
+              {project.rewrite_analysis_warning && <p className="rewrite-warning">{project.rewrite_analysis_warning}</p>}
               <label className="source-strategy">
                 素材来源策略
                 <select value={materialSourceStrategy} onChange={(event) => setMaterialSourceStrategy(event.target.value)}>
@@ -1621,7 +1826,7 @@ function App() {
                   isRecognizingImage={recognizingShotIds.has(shot.id)}
                   onUpdateVoiceText={(text) => updateShotVoiceText(shot.id, text)}
                   processingImage={processingImage}
-                  generatingShotId={generatingShotId}
+                  generatingShotIds={generatingShotIds}
                   onCrop={(assetId) => processGeneratedImage(assetId, 'crop-square')}
                   onRemoveWatermark={(assetId) => processGeneratedImage(assetId, 'remove-watermark')}
                   onGrayscale={(assetId) => processGeneratedImage(assetId, 'grayscale')}
@@ -1688,7 +1893,7 @@ function App() {
                     isRecognizingImage={recognizingShotIds.has(shot.id)}
                     onUpdateVoiceText={(text) => updateShotVoiceText(shot.id, text)}
                     processingImage={processingImage}
-                    generatingShotId={generatingShotId}
+                    generatingShotIds={generatingShotIds}
                     onCrop={(assetId) => processGeneratedImage(assetId, 'crop-square')}
                     onRemoveWatermark={(assetId) => processGeneratedImage(assetId, 'remove-watermark')}
                     onGrayscale={(assetId) => processGeneratedImage(assetId, 'grayscale')}
@@ -2161,7 +2366,7 @@ function AssetCard({ asset, selected, onSelect, onPreview, onEdit, onDelete, ima
         onClick={openPreview}
         onKeyDown={openPreview}
       >
-        {asset.file_type === 'image' ? <SafeImage src={src} alt={asset.file_name} style={assetCropDisplayStyle(asset)} /> : (
+        {asset.file_type === 'image' ? <CropAwareAssetImage asset={asset} src={src} alt={asset.file_name} /> : (
           asset.file_url
             ? <video src={src} poster={asset.thumbnail_url ? `${API}${asset.thumbnail_url}` : undefined} controls preload="metadata" />
             : <div className="video-processing-placeholder"><Film size={32} />{asset.processing_stage === 'failed' ? '处理失败' : '原视频已转为片段'}</div>
@@ -2188,7 +2393,25 @@ function AssetCard({ asset, selected, onSelect, onPreview, onEdit, onDelete, ima
   );
 }
 
-function SafeImage({ src, alt, style }) {
+function CropAwareAssetImage({ asset, src, alt }) {
+  const [naturalSize, setNaturalSize] = useState(null);
+  useEffect(() => {
+    setNaturalSize(null);
+  }, [src]);
+  return (
+    <SafeImage
+      src={src}
+      alt={alt}
+      style={assetCropDisplayStyle(asset, naturalSize)}
+      onLoad={(event) => setNaturalSize({
+        width: event.currentTarget.naturalWidth,
+        height: event.currentTarget.naturalHeight,
+      })}
+    />
+  );
+}
+
+function SafeImage({ src, alt, style, onLoad }) {
   const [broken, setBroken] = useState(false);
   useEffect(() => {
     setBroken(false);
@@ -2196,7 +2419,7 @@ function SafeImage({ src, alt, style }) {
   if (!src || broken) {
     return <div className="image-fallback">图片文件不可用</div>;
   }
-  return <img src={src} alt={alt || ''} style={style} loading="lazy" decoding="async" onError={() => setBroken(true)} />;
+  return <img src={src} alt={alt || ''} style={style} loading="lazy" decoding="async" onLoad={onLoad} onError={() => setBroken(true)} />;
 }
 
 
@@ -2363,13 +2586,14 @@ function ImagePreview({ asset, busy = false, onApplyCrop, onClose }) {
     return nextImageBox;
   }
 
-  function resetCropBox(nextImageBox = imageBox) {
+  function resetCropBox(nextImageBox = imageBox, fillsImage = false) {
     if (!nextImageBox) return;
     const side = Math.min(nextImageBox.width, nextImageBox.height);
     setCropBox({
       x: Math.round((nextImageBox.width - side) / 2),
       y: Math.round((nextImageBox.height - side) / 2),
       size: Math.round(side),
+      fillsImage,
     });
   }
 
@@ -2377,20 +2601,25 @@ function ImagePreview({ asset, busy = false, onApplyCrop, onClose }) {
     const image = event.currentTarget;
     const nextImageBox = readImageBox();
     setNaturalSize({ width: image.naturalWidth, height: image.naturalHeight });
-    const crop = asset.crop_region;
-    const cropMatchesImage = Number(crop?.image_width || 0) === image.naturalWidth
-      && Number(crop?.image_height || 0) === image.naturalHeight;
-    if (cropMatchesImage && crop?.size && nextImageBox) {
-      const scaleX = nextImageBox.width / Number(crop.image_width);
-      const scaleY = nextImageBox.height / Number(crop.image_height);
-      const displaySize = Math.min(Number(crop.size) * Math.min(scaleX, scaleY), nextImageBox.width, nextImageBox.height);
+    const crop = normalizedAssetCropRegion(asset, {
+      width: image.naturalWidth,
+      height: image.naturalHeight,
+    });
+    if (crop && nextImageBox) {
+      const scaleX = nextImageBox.width / crop.imageWidth;
+      const scaleY = nextImageBox.height / crop.imageHeight;
+      const displaySize = Math.min(crop.size * Math.min(scaleX, scaleY), nextImageBox.width, nextImageBox.height);
       setCropBox({
-        x: Math.max(0, Math.min(Number(crop.x || 0) * scaleX, nextImageBox.width - displaySize)),
-        y: Math.max(0, Math.min(Number(crop.y || 0) * scaleY, nextImageBox.height - displaySize)),
+        x: Math.max(0, Math.min(crop.x * scaleX, nextImageBox.width - displaySize)),
+        y: Math.max(0, Math.min(crop.y * scaleY, nextImageBox.height - displaySize)),
         size: displaySize,
+        fillsImage: image.naturalWidth === image.naturalHeight
+          && crop.x === 0
+          && crop.y === 0
+          && Math.abs(crop.size - image.naturalWidth) < 0.5,
       });
     } else {
-      resetCropBox(nextImageBox);
+      resetCropBox(nextImageBox, image.naturalWidth === image.naturalHeight);
     }
   }
 
@@ -2444,7 +2673,13 @@ function ImagePreview({ asset, busy = false, onApplyCrop, onClose }) {
           <strong>{asset.file_name || '图片预览'}</strong>
           <div className="image-preview-actions">
             {canCrop && (
-              <button type="button" onClick={() => resetCropBox(readImageBox())}>
+              <button
+                type="button"
+                onClick={() => resetCropBox(
+                  readImageBox(),
+                  naturalSize?.width === naturalSize?.height,
+                )}
+              >
                 <Crop size={17} /> 重置裁剪框
               </button>
             )}
@@ -2469,7 +2704,11 @@ function ImagePreview({ asset, busy = false, onApplyCrop, onClose }) {
               role="slider"
               aria-label="拖拽选择方形裁剪区域"
               tabIndex={0}
-              style={{
+              style={cropBox.fillsImage ? {
+                inset: 0,
+                width: '100%',
+                height: '100%',
+              } : {
                 left: `${cropBox.x}px`,
                 top: `${cropBox.y}px`,
                 width: `${cropBox.size}px`,
@@ -2697,7 +2936,7 @@ function ShotCard({
   isRecognizingImage,
   onUpdateVoiceText,
   processingImage,
-  generatingShotId,
+  generatingShotIds,
   onCrop,
   onRemoveWatermark,
   onGrayscale,
@@ -2710,7 +2949,7 @@ function ShotCard({
   useEffect(() => {
     if (!editingVoiceText) setVoiceTextDraft(shot.voice_text || '');
   }, [shot.voice_text, editingVoiceText]);
-  const isGeneratingImage = generatingShotId === shot.id;
+  const isGeneratingImage = generatingShotIds.has(shot.id);
   const visibleAssets = [...assets]
     .sort((a, b) => (b.id === selectedAssetId ? 1 : 0) - (a.id === selectedAssetId ? 1 : 0))
     .slice(0, 2);
@@ -2821,15 +3060,21 @@ function ShotCard({
                 className="image-choice-main"
                 role="button"
                 tabIndex={0}
-                onClick={() => {
+                onClick={(event) => {
                   onSelect?.(item.id, item.asset_source || 'web_search');
-                  onPreview?.(item);
+                  onPreview?.(assetWithVisibleCropRegion(
+                    item,
+                    event.currentTarget.querySelector('img'),
+                  ));
                 }}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter' || event.key === ' ') {
                     event.preventDefault();
                     onSelect?.(item.id, item.asset_source || 'web_search');
-                    onPreview?.(item);
+                    onPreview?.(assetWithVisibleCropRegion(
+                      item,
+                      event.currentTarget.querySelector('img'),
+                    ));
                   }
                 }}
                 title="选择并预览这张图"
@@ -2847,7 +3092,7 @@ function ShotCard({
                         disabled={Boolean(processingImage)}
                         onClick={(event) => {
                           event.stopPropagation();
-                          onPreview?.(item);
+                          onCrop?.(item.id);
                         }}
                       >
                         <Crop size={16} />

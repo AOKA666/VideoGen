@@ -15,10 +15,14 @@ from services.text_service import (  # noqa: E402
     GUOZHIJILIANG_STORY_SEEDS,
     MIN_GUOZHIJILIANG_SCRIPT_CHARS,
     MIN_GUOZHIJILIANG_SCRIPT_PARAGRAPHS,
+    MAX_REWRITE_LENGTH_RATIO,
     MIN_REWRITE_DIFFERENCE,
+    MIN_REWRITE_LENGTH_RATIO,
     RECENT_GUOZHIJILIANG_OPENINGS,
     RECENT_GUOZHIJILIANG_PEOPLE,
+    RewriteGenerationError,
     build_guozhijiliang_script_prompt_v2,
+    build_rewrite_analysis_prompt,
     build_rewrite_prompt,
     choose_guozhijiliang_seed,
     clean_shot_visual_terms,
@@ -26,6 +30,8 @@ from services.text_service import (  # noqa: E402
     cover_title_rejection_reasons,
     cover_title_needs_rewrite,
     ensure_original_opening,
+    ensure_rewrite_book_promotion,
+    extract_leading_title,
     fallback_infer_title,
     extract_opening_hook,
     generate_viral_title,
@@ -34,26 +40,130 @@ from services.text_service import (  # noqa: E402
     guozhijiliang_script_stats,
     keywords_from_text,
     normalize_auto_title,
+    normalize_rewrite_fact_brief,
     parse_title_candidates,
+    request_minimax_rewrite_analysis,
+    rewrite_script,
+    rewrite_script_with_minimax,
 )
 
 
 class ShotTagGenerationTests(unittest.TestCase):
-    def test_title_fallback_does_not_treat_parent_words_as_the_main_theme(self) -> None:
-        wang_demin = "这个人叫王德民，父亲留美归来，母亲是瑞士人。他高考接近满分，却被清华和北大拒绝。"
-        song_sisters = "宋氏三姐妹，一个爱钱，一个爱国，一个爱权。父亲宋嘉树支持革命。"
+    def test_ai_rewrite_failure_does_not_fall_back_to_source_copy(self) -> None:
+        source = "This source must never be returned as an AI rewrite fallback."
+        with patch.dict("os.environ", {"MINIMAX_API_KEY": "test"}), patch(
+            "services.text_service.rewrite_script_with_minimax",
+            side_effect=ValueError("invalid analysis JSON"),
+        ), patch(
+            "services.text_service.fallback_rewrite_script",
+        ) as fallback:
+            with self.assertRaises(RewriteGenerationError) as raised:
+                rewrite_script(source)
 
-        self.assertEqual("王德民名校拒录", fallback_infer_title(wang_demin))
-        self.assertEqual("宋氏三姐妹命运沉浮", fallback_infer_title(song_sisters))
-        self.assertNotEqual("家书背后", fallback_infer_title(wang_demin))
+        fallback.assert_not_called()
+        self.assertIn("rewrite pipeline", raised.exception.detail)
+        self.assertIn("invalid analysis JSON", raised.exception.detail)
 
-    def test_unrelated_ai_title_is_replaced_with_grounded_fallback(self) -> None:
-        source = "这个人叫王德民，他高考接近满分，却被清华和北大拒绝。"
+    def test_two_stage_rewrite_reports_analysis_failure_stage(self) -> None:
+        with patch(
+            "services.text_service.request_minimax_rewrite_analysis",
+            side_effect=ValueError("truncated JSON"),
+        ):
+            with self.assertRaises(RewriteGenerationError) as raised:
+                rewrite_script_with_minimax("source text", "documentary", "test-key")
 
-        self.assertEqual("王德民名校拒录", normalize_auto_title("家书背后", source))
+        self.assertIn("source analysis", raised.exception.detail)
+        self.assertIn("truncated JSON", raised.exception.detail)
+
+    def test_two_stage_rewrite_reports_draft_attempt_failure_stage(self) -> None:
+        fact_brief = {"facts": ["fact"], "material_cards": [{"detail": "detail"}]}
+        with patch(
+            "services.text_service.request_minimax_rewrite_analysis",
+            return_value=fact_brief,
+        ), patch(
+            "services.text_service.request_minimax_rewrite",
+            side_effect=TimeoutError("request timed out"),
+        ):
+            with self.assertRaises(RewriteGenerationError) as raised:
+                rewrite_script_with_minimax("source text", "documentary", "test-key")
+
+        self.assertIn("draft generation attempt 1", raised.exception.detail)
+        self.assertIn("request timed out", raised.exception.detail)
+
+    def test_source_analysis_retries_read_timeout_and_reports_attempts(self) -> None:
+        with patch(
+            "services.text_service.urllib.request.urlopen",
+            side_effect=TimeoutError("The read operation timed out"),
+        ) as urlopen:
+            with self.assertRaises(RuntimeError) as raised:
+                request_minimax_rewrite_analysis("source text", "test-key")
+
+        self.assertEqual(2, urlopen.call_count)
+        self.assertIn("timed out after 2 requests", str(raised.exception))
+        self.assertIn("120s timeout each", str(raised.exception))
+
+    def test_source_analysis_retries_malformed_model_json(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "choices": [{
+                        "message": {
+                            "content": '{"timeline": [], "facts": ["fact"] "material_cards": []}'
+                        }
+                    }]
+                }).encode("utf-8")
+
+        with patch(
+            "services.text_service.urllib.request.urlopen",
+            return_value=FakeResponse(),
+        ) as urlopen:
+            with self.assertRaises(RuntimeError) as raised:
+                request_minimax_rewrite_analysis("source text", "test-key")
+
+        self.assertEqual(2, urlopen.call_count)
+        self.assertIn("invalid JSON after 2 analysis attempts", str(raised.exception))
+        self.assertIn("JSONDecodeError", str(raised.exception))
+
+    def test_project_title_uses_the_first_eight_characters(self) -> None:
+        source = "一二三四五六七八九十十一十二"
+
+        self.assertEqual("一二三四五六七八", extract_leading_title(source))
+        self.assertEqual("一二三四五六七八", fallback_infer_title(source))
+        self.assertEqual("一二三四五六七八", normalize_auto_title("忽略这个标题", source))
+
+    def test_project_title_stops_at_punctuation_before_ten_characters(self) -> None:
+        self.assertEqual("谢汉光", extract_leading_title("谢汉光，潜伏台湾四十二年。"))
+        self.assertEqual("开头没有标点符超", extract_leading_title("开头没有标点符超过十个字，后文。"))
+
+    def test_project_title_ignores_leading_punctuation_and_whitespace(self) -> None:
+        self.assertEqual("他回来了", extract_leading_title("  \n“他回来了！”后文"))
+        self.assertEqual("未命名项目", extract_leading_title("，。！？"))
 
     def test_rewrite_requires_seventy_percent_reconstruction(self) -> None:
         self.assertEqual(70, MIN_REWRITE_DIFFERENCE)
+
+    def test_rewrite_length_stays_close_to_source(self) -> None:
+        self.assertEqual(0.90, MIN_REWRITE_LENGTH_RATIO)
+        self.assertEqual(1.10, MAX_REWRITE_LENGTH_RATIO)
+
+        prompt = build_rewrite_prompt("一" * 1000, "纪实故事型", 1, fact_brief={"facts": ["测试事实"]})
+        self.assertIn("900 到 1100", prompt)
+        self.assertIn("应以接近原文的 1000 字为写作目标", prompt)
+
+    def test_rewrite_comparison_rejects_a_script_that_is_too_short(self) -> None:
+        comparison = compare_scripts("甲" * 2000, "乙" * 800)
+
+        self.assertEqual(40, comparison["length_ratio"])
+        self.assertEqual(1800, comparison["min_rewritten_length"])
+        self.assertEqual(2200, comparison["max_rewritten_length"])
+        self.assertFalse(comparison["length_passed"])
+        self.assertFalse(comparison["passed"])
 
     def test_opening_hook_uses_complete_sentences_between_20_and_35_chars(self) -> None:
         source = "他拒绝了所有人的劝告。因为那个箱子里，藏着不能公开的秘密。后面的故事继续。"
@@ -83,6 +193,17 @@ class ShotTagGenerationTests(unittest.TestCase):
         result = ensure_original_opening(source, rewritten)
 
         self.assertTrue(result.startswith(extract_opening_hook(source)))
+
+    def test_multi_paragraph_fixed_opening_is_not_prepended_twice(self) -> None:
+        opening = "第一段固定开头。\n\n第二段继续制造悬念。\n\n第三段揭示核心人物。"
+        source = f"{opening}\n\n后面的原始正文。"
+        rewritten = "第一段固定开头。\n第二段继续制造悬念。\n第三段揭示核心人物。\n全新正文从这里开始。"
+
+        result = ensure_original_opening(source, rewritten, f"chars_{len(opening)}")
+
+        self.assertEqual(1, result.count("第一段固定开头。"))
+        self.assertEqual(1, result.count("第二段继续制造悬念。"))
+        self.assertEqual(1, result.count("第三段揭示核心人物。"))
 
     def test_guozhijiliang_seed_pool_covers_book_people(self) -> None:
         seed_people = {person for person, _ in GUOZHIJILIANG_STORY_SEEDS}
@@ -287,6 +408,122 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertIn("禁止主动添加书名", plain_prompt)
         self.assertIn("原文包含带书或图书推荐内容", book_prompt)
 
+    def test_rewrite_prompt_can_force_the_selected_sales_book(self) -> None:
+        prompt = build_rewrite_prompt(
+            "原文没有任何带书内容。",
+            "纪实故事型",
+            1,
+            append_book_promotion=True,
+            promotion_book_title="《国之脊梁》",
+        )
+
+        self.assertIn("用户已主动开启结尾带书", prompt)
+        self.assertIn("最后一个自然段必须", prompt)
+        self.assertIn("《国之脊梁》", prompt)
+
+    def test_missing_sales_book_is_appended_once_at_the_end(self) -> None:
+        script = "这是已经完成的二创故事。"
+
+        promoted = ensure_rewrite_book_promotion(script, True, "《国之脊梁》")
+        promoted_again = ensure_rewrite_book_promotion(promoted, True, "国之脊梁")
+
+        self.assertTrue(promoted.endswith("值得和孩子一起慢慢看。"))
+        self.assertIn("《国之脊梁》", promoted)
+        self.assertEqual(promoted, promoted_again)
+
+    def test_rewrite_analysis_prompt_reads_the_complete_source(self) -> None:
+        source = "开头事实。" + ("中间事实" * 300) + "全文末尾的重要结果"
+
+        prompt = build_rewrite_analysis_prompt(source)
+
+        self.assertIn("全文末尾的重要结果", prompt)
+        self.assertIn("只做内容理解和事实拆解", prompt)
+        self.assertIn("资料卡不是摘要", prompt)
+        self.assertIn("后续二创稿仍要写到约", prompt)
+        self.assertIn("转发机制：这是核心", prompt)
+        self.assertIn("评论、点赞、关注", prompt)
+        self.assertIn("section_plan", prompt)
+        self.assertIn("总计不超过200字", prompt)
+        self.assertIn("同一事件只写一次", prompt)
+        self.assertIn("不得增加字段", prompt)
+        self.assertNotIn('"detail_density"', prompt)
+        self.assertNotIn('"retention_beats"', prompt)
+
+    def test_second_stage_uses_fact_brief_without_source_body(self) -> None:
+        source = "固定开头必须保留。原文正文里的独特句子绝不能进入第二步提示词。"
+        fact_brief = normalize_rewrite_fact_brief({
+            "core_subject": "测试人物",
+            "core_conflict": "测试冲突",
+            "timeline": [{"time": "某年", "event": "发生关键事件"}],
+            "facts": ["人物完成任务"],
+            "book_promotion": {"present": False, "facts": []},
+        }, raw_length=2000)
+
+        prompt = build_rewrite_prompt(
+            source,
+            "纪实故事型",
+            1,
+            preserve_rule="first_sentence",
+            fact_brief=fact_brief,
+        )
+
+        self.assertIn("固定开头必须保留。", prompt)
+        self.assertIn("人物完成任务", prompt)
+        self.assertIn('"target_rewrite_length": 2000', prompt)
+        self.assertIn("事实资料卡不是篇幅上限", prompt)
+        self.assertNotIn("原文正文里的独特句子", prompt)
+        self.assertNotIn("<raw_script>", prompt)
+
+    def test_short_rewrite_retry_uses_targeted_expansion(self) -> None:
+        previous = {
+            "rewritten_script": "上一版短稿" * 100,
+            "rewrite_comparison": {
+                "overall_difference": 80,
+                "text1_length": 2000,
+                "text2_length": 1000,
+                "length_passed": False,
+                "min_rewritten_length": 1800,
+                "max_rewritten_length": 2200,
+                "continuous_reuse": 5,
+                "source_phrase_reuse": 5,
+                "sentence_imitation": 5,
+            },
+        }
+
+        prompt = build_rewrite_prompt("原" * 2000, "纪实故事型", 2, previous, fact_brief={"facts": ["关键事实"]})
+
+        self.assertIn("本轮首要任务：定向扩写", prompt)
+        self.assertIn("至少增加约 1000 字", prompt)
+        self.assertIn("不要另起炉灶重写成另一篇短稿", prompt)
+
+    def test_eighty_percent_rewrite_returns_with_a_warning_when_other_quality_passes(self) -> None:
+        comparison = {
+            "passed": False,
+            "non_length_quality_passed": True,
+            "length_ratio": 85,
+            "overall_difference": 80,
+            "continuous_reuse": 5,
+            "source_phrase_reuse": 5,
+            "sentence_imitation": 5,
+            "text1_length": 1000,
+            "text2_length": 850,
+            "min_rewritten_length": 900,
+            "max_rewritten_length": 1100,
+        }
+
+        def fake_rewrite(*_args, **_kwargs):
+            return {"rewritten_script": "二创正文", "rewrite_comparison": dict(comparison)}
+
+        with patch(
+            "services.text_service.request_minimax_rewrite_analysis",
+            return_value={"facts": ["事实"]},
+        ), patch("services.text_service.request_minimax_rewrite", side_effect=fake_rewrite):
+            result = rewrite_script_with_minimax("原文" * 500, "纪实故事型", "test-key")
+
+        self.assertEqual("length_warning", result["rewrite_quality_status"])
+        self.assertIn("85%", result["rewrite_warning"])
+        self.assertEqual(3, result["rewrite_attempts"])
+
     def test_rewrite_prompt_requires_body_to_continue_protected_opening(self) -> None:
         source = (
             "他在台湾潜伏四十二年后终于回乡，却发现妻子身边早已儿孙满堂。"
@@ -318,15 +555,15 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertIn("固定开头必须完整原样保留", prompt)
         self.assertIn("不能从一句话中间生硬截断", prompt)
 
-    def test_rewrite_comparison_excludes_the_protected_opening(self) -> None:
+    def test_rewrite_comparison_includes_the_fixed_opening(self) -> None:
         fixed_opening = "这段固定开头必须一字不改而且仍然参与相似度计算"
         original = f"{fixed_opening}。他在一九八零年来到北京，随后进入实验室工作。"
         rewritten = f"{fixed_opening}。抵达首都以后，他把余下的时间都交给了科研。"
 
         comparison = compare_scripts(original, rewritten, fixed_opening)
 
-        self.assertNotIn(fixed_opening, comparison["reused_passages"])
-        self.assertEqual(len(fixed_opening), comparison["protected_opening_length"])
+        self.assertTrue(any(fixed_opening in passage for passage in comparison["reused_passages"]))
+        self.assertEqual(0, comparison["protected_opening_length"])
         self.assertIn("keyword_overlap", comparison)
         self.assertIn("source_phrase_reuse", comparison)
 
@@ -373,7 +610,7 @@ class ShotTagGenerationTests(unittest.TestCase):
 
         self.assertIn(previous_script, prompt)
         self.assertIn("重点重复片段：仍然照着原文写的重复表达", prompt)
-        self.assertIn("固定开头不参与差异度验收", prompt)
+        self.assertIn("固定开头也参与重复率和总体重构度计算", prompt)
         self.assertIn("放弃上一版的段落、句序和叙事路径", prompt)
 
     def test_keywords_from_text_does_not_slice_script_fragments(self) -> None:

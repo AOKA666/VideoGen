@@ -25,14 +25,18 @@ GUOZHIJILIANG_PEOPLE = [
 PERSON_HINTS = GUOZHIJILIANG_PEOPLE + ["邓稼先", "于敏", "黄旭华", "袁隆平", "孙家栋", "屠呦呦", "彭士禄", "两弹一星"]
 SCENE_HINTS = ["实验室", "会议", "档案", "照片", "火箭", "导弹", "核潜艇", "宿舍", "办公室", "手稿", "文件"]
 ERA_HINTS = ["1950", "1960", "1970", "上世纪", "建国", "抗战"]
-MIN_REWRITE_LENGTH_RATIO = 0.85
-MAX_REWRITE_LENGTH_RATIO = 1.25
+MIN_REWRITE_LENGTH_RATIO = 0.90
+MAX_REWRITE_LENGTH_RATIO = 1.10
 MIN_REWRITE_DIFFERENCE = 70
 MAX_REWRITE_CONTINUOUS_REUSE = 12
 MAX_REWRITE_SOURCE_PHRASE_REUSE = 20
 MAX_REWRITE_SENTENCE_IMITATION = 35
 MAX_REWRITE_ATTEMPTS = 3
-MAX_AUTO_TITLE_LENGTH = 9
+MAX_REWRITE_ANALYSIS_ATTEMPTS = 2
+MAX_REWRITE_ANALYSIS_REQUEST_ATTEMPTS = 2
+REWRITE_ANALYSIS_MATERIAL_RATIO = 0.30
+REWRITE_ANALYSIS_CHARS_PER_FACT_ITEM = 200
+MAX_AUTO_TITLE_LENGTH = 8
 MAX_PUBLISH_SHORT_TITLE_LENGTH = 16
 OPENING_HOOK_MIN_CHARS = 20
 OPENING_HOOK_MAX_CHARS = 35
@@ -257,11 +261,23 @@ class RewriteQualityError(RuntimeError):
         difference = comparison.get("overall_difference", 0)
         super().__init__(
             f"rewrite quality rejected: difference={difference}%, "
+            f"length={comparison.get('text2_length', 0)}/{comparison.get('text1_length', 0)} "
+            f"({comparison.get('length_ratio', 0)}%), "
             f"continuous_reuse={comparison.get('continuous_reuse', 0)}%, "
             f"source_phrase_reuse={comparison.get('source_phrase_reuse', comparison.get('phrase_overlap', 0))}%, "
             f"sentence_imitation={comparison.get('sentence_imitation', 0)}%"
         )
         self.result = result
+
+
+class RewriteGenerationError(RuntimeError):
+    def __init__(self, stage: str, cause: Exception):
+        self.stage = stage
+        self.cause = cause
+        cause_name = type(cause).__name__
+        cause_detail = str(cause).strip() or cause_name
+        self.detail = f"AI rewrite failed during {stage}: {cause_name}: {cause_detail}"[:1000]
+        super().__init__(self.detail)
 
 
 def content_length(text: str) -> int:
@@ -352,8 +368,16 @@ def remove_protected_opening(text: str, protected_opening: str) -> str:
 
 
 def compare_scripts(text1: str, text2: str, protected_opening: str = "") -> dict:
-    body1 = remove_protected_opening(text1, protected_opening)
-    body2 = remove_protected_opening(text2, protected_opening)
+    source_length = content_length(text1)
+    rewritten_length = content_length(text2)
+    min_rewritten_length = int(source_length * MIN_REWRITE_LENGTH_RATIO)
+    max_rewritten_length = int(source_length * MAX_REWRITE_LENGTH_RATIO)
+    length_ratio = round((rewritten_length / source_length) * 100) if source_length else 0
+    length_passed = bool(source_length) and min_rewritten_length <= rewritten_length <= max_rewritten_length
+    # The fixed opening is intentionally included in every reuse metric. The
+    # optional argument remains for call compatibility with older integrations.
+    body1 = text1
+    body2 = text2
     compact1 = compact_similarity_text(body1)
     compact2 = compact_similarity_text(body2)
     total_chars = len(compact1) + len(compact2)
@@ -390,12 +414,13 @@ def compare_scripts(text1: str, text2: str, protected_opening: str = "") -> dict
         reverse=True,
     )[:8]
 
-    passed = (
+    non_length_quality_passed = (
         overall_difference >= MIN_REWRITE_DIFFERENCE
         and continuous_reuse <= MAX_REWRITE_CONTINUOUS_REUSE
         and source_phrase_reuse <= MAX_REWRITE_SOURCE_PHRASE_REUSE
         and sentence_imitation <= MAX_REWRITE_SENTENCE_IMITATION
     )
+    passed = length_passed and non_length_quality_passed
     return {
         "continuous_reuse": continuous_reuse,
         "phrase_overlap": phrase_overlap,
@@ -406,9 +431,14 @@ def compare_scripts(text1: str, text2: str, protected_opening: str = "") -> dict
         "character_similarity": continuous_reuse,
         "semantic_similarity": keyword_overlap,
         "overall_difference": overall_difference,
-        "text1_length": len(compact1),
-        "text2_length": len(compact2),
-        "protected_opening_length": content_length(protected_opening),
+        "text1_length": source_length,
+        "text2_length": rewritten_length,
+        "length_ratio": length_ratio,
+        "length_passed": length_passed,
+        "non_length_quality_passed": non_length_quality_passed,
+        "min_rewritten_length": min_rewritten_length,
+        "max_rewritten_length": max_rewritten_length,
+        "protected_opening_length": 0,
         "reused_passages": reused_passages,
         "common_keywords": sorted(terms1 & terms2, key=len, reverse=True)[:10],
         "unique_keywords1": sorted(terms1 - terms2, key=len, reverse=True)[:10],
@@ -441,8 +471,33 @@ def looks_like_truncated_sentence(title: str, raw_script: str) -> bool:
     if not title or not raw_script:
         return False
     sentences = split_sentences(raw_script)
-    first = clean_auto_title(sentences[0] if sentences else raw_script)
-    return len(first) > len(title) + 3 and first.startswith(title)
+    cleaned_sentences = [clean_auto_title(sentence) for sentence in sentences]
+    if not cleaned_sentences:
+        cleaned_sentences = [clean_auto_title(raw_script)]
+
+    # Reject an unfinished prefix such as “他是中国最专情” as before, but inspect
+    # every sentence instead of only the opening sentence.
+    if any(len(sentence) > len(title) + 3 and sentence.startswith(title) for sentence in cleaned_sentences):
+        return True
+
+    # A model may satisfy a length instruction by cutting through the first word
+    # of a source phrase (for example “最专情的地下党员” -> “情的地下党员”).
+    # Detect that broken left boundary.  jieba gives us word boundaries when it is
+    # available; the small fallback covers the common “X的...” fragment shape.
+    compact_source = clean_auto_title(raw_script)
+    start = compact_source.find(title)
+    if start > 0:
+        if jieba is not None:
+            boundaries = {0}
+            cursor = 0
+            for token in jieba.cut(compact_source, cut_all=False):
+                cursor += len(token)
+                boundaries.add(cursor)
+            if start not in boundaries:
+                return True
+        elif re.match(r"^[\u4e00-\u9fff]{1,2}的", title):
+            return True
+    return False
 
 
 def extract_title_subject(raw_script: str) -> str:
@@ -464,6 +519,7 @@ def extract_title_subject(raw_script: str) -> str:
         return person
     patterns = [
         r"(?:这个人叫|这个人就是|他叫|她叫|名叫|名字叫)([\u4e00-\u9fff]{2,4})",
+        r"(?:这个(?:地下党员|党员|科学家|作家|院士|专家|工程师|英雄)叫)([\u4e00-\u9fff]{2,4})",
         r"(?:科学家|作家|院士|专家|工程师|英雄)([\u4e00-\u9fff]{2,4})(?=[，。！？])",
         r"^([\u4e00-\u9fff]{2,6})(?=[，。])",
     ]
@@ -483,8 +539,11 @@ def auto_title_is_grounded(title: str, raw_script: str) -> bool:
     if not cleaned or not text:
         return False
     subject = extract_title_subject(raw_script)
-    if subject and subject in cleaned:
-        return True
+    # When the document identifies a central person, a project title must name
+    # that person.  This prevents a locally copied identity/emotion fragment from
+    # being mistaken for a title that represents the whole document.
+    if subject:
+        return subject in cleaned
     generic_pairs = {"故事", "背后", "往事", "人生", "命运", "选择", "时刻", "传奇"}
     title_pairs = {
         cleaned[index:index + 2]
@@ -494,104 +553,33 @@ def auto_title_is_grounded(title: str, raw_script: str) -> bool:
     return any(pair in text for pair in title_pairs)
 
 
-def fallback_infer_title(raw_script: str) -> str:
-    text = re.sub(r"\s+", "", raw_script or "")
-    if not text:
+def extract_leading_title(raw_script: str) -> str:
+    """Use at most the first eight script characters, stopping at punctuation."""
+    source = re.sub(r"\s+", "", str(raw_script or ""))
+    source = re.sub(r"^[，。！？、；：\"'“”‘’《》【】（）—…\-.!?,;:()\[\]{}<>]+", "", source)
+    if not source:
         return "未命名项目"
-    themes = [
-        ("骨灰", "三十三年守候"),
-        ("高考", "名校拒录"),
-        ("三姐妹", "命运沉浮"),
-        ("两弹一星", "两弹一星"),
-        ("回国", "归国"),
-        ("归国", "归国"),
-        ("隐姓埋名", "隐姓埋名"),
-        ("核潜艇", "核潜艇"),
-        ("青蒿素", "青蒿素"),
-        ("杂交水稻", "稻田传奇"),
-        ("卫星", "卫星时刻"),
-        ("导弹", "导弹往事"),
-        ("绝密", "绝密往事"),
-        ("牺牲", "最后时刻"),
-        ("国家", "国家选择"),
-    ]
-    person = extract_title_subject(raw_script)
-    theme = next((label for needle, label in themes if needle in text), "")
-    candidates: list[str] = []
-    if person and theme:
-        candidates.append(f"{person}{theme}")
-    if person:
-        candidates.extend([f"{person}往事", f"{person}故事", person])
-    if theme:
-        candidates.append(theme)
-    for candidate in candidates:
-        cleaned = clean_auto_title(candidate)
-        if 2 <= len(cleaned) <= MAX_AUTO_TITLE_LENGTH:
-            return cleaned
-    chunks = re.findall(r"[\u4e00-\u9fff]{2,6}", text)
-    weak_chunks = {"今天我们", "很多人", "大家好", "你知道", "这个故事", "一个"}
-    for chunk in chunks:
-        if chunk not in weak_chunks and not looks_like_truncated_sentence(chunk, raw_script):
-            return chunk
-    return "未命名项目"
+
+    title_chars: list[str] = []
+    for char in source:
+        if TITLE_PUNCTUATION.fullmatch(char):
+            break
+        title_chars.append(char)
+        if len(title_chars) == MAX_AUTO_TITLE_LENGTH:
+            break
+    return "".join(title_chars) or "未命名项目"
+
+
+def fallback_infer_title(raw_script: str) -> str:
+    return extract_leading_title(raw_script)
 
 
 def normalize_auto_title(title: str, raw_script: str) -> str:
-    cleaned = clean_auto_title(title)
-    if (
-        2 <= len(cleaned) <= MAX_AUTO_TITLE_LENGTH
-        and not looks_like_truncated_sentence(cleaned, raw_script)
-        and auto_title_is_grounded(cleaned, raw_script)
-    ):
-        return cleaned
-    return fallback_infer_title(raw_script)
+    return extract_leading_title(raw_script)
 
 
 def infer_title(raw_script: str) -> str:
-    api_key = os.getenv("MINIMAX_API_KEY", "").strip()
-    if not api_key:
-        return fallback_infer_title(raw_script)
-    prompt = (
-        "请根据下面的中文短视频文案，生成一个项目标题。\n"
-        "要求：1. 必须准确概括文案的核心人物和核心事件，不要被父亲、母亲、家人等次要词带偏，也不要直接截取原文开头。"
-        "2. 不要截断句子，优先使用完整短语。3. 不要标点符号。"
-        "4. 必须是完整短标题，不要像一句话被截断。"
-        "5. 标题中的人物或事件必须能在原文中找到依据，禁止使用与正文无关的套话。"
-        "6. 只返回JSON，不要解释。\n\n"
-        f"文案：\n{(raw_script or '')[:900]}\n\n"
-        '{"title": "项目标题"}'
-    )
-    payload = {
-        "model": minimax_model(),
-        "messages": [
-            {"role": "system", "content": "你只输出可解析JSON。"},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.55,
-        "top_p": 0.85,
-        "max_tokens": 120,
-        "stream": False,
-        "thinking": {"type": "disabled"},
-        "response_format": {"type": "json_object"},
-    }
-    try:
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            f"{minimax_endpoint().rstrip('/')}/chat/completions",
-            data=data,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=20) as response:
-            body = json.loads(response.read().decode("utf-8"))
-        content = body["choices"][0]["message"]["content"]
-        if isinstance(content, list):
-            content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
-        result = json.loads(extract_json(str(content)))
-        return normalize_auto_title(str(result.get("title") or ""), raw_script)
-    except Exception as exc:
-        logging.getLogger(__name__).warning("AI project title generation failed; using grounded fallback: %s", exc)
-        return fallback_infer_title(raw_script)
+    return extract_leading_title(raw_script)
 
 
 def extract_opening_hook(raw_script: str, preserve_rule: str = "auto") -> str:
@@ -669,7 +657,10 @@ def ensure_original_opening(raw_script: str, rewritten_script: str, preserve_rul
         return rewritten_script.strip()
 
     rewritten = rewritten_script.strip()
-    if rewritten.startswith(raw_hook):
+    # Paragraph normalization changes blank lines to single newlines before this
+    # check. Compare the opening without formatting so an already preserved
+    # multi-paragraph hook is not prepended a second time.
+    if compact_text(rewritten).startswith(compact_text(raw_hook)):
         return rewritten
 
     lines = [line.strip() for line in rewritten.splitlines() if line.strip()]
@@ -754,7 +745,32 @@ def minimax_model() -> str:
     return os.getenv("MINIMAX_MODEL", "MiniMax-M3")
 
 
-def fallback_rewrite_script(raw_script: str, style: str = "纪实故事型", preserve_rule: str = "auto") -> dict:
+def normalize_sales_book_title(title: str) -> tuple[str, str]:
+    bare = str(title or "").strip().strip("《》").strip() or "国之脊梁"
+    return bare, f"《{bare}》"
+
+
+def ensure_rewrite_book_promotion(script: str, enabled: bool, book_title: str) -> str:
+    rewritten = str(script or "").strip()
+    if not enabled:
+        return rewritten
+    bare, formatted = normalize_sales_book_title(book_title)
+    if bare in rewritten[-240:]:
+        return rewritten
+    promotion = (
+        f"如果你也想了解更多这样的中国脊梁，可以读一读{formatted}。"
+        "书里还有更多课本之外的真实人生，值得和孩子一起慢慢看。"
+    )
+    return f"{rewritten}\n\n{promotion}" if rewritten else promotion
+
+
+def fallback_rewrite_script(
+    raw_script: str,
+    style: str = "纪实故事型",
+    preserve_rule: str = "auto",
+    append_book_promotion: bool = False,
+    promotion_book_title: str = "国之脊梁",
+) -> dict:
     sentences = split_sentences(raw_script)
     title = infer_title(raw_script)
     hook = extract_opening_hook(raw_script, preserve_rule) or build_fallback_hook(raw_script, title)
@@ -772,6 +788,7 @@ def fallback_rewrite_script(raw_script: str, style: str = "纪实故事型", pre
     rewritten = "\n".join(body) if body else hook
     if content_length(raw_script) and content_length(rewritten) < int(content_length(raw_script) * MIN_REWRITE_LENGTH_RATIO):
         rewritten = paragraphize_script(raw_script)
+    rewritten = ensure_rewrite_book_promotion(rewritten, append_book_promotion, promotion_book_title)
     return {
         "title": title,
         "hook": hook,
@@ -788,7 +805,10 @@ def ensure_min_rewrite_difference(result: dict) -> dict:
     difference = comparison.get("overall_difference", 0)
     if not comparison.get("passed", False):
         result["rewrite_error"] = (
-            f"rewrite rejected: difference {difference}%, continuous reuse "
+            f"rewrite rejected: length {comparison.get('text2_length', 0)}/"
+            f"{comparison.get('text1_length', 0)} ({comparison.get('length_ratio', 0)}%), "
+            f"required {comparison.get('min_rewritten_length', 0)}-"
+            f"{comparison.get('max_rewritten_length', 0)} characters; difference {difference}%, continuous reuse "
             f"{comparison.get('continuous_reuse', 0)}%, source phrase reuse "
             f"{comparison.get('source_phrase_reuse', comparison.get('phrase_overlap', 0))}%, "
             f"sentence imitation {comparison.get('sentence_imitation', 0)}%"
@@ -797,16 +817,28 @@ def ensure_min_rewrite_difference(result: dict) -> dict:
     return result
 
 
-def normalize_rewrite_result(result: dict, raw_script: str, style: str, preserve_rule: str = "auto") -> dict:
+def normalize_rewrite_result(
+    result: dict,
+    raw_script: str,
+    style: str,
+    preserve_rule: str = "auto",
+    append_book_promotion: bool = False,
+    promotion_book_title: str = "国之脊梁",
+) -> dict:
     title = str(result.get("title") or infer_title(raw_script)).strip()
     hook = extract_opening_hook(raw_script, preserve_rule) or str(result.get("hook") or build_fallback_hook(raw_script, title)).strip()
     rewritten_script = str(result.get("rewritten_script") or "").strip()
     if not rewritten_script:
-        rewritten_script = fallback_rewrite_script(raw_script, style, preserve_rule)["rewritten_script"]
+        rewritten_script = fallback_rewrite_script(
+            raw_script, style, preserve_rule, append_book_promotion, promotion_book_title
+        )["rewritten_script"]
     rewritten_script = clean_rewritten_script(raw_script, rewritten_script)
     rewritten_script = ensure_original_opening(raw_script, rewritten_script, preserve_rule)
     rewritten_script = add_blank_lines_between_paragraphs(rewritten_script)
-    comparison = compare_scripts(raw_script, rewritten_script, hook)
+    rewritten_script = ensure_rewrite_book_promotion(
+        rewritten_script, append_book_promotion, promotion_book_title
+    )
+    comparison = compare_scripts(raw_script, rewritten_script)
     return {
         "title": normalize_auto_title(title, raw_script),
         "hook": hook,
@@ -819,24 +851,274 @@ def normalize_rewrite_result(result: dict, raw_script: str, style: str, preserve
     }
 
 
-def build_rewrite_prompt(raw_script: str, style: str, attempt: int, previous: dict | None = None, preserve_rule: str = "auto") -> str:
+def build_rewrite_analysis_prompt(raw_script: str) -> str:
+    raw_len = content_length(raw_script)
+    minimum_fact_items = max(4, round(raw_len / REWRITE_ANALYSIS_CHARS_PER_FACT_ITEM))
+    minimum_material_length = int(raw_len * REWRITE_ANALYSIS_MATERIAL_RATIO)
+    maximum_analysis_length = max(1400, min(2800, int(raw_len * 1.1)))
+    return f"""你是短视频事实编辑。完整通读原文，制作一份供第二个模型重新写作的紧凑素材包。本阶段只做内容理解和事实拆解，不写二创文案。
+
+原文去除空白后约 {raw_len} 字，后续二创稿仍要写到约 {raw_len} 字。素材包有效内容约 {minimum_material_length} 字即可，不追求长篇分析。
+
+【爆款分析】总计不超过200字，只写4条短结论：
+1. 钩子结构：最主要的停留原因和视频结构。
+2. 完播机制：最有效的细节密度、信息释放和情绪递进。
+3. 转发机制：这是核心。最主要的转发理由、用户痛点和情绪点。
+4. 互动机制：评论、点赞、关注的真实理由；原文没有就写“无明显设计”。
+
+【紧凑事实卡】资料卡不是摘要，但禁止重复：
+1. material_cards 至少 {minimum_fact_items} 条，每条用一至两句话合并写清人物、时间地点、动作、原因、结果及关键数字；同一事件只写一次。
+2. 保留支撑同等篇幅写作所需的重要事实、人物关系、转折、代价和画面，不复制原文完整句子，不保留原文修辞和段落结构。
+3. 设计4至6个新的写作阶段，target_chars 合计接近 {raw_len}，不得照搬原文段落顺序。
+4. 判断原文是否包含图书推荐；没有就标记 false。
+
+整个 JSON 去除空白后不得超过约 {maximum_analysis_length} 字符。只返回以下单层紧凑 JSON，不得增加字段，不得使用 Markdown：
+{{
+  "core_subject": "主体",
+  "core_conflict": "冲突",
+  "key_choice": "选择",
+  "story_outcome": "结果",
+  "viral_analysis": {{"hook": "短句", "completion": "短句", "share": "短句", "interaction": "短句"}},
+  "material_cards": ["紧凑事实卡1", "紧凑事实卡2"],
+  "must_preserve_terms": ["人名地名年份数字专名"],
+  "section_plan": [{{"task": "段落任务", "cards": [1, 2], "target_chars": 500}}],
+  "book_promotion": {{"present": false}}
+}}
+
+<raw_script>{raw_script}</raw_script>
+"""
+
+
+def nested_value_content_length(value: object) -> int:
+    if isinstance(value, dict):
+        return sum(nested_value_content_length(item) for item in value.values())
+    if isinstance(value, list):
+        return sum(nested_value_content_length(item) for item in value)
+    return content_length(str(value or ""))
+
+
+def normalize_rewrite_fact_brief(result: dict, raw_length: int = 0) -> dict:
+    if not isinstance(result, dict):
+        raise ValueError("Rewrite analysis must return a JSON object")
+    timeline = result.get("timeline") if isinstance(result.get("timeline"), list) else []
+    facts = result.get("facts") if isinstance(result.get("facts"), list) else []
+    material_cards = result.get("material_cards") if isinstance(result.get("material_cards"), list) else []
+    if not (timeline or facts or material_cards):
+        raise ValueError("Rewrite analysis did not return usable material cards")
+    promotion = result.get("book_promotion")
+    if not isinstance(promotion, dict):
+        promotion = {"present": False, "facts": []}
+    viral_analysis = result.get("viral_analysis") if isinstance(result.get("viral_analysis"), dict) else {}
+    structure_summary = result.get("structure_summary") if isinstance(result.get("structure_summary"), dict) else {}
+    section_plan = result.get("section_plan") if isinstance(result.get("section_plan"), list) else []
+    fact_item_count = len(timeline) + len(facts) + len(material_cards)
+    minimum_fact_items = (
+        max(4, round(raw_length / REWRITE_ANALYSIS_CHARS_PER_FACT_ITEM))
+        if raw_length else 1
+    )
+    material_content = {
+        "timeline": timeline,
+        "facts": facts,
+        "material_cards": material_cards,
+        "relationships": result.get("relationships") or [],
+        "viral_analysis": viral_analysis,
+        "structure_summary": structure_summary,
+        "section_plan": section_plan,
+    }
+    material_length = nested_value_content_length(material_content)
+    minimum_material_length = int(raw_length * REWRITE_ANALYSIS_MATERIAL_RATIO) if raw_length else 1
+    material_density_ratio = round((material_length / raw_length) * 100) if raw_length else 0
+    section_target_chars = sum(
+        int(item.get("target_chars") or 0)
+        for item in section_plan
+        if isinstance(item, dict) and str(item.get("target_chars") or "").isdigit()
+    )
+    section_target_ratio = round((section_target_chars / raw_length) * 100) if raw_length else 0
+    section_plan_passed = (
+        len(section_plan) >= 4
+        and (not raw_length or 85 <= section_target_ratio <= 115)
+    )
+    coverage_passed = (
+        fact_item_count >= minimum_fact_items
+        and material_length >= minimum_material_length
+        and section_plan_passed
+    )
+    return {
+        "source_length": raw_length,
+        "target_rewrite_length": raw_length,
+        "min_rewrite_length": int(raw_length * MIN_REWRITE_LENGTH_RATIO) if raw_length else 0,
+        "max_rewrite_length": int(raw_length * MAX_REWRITE_LENGTH_RATIO) if raw_length else 0,
+        "fact_item_count": fact_item_count,
+        "minimum_fact_items": minimum_fact_items,
+        "material_length": material_length,
+        "minimum_material_length": minimum_material_length,
+        "material_density_ratio": material_density_ratio,
+        "section_target_chars": section_target_chars,
+        "section_target_ratio": section_target_ratio,
+        "section_plan_passed": section_plan_passed,
+        "fact_coverage_passed": coverage_passed,
+        "core_subject": str(result.get("core_subject") or "").strip(),
+        "core_conflict": str(result.get("core_conflict") or "").strip(),
+        "key_choice": str(result.get("key_choice") or "").strip(),
+        "story_outcome": str(result.get("story_outcome") or "").strip(),
+        "timeline": timeline,
+        "facts": facts,
+        "material_cards": material_cards,
+        "relationships": result.get("relationships") if isinstance(result.get("relationships"), list) else [],
+        "must_preserve_terms": result.get("must_preserve_terms") if isinstance(result.get("must_preserve_terms"), list) else [],
+        "viral_analysis": viral_analysis,
+        "structure_summary": structure_summary,
+        "section_plan": section_plan,
+        "book_promotion": {
+            "present": bool(promotion.get("present")),
+            "facts": promotion.get("facts") if isinstance(promotion.get("facts"), list) else [],
+        },
+    }
+
+
+def request_minimax_rewrite_analysis(raw_script: str, api_key: str) -> dict:
+    base_prompt = build_rewrite_analysis_prompt(raw_script)
+    raw_len = content_length(raw_script)
+    minimum_fact_items = max(4, round(raw_len / REWRITE_ANALYSIS_CHARS_PER_FACT_ITEM))
+    minimum_material_length = int(raw_len * REWRITE_ANALYSIS_MATERIAL_RATIO)
+    analysis_timeout = max(
+        30,
+        min(300, int(os.getenv("MINIMAX_ANALYSIS_TIMEOUT_SECONDS", "120"))),
+    )
+    last_brief: dict | None = None
+    last_analysis_error: Exception | None = None
+    for attempt in range(1, MAX_REWRITE_ANALYSIS_ATTEMPTS + 1):
+        retry_note = ""
+        if last_analysis_error:
+            retry_note = (
+                "\n\n上一版返回的 JSON 无法解析，错误为："
+                f"{type(last_analysis_error).__name__}: {str(last_analysis_error)[:240]}。"
+                "请重新输出完整且严格合法的 JSON；检查所有逗号、引号、括号，"
+                "不要使用 Markdown 代码块，不要在 JSON 前后添加解释，并严格压缩内容长度。"
+            )
+        elif last_brief:
+            retry_note = (
+                f"\n\n上一版分析未达到写作素材密度要求：事实/素材卡 {last_brief.get('fact_item_count', 0)} 条，"
+                f"最低 {minimum_fact_items} 条；有效分析与素材约 {last_brief.get('material_length', 0)} 字，"
+                f"最低 {minimum_material_length} 字；结构计划 {len(last_brief.get('section_plan') or [])} 段，最低4段。"
+                "请重新通读原文，补齐爆点、完播、转发、评论、点赞、关注机制，"
+                "把遗漏的动作、原因、结果、人物关系、时间节点、画面与情绪细节补齐，"
+                "并重新给出目标字数接近原文的分段写作计划。"
+            )
+        payload = {
+            "model": minimax_model(),
+            "messages": [
+                {"role": "system", "content": "你只做原文事实拆解，只输出可解析 JSON，不写二创稿。"},
+                {"role": "user", "content": base_prompt + retry_note},
+            ],
+            "temperature": 0.2,
+            "top_p": 0.8,
+            "max_tokens": max(1100, min(2500, round(raw_len * 0.70))),
+            "stream": False,
+            "thinking": {"type": "disabled"},
+            "response_format": {"type": "json_object"},
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{minimax_endpoint().rstrip('/')}/chat/completions",
+            data=data,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        body: dict | None = None
+        for request_attempt in range(1, MAX_REWRITE_ANALYSIS_REQUEST_ATTEMPTS + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=analysis_timeout) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as exc:
+                error_body = exc.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"MiniMax analysis API {exc.code}: {error_body}") from exc
+            except (TimeoutError, urllib.error.URLError) as exc:
+                is_timeout = isinstance(exc, TimeoutError) or isinstance(
+                    getattr(exc, "reason", None), TimeoutError
+                )
+                if not is_timeout:
+                    raise
+                if request_attempt >= MAX_REWRITE_ANALYSIS_REQUEST_ATTEMPTS:
+                    raise RuntimeError(
+                        "MiniMax source analysis timed out after "
+                        f"{MAX_REWRITE_ANALYSIS_REQUEST_ATTEMPTS} requests "
+                        f"({analysis_timeout}s timeout each)"
+                    ) from exc
+        if body is None:
+            raise RuntimeError("MiniMax source analysis returned no response")
+        content = body["choices"][0]["message"]["content"]
+        if isinstance(content, list):
+            content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+        try:
+            parsed_analysis = json.loads(extract_json(str(content)))
+            last_brief = normalize_rewrite_fact_brief(parsed_analysis, raw_len)
+            last_analysis_error = None
+        except (json.JSONDecodeError, ValueError) as exc:
+            last_analysis_error = exc
+            continue
+        if last_brief["fact_coverage_passed"]:
+            return last_brief
+        last_brief["analysis_warning"] = (
+            f"已使用精简素材包继续写作：素材卡共 {last_brief.get('fact_item_count', 0)} 条，"
+            f"有效素材约 {last_brief.get('material_length', 0)} 字。"
+        )
+        return last_brief
+    if last_brief:
+        last_brief["analysis_warning"] = (
+            f"素材分析密度未完全达标：事实 {last_brief.get('fact_item_count', 0)}/{minimum_fact_items}，"
+            f"有效素材 {last_brief.get('material_length', 0)}/{minimum_material_length} 字，"
+            f"结构计划 {len(last_brief.get('section_plan') or [])}/4 段。已使用当前最完整资料卡继续写作。"
+        )
+        return last_brief
+    if last_analysis_error:
+        raise RuntimeError(
+            "MiniMax source analysis returned invalid JSON after "
+            f"{MAX_REWRITE_ANALYSIS_ATTEMPTS} analysis attempts: "
+            f"{type(last_analysis_error).__name__}: {last_analysis_error}"
+        ) from last_analysis_error
+    raise RuntimeError("Rewrite analysis did not return a usable fact brief")
+
+
+def build_rewrite_prompt(
+    raw_script: str,
+    style: str,
+    attempt: int,
+    previous: dict | None = None,
+    preserve_rule: str = "auto",
+    fact_brief: dict | None = None,
+    append_book_promotion: bool = False,
+    promotion_book_title: str = "国之脊梁",
+) -> str:
     opening_hook = extract_opening_hook(raw_script, preserve_rule)
     raw_len = content_length(raw_script)
     min_len = int(raw_len * MIN_REWRITE_LENGTH_RATIO)
     max_len = int(raw_len * MAX_REWRITE_LENGTH_RATIO)
-    has_book_promotion = bool(re.search(
+    source_has_book_promotion = bool(re.search(
         r"(《[^》]+》|这本书|书里|书中|翻开|读完|买给孩子|下单|购买|小黄车|带书|卖书|推荐给家长)",
         raw_script,
     ))
-    conversion_instruction = (
-        "原文包含带书或图书推荐内容，可以保留原有转化意图并重新表达，但不要扩大篇幅、不要改成硬广。"
-        if has_book_promotion else
-        "原文不包含带书或图书推荐内容，改写稿也禁止主动添加书名、翻书、读书感受、买书、小黄车、家长购买或推荐给孩子等转化内容。结尾必须跟随原文主题自然收束。"
-    )
+    brief_promotion = (fact_brief or {}).get("book_promotion") or {}
+    has_book_promotion = bool(brief_promotion.get("present", source_has_book_promotion))
+    _, formatted_book_title = normalize_sales_book_title(promotion_book_title)
+    if append_book_promotion:
+        conversion_instruction = (
+            f"用户已主动开启结尾带书。最后一个自然段必须在故事完成后自然带出{formatted_book_title}，"
+            "用一到两句话说明书中还有更多相关真实人物或故事，并给出自然阅读建议。"
+            "不要突然硬广，不要编造书中具体章节、作者、价格、优惠或购买渠道。"
+        )
+    else:
+        conversion_instruction = (
+            "原文包含带书或图书推荐内容，可以保留原有转化意图并重新表达，但不要扩大篇幅、不要改成硬广。"
+            if has_book_promotion else
+            "原文不包含带书或图书推荐内容，改写稿也禁止主动添加书名、翻书、读书感受、买书、小黄车、家长购买或推荐给孩子等转化内容。结尾必须跟随原文主题自然收束。"
+        )
     retry_instruction = ""
     if previous:
         comparison = previous.get("rewrite_comparison") or {}
         previous_script = str(previous.get("rewritten_script") or "").strip()
+        previous_length = comparison.get("text2_length", content_length(previous_script))
         reused_passages = [
             str(item).strip()
             for item in comparison.get("reused_passages", [])
@@ -845,6 +1127,8 @@ def build_rewrite_prompt(raw_script: str, style: str, attempt: int, previous: di
         reused_summary = "；".join(reused_passages[:8]) or "系统未定位到单一长句，请全面检查正文表达"
         retry_instruction = (
             f"上一版没有通过真正重写验收：总体重构度 {comparison.get('overall_difference', 0)}%，"
+            f"字数 {comparison.get('text2_length', 0)}，原文 {comparison.get('text1_length', 0)} 字，"
+            f"合格范围 {comparison.get('min_rewritten_length', min_len)} 到 {comparison.get('max_rewritten_length', max_len)} 字，"
             f"固定开头之外的连续照抄率 {comparison.get('continuous_reuse', comparison.get('character_similarity', 0))}%，"
             f"原文短语复用率 {comparison.get('source_phrase_reuse', comparison.get('phrase_overlap', 0))}%，"
             f"逐句模仿率 {comparison.get('sentence_imitation', 0)}%。"
@@ -853,19 +1137,42 @@ def build_rewrite_prompt(raw_script: str, style: str, attempt: int, previous: di
             "不得逐句找同义词，不得按原文段落一一对应；应重新选择主冲突、重新编排信息出现顺序、重新组织场景和情绪递进。"
             f"\n<previous_rewrite>{previous_script}</previous_rewrite>"
         )
+        if not comparison.get("length_passed", True):
+            if previous_length < min_len:
+                missing_chars = max(raw_len - previous_length, min_len - previous_length)
+                retry_instruction += (
+                    f"\n\n【本轮首要任务：定向扩写】上一版只有 {previous_length} 字，不要另起炉灶重写成另一篇短稿。"
+                    f"请以上一版为底稿，至少增加约 {missing_chars} 字，最终写到接近 {raw_len} 字。"
+                    "逐条检查事实资料卡，把尚未充分展开的时间节点、人物动作、原因、后果和具体画面写成完整叙事；"
+                    "补充自然过渡和情绪递进，但禁止虚构、重复同一件事或堆砌空话。必须返回扩写后的完整全文。"
+                )
+            elif previous_length > max_len:
+                retry_instruction += (
+                    f"\n\n【本轮首要任务：定向精简】上一版有 {previous_length} 字，请保留完整事实与叙事主线，"
+                    f"删去重复表达和空泛评价，最终压缩到接近 {raw_len} 字。必须返回精简后的完整全文。"
+                )
+    fact_brief_json = json.dumps(fact_brief or {}, ensure_ascii=False, indent=2)
     prompt = f"""
 你是一名视频号爆款短视频文案改写专家，擅长改写卖书类、历史人物类、大国情绪类、爱国教育类短视频口播文案。
 
-我要你改写下面这篇文案，目标是在视频号发布，用于提高播放量和完播率。是否保留带书内容必须跟随原文，不得自行添加。
+这是两步创作流程的第二步。原文已经由事实编辑拆成资料卡，你不能看到原文正文，也不得猜测或还原原文表达。请只根据事实资料卡重新创作完整文案，目标是在视频号发布，用于提高播放量和完播率。
+事实资料卡不是篇幅上限。要把其中的客观事实重新组织成完整场景、动作、过渡和情绪递进，写到资料卡标注的目标字数；不得因为资料卡采用短句记录，就把成稿写成摘要。
+
+【写作前必须使用第一步分析】
+1. 先读取 viral_analysis，理解原文的停留爆点、完播机制、情绪曲线、转发价值以及评论、点赞、关注理由；不要只读取 timeline 和 facts。
+2. 再读取 structure_summary 和 section_plan，按照新的叙事主线与各段 target_chars 规划全文。各段可以自然浮动，但总字数必须接近目标。
+3. material_cards 是详细写作素材。把动作、条件、因果、画面和人物代价写进正文，维持原文的细节密度，不能把素材卡重新压缩成摘要。
+4. 复用的是原文奏效的内容机制，不是原文句子。必须重新设计表达、段落组织和信息出现顺序。
+5. 转发、评论、点赞、关注理由要融进观点、冲突和情绪落点；只在合适位置使用一次自然互动引导，禁止机械喊“点赞关注转发”。
 
 【最重要要求】
 用户选定的原文开头必须一字不改保留，不允许改字、不允许换词、不允许调整顺序、不允许删减。
-你只能从这段受保护内容之后开始优化。即使你判断开头不够好，也不能擅自改动。
+你只能从这段受保护内容之后开始创作。即使你判断开头不够好，也不能擅自改动。
 必须原样保留的开头是：{opening_hook}
 
 【固定开头后的连续叙事】
 固定开头不是一段可以独立放置的引子，而是整篇文案正在发生的第一段剧情。后续正文必须紧接固定开头最后一句继续讲，不能另起一个开头。
-固定开头之后，不得沿着原文的段落结构逐段改写。你必须先通读全文，在心里把原文拆成“不可改变的事实清单”和“可以完全推翻的表达结构”，再重新选择一条更有吸引力的叙事主线。
+固定开头之后，不得沿着原文的段落结构逐段改写，必须根据资料卡重新选择一条更有吸引力的叙事主线。资料卡只规定事实边界，不规定写作顺序和表达结构。
 固定开头后的第一句必须承担过渡作用，让观众知道后文和开头是同一个故事；但后续信息出现顺序、场景组合、铺垫位置、冲突展开和情绪递进都要重新设计。
 禁止在固定开头后再次使用“谁能想到”“你敢相信吗”“很多人不知道”“他到底是谁”等二次钩子来重启文案；也不要像第一次出场一样重新介绍同一个人物，造成两个独立开头。原文确实转入人物背景时，可以保留这一结构，但必须写成承接上文的背景补充。
 例如固定开头以“妻子追出来说了一番话，把他感动得老泪纵横”结束，而原文接下来转入他早年的经历，可以写“而这场迟到了四十二年的重逢，还要从他当年离开广东说起”，不能直接写“谁能想到，一个广东读书人……”另起一个开头。
@@ -882,7 +1189,7 @@ def build_rewrite_prompt(raw_script: str, style: str, attempt: int, previous: di
 3. 除固定开头和无法改写的专有名词外，原文中的完整句子、金句、狠话、过渡句、情绪表达和带书话术都不要照抄。
 4. 必须保留客观事实、真实时间关系和因果关系；原文的信息揭示顺序、段落顺序、各段功能、叙述落点和转折方式不属于事实，必须重新设计。
 
-【真正大改：把原文当素材库，不当模板】
+【真正大改：把事实资料卡当素材库】
 1. 除固定开头外，禁止按原文从第一段到最后一段逐段对应改写。
 2. 禁止“读一句、换一种说法”；即使每句话都换了词，只要句子顺序、段落功能和信息出现位置仍与原文一一对应，也是不合格。
 3. 先找出全文最值得讲的核心冲突和人物选择，以它为主轴；背景、履历、评价只在推动主轴时出现。
@@ -931,11 +1238,12 @@ def build_rewrite_prompt(raw_script: str, style: str, attempt: int, previous: di
 【长度和质量约束】
 原文去除空白后的长度约 {raw_len} 个中文字符。
 rewritten_script 去除空白后的长度必须控制在 {min_len} 到 {max_len} 个中文字符之间。
+应以接近原文的 {raw_len} 字为写作目标，不要刻意写到允许区间的上限或下限；在事实完整、口播自然的前提下，最终字数应尽量贴近原文。
 不要压缩成摘要、提纲或短版解说，也不要省略原文中的重要事实。
 事实边界：不虚构；不添加没有依据的具体时间、地点、人物关系；人物、年代、事件、因果关系必须保留。
 除必须原样保留的固定开头、专有名词、年份、数字和固定称谓之外，整体表达必须重新组织。
-系统只检查固定开头之后的正文。总体重构度必须达到 {MIN_REWRITE_DIFFERENCE}% 以上，连续照抄率不得超过 {MAX_REWRITE_CONTINUOUS_REUSE}%，原文六字短语复用率不得超过 {MAX_REWRITE_SOURCE_PHRASE_REUSE}%，逐句模仿率不得超过 {MAX_REWRITE_SENTENCE_IMITATION}%。
-新增一两句话、增加段落、换行、调整标点、调换少量句子都不能稀释这些指标；任何一项超限都会整篇退回重写。固定开头不参与差异度验收，也绝不能为了提高分数而改动。
+系统检查整篇文案，固定开头也参与重复率和总体重构度计算。总体重构度必须达到 {MIN_REWRITE_DIFFERENCE}% 以上，连续照抄率不得超过 {MAX_REWRITE_CONTINUOUS_REUSE}%，原文六字短语复用率不得超过 {MAX_REWRITE_SOURCE_PHRASE_REUSE}%，逐句模仿率不得超过 {MAX_REWRITE_SENTENCE_IMITATION}%。
+新增一两句话、增加段落、换行、调整标点、调换少量句子都不能稀释这些指标；任何一项超限都会整篇退回重写。固定开头必须原样保留，即使它会提高重复率，也绝不能为了提高分数而改动。
 人名、地点、年份和事实关键词的正常重合只单独展示，不计入差异度；不要为了降低关键词重合而篡改事实。
 {MIN_REWRITE_DIFFERENCE}% 是硬性验收线：不能通过加句、换行、调整标点、段落错位或同义词替换达成，固定开头之后的正文必须让读者明显感到作者重新构思、重新组织、重新讲述了一遍。
 
@@ -950,20 +1258,58 @@ rewritten_script 字段里只能放改写后的完整文案正文，禁止包含
 输出前自检固定开头与第一句新正文：如果第一句像与前文无关的新钩子，或像同一人物第一次出场一样重新介绍，必须在不改变事实与因果关系的前提下重写成自然过渡。
 输出前检查分段是否过碎：不能为了凑 40 到 60 字拆散同一个连续画面；少于 25 字且不能独立成画面的段落要与相邻段合并，超过 80 字的段落只在确有画面转换时自然拆分。
 
-<raw_script>{raw_script}</raw_script>
+【事实资料卡】
+<fact_brief>{fact_brief_json}</fact_brief>
 """
     return prompt
 
 
-def rewrite_script_with_minimax(raw_script: str, style: str, api_key: str, preserve_rule: str = "auto") -> dict:
+def rewrite_script_with_minimax(
+    raw_script: str,
+    style: str,
+    api_key: str,
+    preserve_rule: str = "auto",
+    append_book_promotion: bool = False,
+    promotion_book_title: str = "国之脊梁",
+) -> dict:
     raw_len = content_length(raw_script)
+    try:
+        fact_brief = request_minimax_rewrite_analysis(raw_script, api_key)
+    except RewriteGenerationError:
+        raise
+    except Exception as exc:
+        raise RewriteGenerationError("source analysis", exc) from exc
     best_result: dict | None = None
     last_result: dict | None = None
+
+    def candidate_rank(candidate: dict) -> tuple[int, int, int, int]:
+        metrics = candidate.get("rewrite_comparison") or {}
+        length_ratio = int(metrics.get("length_ratio") or 0)
+        return (
+            int(bool(metrics.get("passed"))),
+            int(bool(metrics.get("non_length_quality_passed"))),
+            -abs(length_ratio - 100),
+            int(metrics.get("overall_difference") or 0),
+        )
+
     for attempt in range(1, MAX_REWRITE_ATTEMPTS + 1):
-        prompt = build_rewrite_prompt(raw_script, style, attempt, last_result, preserve_rule)
-        result = request_minimax_rewrite(prompt, raw_script, style, api_key, raw_len, preserve_rule)
+        prompt = build_rewrite_prompt(
+            raw_script, style, attempt, last_result, preserve_rule, fact_brief,
+            append_book_promotion, promotion_book_title,
+        )
+        try:
+            result = request_minimax_rewrite(
+                prompt, raw_script, style, api_key, raw_len, preserve_rule,
+                append_book_promotion, promotion_book_title,
+            )
+        except RewriteGenerationError:
+            raise
+        except Exception as exc:
+            raise RewriteGenerationError(f"draft generation attempt {attempt}", exc) from exc
+        result["rewrite_fact_brief"] = fact_brief
+        result["rewrite_analysis_warning"] = fact_brief.get("analysis_warning", "")
         comparison = result.get("rewrite_comparison") or {}
-        if not best_result or comparison.get("overall_difference", 0) > (best_result.get("rewrite_comparison") or {}).get("overall_difference", 0):
+        if not best_result or candidate_rank(result) > candidate_rank(best_result):
             best_result = result
         if comparison.get("passed", False):
             result["rewrite_attempts"] = attempt
@@ -973,8 +1319,20 @@ def rewrite_script_with_minimax(raw_script: str, style: str, api_key: str, prese
     assert best_result is not None
     comparison = best_result.get("rewrite_comparison") or {}
     best_result["rewrite_attempts"] = MAX_REWRITE_ATTEMPTS
+    length_ratio = int(comparison.get("length_ratio") or 0)
+    if comparison.get("non_length_quality_passed") and 80 <= length_ratio < 90:
+        best_result["rewrite_warning"] = (
+            f"二创稿已返回，但字数为原文的 {length_ratio}%，低于建议的90%；"
+            "差异度和复用指标均已合格，可继续编辑或再次改写。"
+        )
+        best_result["rewrite_quality_status"] = "length_warning"
+        best_result["rewrite_error"] = ""
+        return best_result
     best_result["rewrite_error"] = (
         f"rewrite quality rejected after {MAX_REWRITE_ATTEMPTS} attempts: "
+        f"length {comparison.get('text2_length', 0)}/{comparison.get('text1_length', 0)} "
+        f"({comparison.get('length_ratio', 0)}%, required "
+        f"{comparison.get('min_rewritten_length', 0)}-{comparison.get('max_rewritten_length', 0)}), "
         f"difference {comparison.get('overall_difference', 0)}%, "
         f"continuous reuse {comparison.get('continuous_reuse', 0)}%, "
         f"source phrase reuse {comparison.get('source_phrase_reuse', 0)}%, "
@@ -983,7 +1341,16 @@ def rewrite_script_with_minimax(raw_script: str, style: str, api_key: str, prese
     raise RewriteQualityError(best_result)
 
 
-def request_minimax_rewrite(prompt: str, raw_script: str, style: str, api_key: str, raw_len: int, preserve_rule: str = "auto") -> dict:
+def request_minimax_rewrite(
+    prompt: str,
+    raw_script: str,
+    style: str,
+    api_key: str,
+    raw_len: int,
+    preserve_rule: str = "auto",
+    append_book_promotion: bool = False,
+    promotion_book_title: str = "国之脊梁",
+) -> dict:
     payload = {
         "model": minimax_model(),
         "messages": [
@@ -1019,21 +1386,32 @@ def request_minimax_rewrite(prompt: str, raw_script: str, style: str, api_key: s
         content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
     result = json.loads(extract_json(str(content)))
     result["rewrite_provider"] = minimax_model()
-    return normalize_rewrite_result(result, raw_script, style, preserve_rule)
+    return normalize_rewrite_result(
+        result, raw_script, style, preserve_rule, append_book_promotion, promotion_book_title
+    )
 
 
-def rewrite_script(raw_script: str, style: str = "纪实故事型", preserve_rule: str = "auto") -> dict:
-    fallback = fallback_rewrite_script(raw_script, style, preserve_rule)
+def rewrite_script(
+    raw_script: str,
+    style: str = "纪实故事型",
+    preserve_rule: str = "auto",
+    append_book_promotion: bool = False,
+    promotion_book_title: str = "国之脊梁",
+) -> dict:
     api_key = os.getenv("MINIMAX_API_KEY", "").strip()
     if not api_key:
+        fallback = fallback_rewrite_script(
+            raw_script, style, preserve_rule, append_book_promotion, promotion_book_title
+        )
         return ensure_min_rewrite_difference(fallback)
     try:
-        return rewrite_script_with_minimax(raw_script, style, api_key, preserve_rule)
-    except RewriteQualityError:
+        return rewrite_script_with_minimax(
+            raw_script, style, api_key, preserve_rule, append_book_promotion, promotion_book_title
+        )
+    except (RewriteQualityError, RewriteGenerationError):
         raise
     except Exception as exc:
-        fallback["rewrite_error"] = str(exc)[:300]
-        return ensure_min_rewrite_difference(fallback)
+        raise RewriteGenerationError("rewrite pipeline", exc) from exc
 
 
 def choose_guozhijiliang_seed(person_name: str = "", event_angle: str = "") -> tuple[str, str]:

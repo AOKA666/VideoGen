@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from services.store import PROJECTS_DIR, load_db, project_dir, save_db
-from services.text_service import RewriteQualityError, compare_scripts, generate_guozhijiliang_script, infer_title, merge_short_script_paragraphs, rewrite_script
+from services.text_service import RewriteGenerationError, RewriteQualityError, compare_scripts, generate_guozhijiliang_script, infer_title, merge_short_script_paragraphs, rewrite_script
 from services.web_image_pipeline import DONE_STATUSES, recover_interrupted_searches
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
@@ -44,6 +44,8 @@ class MergeParagraphsPayload(BaseModel):
 class RewritePayload(BaseModel):
     opening_preserve_rule: str = "auto"
     opening_preserve_chars: int | None = None
+    append_book_promotion: bool = False
+    promotion_book_title: str = "国之脊梁"
 
 
 @router.get("")
@@ -179,18 +181,37 @@ def rewrite(project_id: str, payload: RewritePayload | None = None):
             preserve_rule = (payload.opening_preserve_rule if payload else "auto")
         if preserve_rule not in {"auto", "first_sentence", "first_paragraph"} and not preserve_rule.startswith("chars_"):
             raise HTTPException(400, "Invalid opening preserve rule")
-        result = rewrite_script(project["raw_script"], project.get("script_style", "纪实故事型"), preserve_rule)
+        promotion_book_title = str(payload.promotion_book_title if payload else "国之脊梁").strip().strip("《》").strip()
+        if not promotion_book_title:
+            promotion_book_title = "国之脊梁"
+        if len(promotion_book_title) > 60:
+            raise HTTPException(400, "Promotion book title must not exceed 60 characters")
+        append_book_promotion = bool(payload and payload.append_book_promotion)
+        result = rewrite_script(
+            project["raw_script"],
+            project.get("script_style", "纪实故事型"),
+            preserve_rule,
+            append_book_promotion,
+            promotion_book_title,
+        )
     except RewriteQualityError as exc:
         detail = exc.result.get("rewrite_error") or str(exc)
         raise HTTPException(422, detail) from exc
+    except RewriteGenerationError as exc:
+        raise HTTPException(502, exc.detail) from exc
     project["rewritten_script"] = result["rewritten_script"]
     project["rewrite_provider"] = result.get("rewrite_provider", "")
     project["rewrite_error"] = result.get("rewrite_error", "")
+    project["rewrite_warning"] = result.get("rewrite_warning", "")
+    project["rewrite_analysis_warning"] = result.get("rewrite_analysis_warning", "")
+    project["rewrite_quality_status"] = result.get("rewrite_quality_status", "passed")
     project["rewrite_comparison"] = result.get("rewrite_comparison", {})
     project["rewrite_difference"] = result.get("rewrite_difference", 0)
     project["rewrite_attempts"] = result.get("rewrite_attempts", 1)
     project["opening_preserve_rule"] = preserve_rule
     project["opening_preserve_chars"] = payload.opening_preserve_chars if payload else None
+    project["append_book_promotion"] = append_book_promotion
+    project["promotion_book_title"] = promotion_book_title
     project["status"] = "script_ready"
     project["updated_at"] = datetime.now().isoformat(timespec="seconds")
     save_db(db)
@@ -211,7 +232,8 @@ def merge_script_paragraphs(project_id: str, payload: MergeParagraphsPayload):
     after_count = len([line for line in merged.splitlines() if line.strip()])
     if "".join(source.split()) != "".join(merged.split()):
         raise HTTPException(500, "Paragraph merge unexpectedly changed script content")
-    comparison = compare_scripts(project.get("raw_script", ""), merged)
+    raw_script = project.get("raw_script", "")
+    comparison = compare_scripts(raw_script, merged)
     project["rewritten_script"] = merged
     project["rewrite_comparison"] = comparison
     project["rewrite_difference"] = comparison["overall_difference"]
@@ -241,7 +263,8 @@ def update_script(project_id: str, payload: ScriptUpdate):
         project["name"] = name
     if payload.rewritten_script is not None:
         project["rewritten_script"] = payload.rewritten_script
-        comparison = compare_scripts(project.get("raw_script", ""), payload.rewritten_script)
+        raw_script = project.get("raw_script", "")
+        comparison = compare_scripts(raw_script, payload.rewritten_script)
         project["rewrite_comparison"] = comparison
         project["rewrite_difference"] = comparison["overall_difference"]
         project["status"] = "script_ready"
@@ -259,7 +282,12 @@ def update_script(project_id: str, payload: ScriptUpdate):
         project["archived"] = payload.archived
     project["updated_at"] = datetime.now().isoformat(timespec="seconds")
     save_db(db)
-    return {"status": "saved"}
+    return {
+        "status": "saved",
+        "rewritten_script": project.get("rewritten_script", ""),
+        "rewrite_comparison": project.get("rewrite_comparison", {}),
+        "rewrite_difference": project.get("rewrite_difference", 0),
+    }
 
 
 @router.delete("/{project_id}")

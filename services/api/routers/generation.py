@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import shutil
+import threading
 from io import BytesIO
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +36,7 @@ from services.store import load_db, project_dir, public_url, save_db
 from services.text_service import generate_publish_assistant, generate_viral_title
 
 router = APIRouter(prefix="/api/projects", tags=["generation"])
+GENERATED_IMAGE_SAVE_LOCK = threading.Lock()
 
 
 class VoicePayload(BaseModel):
@@ -378,29 +380,40 @@ def generate_image(project_id: str, shot_id: str, payload: ImageGenerationPayloa
         raise HTTPException(502, str(exc)) from exc
     prompt = result["prompt"]
     generated_id = new_id()
-    db["generated_assets"].append({
-        "id": generated_id,
-        "project_id": project_id,
-        "shot_id": shot_id,
-        "type": "image",
-        "prompt": prompt,
-        "provider": result.get("provider"),
-        "model": result.get("model"),
-        "image_size": result.get("image_size"),
-        "person_gender": result.get("person_gender"),
-        "remote_url": result.get("remote_url"),
-        "seed": result.get("seed"),
-        "file_url": public_url(out),
-        "local_path": str(out),
-        "status": "success",
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-    })
-    shot["selected_asset_id"] = generated_id
-    shot["asset_source"] = "ai_generated"
-    shot["status"] = "ai_generated"
-    save_db(db)
+    with GENERATED_IMAGE_SAVE_LOCK:
+        # Reload after the slow AI request. Other image generations or prompt
+        # recognition may have completed while this request was in flight; using
+        # the pre-request snapshot here would silently overwrite their changes.
+        db = load_db()
+        shot = next((s for s in db["shots"] if s["project_id"] == project_id and s["id"] == shot_id), None)
+        if not shot:
+            raise HTTPException(404, "Shot not found after image generation")
+        asset = {
+            "id": generated_id,
+            "project_id": project_id,
+            "shot_id": shot_id,
+            "type": "image",
+            "prompt": prompt,
+            "provider": result.get("provider"),
+            "model": result.get("model"),
+            "image_size": result.get("image_size"),
+            "person_gender": result.get("person_gender"),
+            "remote_url": result.get("remote_url"),
+            "seed": result.get("seed"),
+            "file_url": public_url(out),
+            "local_path": str(out),
+            "status": "success",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        db["generated_assets"].append(asset)
+        shot["selected_asset_id"] = generated_id
+        shot["asset_source"] = "ai_generated"
+        shot["status"] = "ai_generated"
+        save_db(db)
     return {
         "shot_id": shot_id,
+        "shot_index": shot.get("shot_index"),
+        "asset": asset,
         "image_url": public_url(out),
         "prompt": prompt,
         "provider": result.get("provider"),

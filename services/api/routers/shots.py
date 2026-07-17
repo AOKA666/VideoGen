@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+import os
 import threading
 from uuid import uuid4
 
@@ -14,36 +16,69 @@ from services.web_image_pipeline import mark_project_searching, request_stop_pro
 
 router = APIRouter(prefix="/api/projects", tags=["shots"])
 REANALYZE_SAVE_LOCK = threading.Lock()
+DEFAULT_AI_IMAGE_CONCURRENCY = 3
+MAX_AI_IMAGE_CONCURRENCY = 8
+
+
+def ai_image_concurrency(total: int) -> int:
+    try:
+        configured = int(os.getenv("AI_IMAGE_CONCURRENCY", str(DEFAULT_AI_IMAGE_CONCURRENCY)))
+    except ValueError:
+        configured = DEFAULT_AI_IMAGE_CONCURRENCY
+    return max(1, min(configured, MAX_AI_IMAGE_CONCURRENCY, max(1, total)))
+
+
+def _generate_one_ai_image(project_id: str, generated_shot: dict) -> tuple[dict, object, dict]:
+    out = project_dir(project_id) / "images" / f"shot_{generated_shot['shot_index']:03d}.png"
+    result = generate_doubao_image(out, generated_shot, "1:1")
+    return generated_shot, out, result
 
 
 def _generate_ai_images(project_id: str, run_id: str, shots: list[dict]) -> None:
     """Generate and select one AI image for every newly created shot."""
     total = len(shots)
     failed = 0
-    for completed, generated_shot in enumerate(shots, start=1):
-        shot_id = generated_shot["id"]
-        out = project_dir(project_id) / "images" / f"shot_{generated_shot['shot_index']:03d}.png"
-        try:
-            result = generate_doubao_image(out, generated_shot, "1:1")
-        except Exception as exc:
-            failed += 1
+    completed = 0
+    executor = ThreadPoolExecutor(
+        max_workers=ai_image_concurrency(total),
+        thread_name_prefix=f"ai-image-{project_id[:8]}",
+    )
+    futures = {
+        executor.submit(_generate_one_ai_image, project_id, generated_shot): generated_shot
+        for generated_shot in shots
+    }
+    try:
+        completed_futures = as_completed(futures)
+        for future in completed_futures:
+            generated_shot = futures[future]
+            completed += 1
+            shot_id = generated_shot["id"]
+            result = None
+            out = None
+            generation_error = None
+            try:
+                _, out, result = future.result()
+            except Exception as exc:
+                generation_error = exc
+
+            # Network/image work runs concurrently. Database mutations stay on
+            # this coordinator thread so completed workers cannot overwrite one
+            # another's project progress or generated-assets records.
             db = load_db()
             project = next((p for p in db["projects"] if p["id"] == project_id), None)
             shot = next((s for s in db["shots"] if s.get("id") == shot_id), None)
             if not project or project.get("shot_generation_run_id") != run_id:
+                for pending in futures:
+                    pending.cancel()
                 return
-            if shot:
-                shot["status"] = "no_image"
-                shot["image_generation_error"] = str(exc)[:500]
-                shot["updated_at"] = datetime.now().isoformat(timespec="seconds")
-            project["search_error"] = f"{failed} 个分镜 AI 图片生成失败"
-        else:
-            db = load_db()
-            project = next((p for p in db["projects"] if p["id"] == project_id), None)
-            shot = next((s for s in db["shots"] if s.get("id") == shot_id), None)
-            if not project or project.get("shot_generation_run_id") != run_id:
-                return
-            if shot:
+            if generation_error is not None:
+                failed += 1
+                if shot:
+                    shot["status"] = "no_image"
+                    shot["image_generation_error"] = str(generation_error)[:500]
+                    shot["updated_at"] = datetime.now().isoformat(timespec="seconds")
+                project["search_error"] = f"{failed} 个分镜 AI 图片生成失败"
+            elif shot and result is not None and out is not None:
                 generated_id = str(uuid4())
                 db.setdefault("generated_assets", []).append({
                     "id": generated_id,
@@ -66,13 +101,16 @@ def _generate_ai_images(project_id: str, run_id: str, shots: list[dict]) -> None
                 shot["asset_source"] = "ai_generated"
                 shot["status"] = "ai_generated"
                 shot["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        project["search_stage"] = "generating_ai_images"
-        project["search_completed"] = completed
-        project["search_total"] = total
-        project["current_shot_index"] = generated_shot.get("shot_index")
-        project["current_search_keyword"] = f"正在生成 AI 图片：{completed}/{total}"
-        project["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        save_db(db)
+            project["search_stage"] = "generating_ai_images"
+            project["search_completed"] = completed
+            project["search_total"] = total
+            project["current_shot_index"] = generated_shot.get("shot_index")
+            project["current_search_keyword"] = f"正在并发生成 AI 图片：{completed}/{total}"
+            project["ai_image_concurrency"] = ai_image_concurrency(total)
+            project["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            save_db(db)
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
 
     db = load_db()
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
