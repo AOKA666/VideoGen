@@ -127,8 +127,30 @@ function normalizedAssetCropRegion(asset, naturalSize = null) {
   return { x, y, size: safeSize, imageWidth: width, imageHeight: height };
 }
 
+function centeredAssetCropRegion(widthValue, heightValue) {
+  const imageWidth = Number(widthValue || 0);
+  const imageHeight = Number(heightValue || 0);
+  if (!imageWidth || !imageHeight) return null;
+  const size = Math.min(imageWidth, imageHeight);
+  return {
+    x: (imageWidth - size) / 2,
+    y: (imageHeight - size) / 2,
+    size,
+    imageWidth,
+    imageHeight,
+  };
+}
+
+function resolvedAssetCropRegion(asset, naturalSize = null) {
+  const imageWidth = Number(naturalSize?.width || asset?.width || 0);
+  const imageHeight = Number(naturalSize?.height || asset?.height || 0);
+  if (!imageWidth || !imageHeight) return null;
+  return normalizedAssetCropRegion(asset, { width: imageWidth, height: imageHeight })
+    || centeredAssetCropRegion(imageWidth, imageHeight);
+}
+
 function assetCropDisplayStyle(asset, naturalSize = null) {
-  const crop = normalizedAssetCropRegion(asset, naturalSize);
+  const crop = resolvedAssetCropRegion(asset, naturalSize);
   if (!crop) return undefined;
   return {
     position: 'absolute',
@@ -138,26 +160,20 @@ function assetCropDisplayStyle(asset, naturalSize = null) {
     height: `${(crop.imageHeight / crop.size) * 100}%`,
     left: `${-(crop.x / crop.size) * 100}%`,
     top: `${-(crop.y / crop.size) * 100}%`,
-    objectFit: 'fill',
+    objectFit: 'contain',
   };
 }
 
-function assetWithVisibleCropRegion(asset, imageElement) {
-  const imageWidth = Number(imageElement?.naturalWidth || 0);
-  const imageHeight = Number(imageElement?.naturalHeight || 0);
-  if (!imageWidth || !imageHeight) return asset;
-  const savedCrop = normalizedAssetCropRegion(asset, {
-    width: imageWidth,
-    height: imageHeight,
+function cropRegionFromRenderedImage(asset, imageElement) {
+  return resolvedAssetCropRegion(asset, {
+    width: imageElement?.naturalWidth,
+    height: imageElement?.naturalHeight,
   });
-  const side = Math.min(imageWidth, imageHeight);
-  const visibleCrop = savedCrop || {
-    x: (imageWidth - side) / 2,
-    y: (imageHeight - side) / 2,
-    size: side,
-    imageWidth,
-    imageHeight,
-  };
+}
+
+function assetWithVisibleCropRegion(asset, imageElement) {
+  const visibleCrop = cropRegionFromRenderedImage(asset, imageElement);
+  if (!visibleCrop) return asset;
   return {
     ...asset,
     crop_region: {

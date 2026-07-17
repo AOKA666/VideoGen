@@ -1597,6 +1597,8 @@ h3 { font-size: 16px; line-height: 1.48; }
   justify-self: center;
   max-width: 100%;
   max-height: calc(100vh - 170px);
+  overflow: hidden;
+  border-radius: 6px;
 }
 .crop-preview-stage img {
   display: block;
@@ -1614,6 +1616,7 @@ h3 { font-size: 16px; line-height: 1.48; }
   border: 2px solid #f8fafc;
   background: transparent;
   box-shadow:
+    0 0 0 9999px rgba(12, 21, 25, .5),
     0 0 0 1px rgba(12, 21, 25, .72),
     inset 0 0 0 1px rgba(36, 103, 91, .78);
 }
