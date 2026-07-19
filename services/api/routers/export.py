@@ -190,6 +190,7 @@ def export_assets(
         source_music = None
     music_start_sec = float(project.get("background_music_start_sec") or 0)
     music_volume = float(project.get("background_music_volume") or 0.2)
+    voice_volume = max(0.0, min(float(project.get("voice_volume", 1.0)), 2.0))
     prepared_music = None
     music_report = None
     if source_music:
@@ -217,6 +218,7 @@ def export_assets(
                 title_line1=project.get("title_line1", ""),
                 title_line2=project.get("title_line2", ""),
                 background_music_path=prepared_music,
+                voice_volume=voice_volume,
             )
             draft_report = None
         else:
@@ -235,6 +237,7 @@ def export_assets(
                 background_music_start_sec=music_start_sec,
                 background_music_volume=music_volume,
                 music_crossfade_sec=1.0,
+                voice_volume=voice_volume,
             )
     except Exception as exc:
         raise HTTPException(500, f"Failed to generate export deliverables: {exc}") from exc
@@ -248,6 +251,7 @@ def export_assets(
             "volume": music_volume,
             "crossfade_sec": 1.0,
         } if source_music else None),
+        "voice_volume": voice_volume,
     }
     (export_dir / "export_verification.json").write_text(
         json.dumps(verification, ensure_ascii=False, indent=2),

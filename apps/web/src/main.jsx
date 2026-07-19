@@ -1,12 +1,13 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Archive, Check, Crop, Download, Eraser, Film, FolderOpen, ImagePlus, Library, Mic, Music, RefreshCw, Save, Scissors, Search, Tags, Trash2, Wand2 } from 'lucide-react';
+import { Archive, Check, Copy, Crop, Download, Eraser, Film, FolderOpen, ImagePlus, Library, Mic, Music, RefreshCw, Save, Scissors, Search, Tags, Trash2, Wand2 } from 'lucide-react';
 import './styles.css';
 
 const API = import.meta.env.VITE_API_URL ?? (import.meta.env.DEV ? 'http://127.0.0.1:8000' : '');
 const ASSET_PAGE_SIZE = 60;
 const DEFAULT_PROMOTION_BOOK = '《国之脊梁》';
 const PROMOTION_BOOK_STORAGE_KEY = 'videogen.promotionBookTitle';
+const MAX_VOICE_VOLUME_PERCENT = 200;
 const VOICE_OPTIONS = [
   { value: 'zh_male_m191_uranus_bigtts', label: '男声 · 沉稳叙事' },
   { value: 'zh_male_dongfanghaoran_uranus_bigtts', label: '男声 · 东方浩然' },
@@ -51,8 +52,58 @@ function copyScriptWithoutParagraphNumbers(event) {
   event.clipboardData.setData('text/plain', cleanText);
 }
 
+async function writeClipboardText(text) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // Fall back for browsers that expose the Clipboard API but deny it in
+      // the current (for example, non-secure) context.
+    }
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', '');
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand('copy');
+  textarea.remove();
+  if (!copied) throw new Error('浏览器未允许访问剪贴板');
+}
+
 function scriptCharacterCount(value) {
   return Array.from(stripScriptParagraphNumbers(value).replace(/\s+/g, '')).length;
+}
+
+function formatBatchImagePrompts(prompts) {
+  const normalized = prompts.map((prompt) => String(prompt || '').trim()).filter(Boolean);
+  const visualMarker = '画面需求：';
+  const safetyMarker = '不要出现真实人物姓名';
+  const parsed = normalized.map((prompt) => {
+    const visualIndex = prompt.indexOf(visualMarker);
+    const safetyIndex = prompt.indexOf(safetyMarker, visualIndex + visualMarker.length);
+    if (visualIndex < 0 || safetyIndex < 0) return null;
+    return {
+      style: prompt.slice(0, visualIndex).trim(),
+      visual: prompt.slice(visualIndex + visualMarker.length, safetyIndex).trim(),
+      safety: prompt.slice(safetyIndex).trim(),
+    };
+  });
+  const canLiftSharedText = parsed.length > 0
+    && parsed.every(Boolean)
+    && parsed.every((item) => item.style === parsed[0].style && item.safety === parsed[0].safety);
+  if (!canLiftSharedText) {
+    return normalized
+      .map((prompt, index) => `${String(index + 1).padStart(2, '0')}. ${prompt}`)
+      .join('\n\n');
+  }
+  const numberedVisuals = parsed
+    .map((item, index) => `${String(index + 1).padStart(2, '0')}. ${item.visual}`)
+    .join('\n\n');
+  return `共同要求：\n${parsed[0].style}${parsed[0].safety}\n\n分镜画面需求：\n${numberedVisuals}`;
 }
 
 function numberScriptParagraphs(value) {
@@ -208,6 +259,7 @@ function App() {
   const [aiScriptPerson, setAiScriptPerson] = useState('');
   const [aiScriptAngle, setAiScriptAngle] = useState('');
   const [processingImage, setProcessingImage] = useState('');
+  const [grayscaleProcessingIds, setGrayscaleProcessingIds] = useState(new Set());
   const [generatingShotIds, setGeneratingShotIds] = useState(new Set());
   const [recognizingShotIds, setRecognizingShotIds] = useState(new Set());
   const [imagePromptEditors, setImagePromptEditors] = useState({});
@@ -221,6 +273,7 @@ function App() {
   const [speechRate, setSpeechRate] = useState(0);
   const [voicePreviewUrl, setVoicePreviewUrl] = useState('');
   const [previewingVoice, setPreviewingVoice] = useState(false);
+  const [voiceVolume, setVoiceVolume] = useState(100);
   const [projectNameDraft, setProjectNameDraft] = useState('');
   const [titleLine1, setTitleLine1] = useState('');
   const [titleLine2, setTitleLine2] = useState('');
@@ -247,6 +300,8 @@ function App() {
   const musicVoiceInputRef = useRef(null);
   const musicPreviewRef = useRef(null);
   const voicePreviewRef = useRef(null);
+  const mainVoicePreviewRef = useRef(null);
+  const mainVoiceAudioGraphRef = useRef({ element: null, context: null, gain: null });
   const playVoicePreviewAfterLoadRef = useRef(false);
   const lastProjectStatusRef = useRef('');
   const rawScriptRef = useRef(null);
@@ -313,7 +368,7 @@ function App() {
   }, [assets, generatedAssets, shots]);
   const searchProgress = useMemo(() => {
     const total = shots.length || project?.search_total || 0;
-    const success = shots.filter((shot) => ['web_downloaded', 'uploaded', 'ai_generated', 'matched'].includes(shot.status)).length;
+    const success = shots.filter((shot) => ['web_downloaded', 'uploaded', 'ai_generated', 'matched', 'prompt_ready'].includes(shot.status)).length;
     const failed = shots.filter((shot) => ['no_image', 'no_match', 'intent_failed'].includes(shot.status)).length;
     const completed = shots.length
       ? success + failed
@@ -430,6 +485,7 @@ function App() {
     setBackgroundMusicId(project.background_music_id || '');
     setBackgroundMusicStart(Number(project.background_music_start_sec || 0));
     setBackgroundMusicVolume(Math.round(Number(project.background_music_volume ?? 0.2) * 100));
+    setVoiceVolume(Math.round(Number(project.voice_volume ?? 1) * 100));
   }, [
     project?.id,
     project?.name,
@@ -442,6 +498,7 @@ function App() {
     project?.background_music_id,
     project?.background_music_start_sec,
     project?.background_music_volume,
+    project?.voice_volume,
   ]);
 
   useEffect(() => {
@@ -449,6 +506,23 @@ function App() {
     if (!player) return;
     player.volume = Math.max(0, Math.min(1, backgroundMusicVolume / 100));
   }, [backgroundMusicVolume, backgroundMusicId]);
+
+  useEffect(() => {
+    const player = mainVoicePreviewRef.current;
+    const graph = mainVoiceAudioGraphRef.current;
+    if (!player) return;
+    if (graph.element === player && graph.gain && graph.context) {
+      graph.gain.gain.setValueAtTime(voiceVolume / 100, graph.context.currentTime);
+      player.volume = 1;
+    } else {
+      player.volume = Math.max(0, Math.min(1, voiceVolume / 100));
+    }
+  }, [voiceVolume, project?.audio_url, tab]);
+
+  useEffect(() => () => {
+    const context = mainVoiceAudioGraphRef.current.context;
+    if (context && context.state !== 'closed') context.close().catch(() => {});
+  }, []);
 
   useEffect(() => {
     if (rewrittenScriptDirtyRef.current) return;
@@ -520,7 +594,7 @@ function App() {
       if (searchProgress.total && searchProgress.completed < searchProgress.total) {
         setMessage(`分镜图片处理结束，仍有 ${searchProgress.total - searchProgress.completed} 个分镜未完成`);
       } else {
-        setMessage('分镜图片处理完成');
+        setMessage(project?.material_source_strategy === 'prompt_only' ? '分镜提示词生成完成' : '分镜图片处理完成');
       }
     }
     lastProjectStatusRef.current = current;
@@ -616,6 +690,42 @@ function App() {
     setParagraphDraft('');
     rewrittenScriptDirtyRef.current = false;
     await persistParagraphs(paragraphs, '文案已保存');
+  }
+
+  async function copyRewrittenScript() {
+    const paragraphs = [...rewrittenParagraphs];
+    if (editingParagraphIndex >= 0 && paragraphs[editingParagraphIndex] !== undefined) {
+      paragraphs[editingParagraphIndex] = paragraphDraft.trim();
+    }
+    const script = paragraphs.join('\n\n').trim();
+    if (!script) {
+      setMessage('暂无二创文案可复制');
+      return;
+    }
+    try {
+      await writeClipboardText(script);
+      setMessage(`二创文案已复制，共 ${scriptCharacterCount(script)} 字`);
+    } catch (err) {
+      setMessage(`复制二创文案失败：${err.message}`);
+    }
+  }
+
+  async function copyAllImagePrompts() {
+    const prompts = [...shots]
+      .sort((a, b) => Number(a.shot_index || 0) - Number(b.shot_index || 0))
+      .map((shot) => String(shot.image_prompt || '').trim())
+      .filter(Boolean);
+    if (!prompts.length) {
+      setMessage('暂无分镜提示词可复制');
+      return;
+    }
+    const numberedPrompts = formatBatchImagePrompts(prompts);
+    try {
+      await writeClipboardText(numberedPrompts);
+      setMessage(`已复制 ${prompts.length} 条分镜提示词`);
+    } catch (err) {
+      setMessage(`复制分镜提示词失败：${err.message}`);
+    }
   }
 
   async function persistParagraphs(paragraphs, successMessage = '段落已自动保存') {
@@ -1025,28 +1135,74 @@ function App() {
     return true;
   }
 
-  async function processGeneratedImage(assetId, operation) {
+  async function processGeneratedImage(assetId, operation, { silent = false } = {}) {
     const processingKey = `${assetId}:${operation}`;
     const label = {
       'crop-square': '裁剪图片',
       grayscale: '转为黑白照片',
       'remove-watermark': 'Seedream 去水印',
     }[operation] || '处理图片';
+
+    if (operation === 'grayscale') {
+      setGrayscaleProcessingIds((current) => new Set(current).add(assetId));
+      if (!silent) setMessage('黑白转换中，可继续转换其他分镜图片');
+      const startedAt = Date.now();
+      try {
+        const result = await request(
+          `/api/projects/${projectId}/generated-assets/${assetId}/${operation}`,
+          { method: 'POST' },
+        );
+        const remaining = 700 - (Date.now() - startedAt);
+        if (remaining > 0) await new Promise((resolve) => window.setTimeout(resolve, remaining));
+        setGeneratedAssets((current) => current.map((asset) => (
+          asset.id === assetId ? result.asset : asset
+        )));
+        if (!silent) setMessage('黑白照片转换完成');
+        return true;
+      } catch (err) {
+        if (!silent) setMessage(`黑白照片转换失败：${err.message}`);
+        return false;
+      } finally {
+        setGrayscaleProcessingIds((current) => {
+          const next = new Set(current);
+          next.delete(assetId);
+          return next;
+        });
+      }
+    }
+
     setProcessingImage(processingKey);
-    const startedAt = Date.now();
     try {
       await run(label, () => request(
         `/api/projects/${projectId}/generated-assets/${assetId}/${operation}`,
         { method: 'POST' },
       ));
-      if (operation === 'grayscale') {
-        const remaining = 700 - (Date.now() - startedAt);
-        if (remaining > 0) await new Promise((resolve) => window.setTimeout(resolve, remaining));
-      }
       await refreshAll(projectId);
     } finally {
       setProcessingImage('');
     }
+  }
+
+  async function grayscaleAllStoryboardImages() {
+    const pendingAssets = generatedAssets.filter((asset) => (
+      asset.project_id === projectId
+      && !asset.is_grayscale
+      && !grayscaleProcessingIds.has(asset.id)
+    ));
+    if (!pendingAssets.length) {
+      setMessage('所有分镜图片都已是黑白照片');
+      return;
+    }
+
+    setMessage(`正在同时转换 ${pendingAssets.length} 张分镜图片为黑白照片`);
+    const results = await Promise.all(pendingAssets.map((asset) => (
+      processGeneratedImage(asset.id, 'grayscale', { silent: true })
+    )));
+    const succeeded = results.filter(Boolean).length;
+    const failed = results.length - succeeded;
+    setMessage(failed
+      ? `一键黑白完成：成功 ${succeeded} 张，失败 ${failed} 张`
+      : `一键黑白完成：${succeeded} 张分镜图片已转为黑白照片`);
   }
 
   async function saveGeneratedImageDisplayRegion(asset, region) {
@@ -1223,6 +1379,57 @@ function App() {
     link.click();
     link.remove();
     setMessage('封面下载已开始');
+  }
+
+  function updateVoiceVolume(value) {
+    const nextVolume = Math.max(0, Math.min(MAX_VOICE_VOLUME_PERCENT, Number(value) || 0));
+    setVoiceVolume(nextVolume);
+    const player = mainVoicePreviewRef.current;
+    const graph = mainVoiceAudioGraphRef.current;
+    if (graph.element === player && graph.gain && graph.context) {
+      graph.gain.gain.setValueAtTime(nextVolume / 100, graph.context.currentTime);
+    } else if (player) {
+      player.volume = Math.min(1, nextVolume / 100);
+    }
+  }
+
+  function activateMainVoicePreview(player) {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) {
+      player.volume = Math.min(1, voiceVolume / 100);
+      return;
+    }
+    let graph = mainVoiceAudioGraphRef.current;
+    if (graph.element !== player || !graph.gain || !graph.context || graph.context.state === 'closed') {
+      if (graph.context && graph.context.state !== 'closed') graph.context.close().catch(() => {});
+      try {
+        const context = new AudioContextClass();
+        const source = context.createMediaElementSource(player);
+        const gain = context.createGain();
+        source.connect(gain);
+        gain.connect(context.destination);
+        graph = { element: player, context, gain };
+        mainVoiceAudioGraphRef.current = graph;
+      } catch {
+        player.volume = Math.min(1, voiceVolume / 100);
+        return;
+      }
+    }
+    player.volume = 1;
+    graph.gain.gain.setValueAtTime(voiceVolume / 100, graph.context.currentTime);
+    if (graph.context.state === 'suspended') graph.context.resume().catch(() => {});
+  }
+
+  async function saveVoiceVolume() {
+    const result = await run('保存配音音量', () => request(
+      `/api/projects/${projectId}/voice-settings`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ volume: voiceVolume / 100 }),
+      },
+    ));
+    if (result) await refreshProject(projectId);
   }
 
   async function saveMusicSettings(overrides = {}) {
@@ -1491,7 +1698,7 @@ function App() {
                   }}
                   placeholder={DEFAULT_PROMOTION_BOOK}
                 />
-                <small>二创时开启“结尾带书”后，将在文案末尾自然带出这本书。</small>
+                <small>开启“结尾带书”后，将用 2–3 段完成情绪承接、产品价值塑造和阅读理由，引导观众产生购买兴趣。</small>
               </label>
               <label>项目名称<input name="name" placeholder="可留空，系统自动取标题" /></label>
               <div className="ai-script-options">
@@ -1643,6 +1850,7 @@ function App() {
                   rawScriptRef.current?.setSelectionRange(0, 0);
                 }}>清除选区</button>}
               </div>
+              <div className="script-panel-footer">
               <label className="source-strategy">
                 素材来源策略
                 <select value={materialSourceStrategy} onChange={(event) => setMaterialSourceStrategy(event.target.value)}>
@@ -1650,16 +1858,19 @@ function App() {
                   <option value="library_only">仅使用素材库</option>
                   <option value="web_only">仅联网搜索</option>
                   <option value="ai_only">仅使用 AI 生成</option>
+                  <option value="prompt_only">仅生成 AI 图片提示词</option>
                 </select>
               </label>
               <div className="actions raw-script-actions">
-                {materialSourceStrategy === 'ai_only' ? (
+                {['ai_only', 'prompt_only'].includes(materialSourceStrategy) ? (
                   <button
                     className="primary"
-                    title="使用原始文案生成分镜，并为每个镜头生成 AI 图片"
+                    title={materialSourceStrategy === 'prompt_only'
+                      ? '使用原始文案生成分镜和图片提示词，不生成画面'
+                      : '使用原始文案生成分镜，并为每个镜头生成 AI 图片'}
                     onClick={() => skipToStoryboard()}
                   >
-                    <Wand2 size={18} /> AI 生成分镜
+                    <Wand2 size={18} /> {materialSourceStrategy === 'prompt_only' ? '生成分镜提示词' : 'AI 生成分镜'}
                   </button>
                 ) : (
                   <>
@@ -1675,6 +1886,7 @@ function App() {
                 )}
               </div>
               <small className="raw-script-hint">跳过二创，使用原始文案直接拆分镜头</small>
+              </div>
             </div>
             <div className="panel">
               <div className="row rewrite-toolbar">
@@ -1691,6 +1903,15 @@ function App() {
                     onClick={() => setAppendBookPromotion((current) => !current)}
                   >
                     <Tags size={15} /> {appendBookPromotion ? '已选结尾带书' : '结尾带书'}
+                  </button>
+                  <button
+                    type="button"
+                    className="rewrite-compact-button"
+                    disabled={!rewrittenParagraphs.length}
+                    title="复制不含段落序号的完整二创文案"
+                    onClick={copyRewrittenScript}
+                  >
+                    <Copy size={15} /> 一键复制二创文案
                   </button>
                   <button className="rewrite-compact-button" onClick={rewrite}><RefreshCw size={15} /> 改写</button>
                 </div>
@@ -1743,6 +1964,7 @@ function App() {
               )}
               {project.rewrite_warning && <p className="rewrite-warning">{project.rewrite_warning}</p>}
               {project.rewrite_analysis_warning && <p className="rewrite-warning">{project.rewrite_analysis_warning}</p>}
+              <div className="script-panel-footer">
               <label className="source-strategy">
                 素材来源策略
                 <select value={materialSourceStrategy} onChange={(event) => setMaterialSourceStrategy(event.target.value)}>
@@ -1750,17 +1972,20 @@ function App() {
                   <option value="library_only">仅使用素材库</option>
                   <option value="web_only">仅联网搜索</option>
                   <option value="ai_only">仅使用 AI 生成</option>
+                  <option value="prompt_only">仅生成 AI 图片提示词</option>
                 </select>
               </label>
               <div className="actions">
                 <button onClick={saveScript}><Save size={18} /> 保存</button>
-                {materialSourceStrategy === 'ai_only' ? (
+                {['ai_only', 'prompt_only'].includes(materialSourceStrategy) ? (
                   <button
                     className="primary"
-                    title="生成分镜，并为每个镜头生成 AI 图片"
+                    title={materialSourceStrategy === 'prompt_only'
+                      ? '生成分镜和图片提示词，不生成画面'
+                      : '生成分镜，并为每个镜头生成 AI 图片'}
                     onClick={() => generateShots()}
                   >
-                    <Wand2 size={18} /> AI 生成分镜
+                    <Wand2 size={18} /> {materialSourceStrategy === 'prompt_only' ? '生成分镜提示词' : 'AI 生成分镜'}
                   </button>
                 ) : (
                   <>
@@ -1775,6 +2000,8 @@ function App() {
                   </>
                 )}
               </div>
+              <small className="raw-script-hint script-footer-placeholder" aria-hidden="true">占位提示</small>
+              </div>
             </div>
           </section>
         )}
@@ -1785,10 +2012,28 @@ function App() {
               <div className="storyboard-action-buttons">
                 <button
                   type="button"
+                  disabled={!shots.some((shot) => String(shot.image_prompt || '').trim())}
+                  onClick={copyAllImagePrompts}
+                >
+                  <Copy size={18} /> 一键复制全部提示词
+                </button>
+                <button
+                  type="button"
                   disabled={busy || !shots.some((shot) => shot.selected_asset_id)}
                   onClick={cropSelectedImages}
                 >
                   <Crop size={18} /> 一键裁剪选中图片
+                </button>
+                <button
+                  type="button"
+                  disabled={Boolean(processingImage) || !generatedAssets.some((asset) => (
+                    asset.project_id === projectId
+                    && !asset.is_grayscale
+                    && !grayscaleProcessingIds.has(asset.id)
+                  ))}
+                  onClick={grayscaleAllStoryboardImages}
+                >
+                  <Film size={18} /> 一键黑白
                 </button>
                 <button
                   type="button"
@@ -1832,6 +2077,7 @@ function App() {
                   onSelect={(assetId, assetSource) => selectAsset(shot.id, assetId, assetSource)}
                   onPreview={setPreviewAsset}
                   imagePrompt={imagePromptEditors[shot.id]}
+                  savedImagePrompt={shot.image_prompt}
                   onOpenImagePrompt={() => openImagePromptEditor(shot.id)}
                   onImagePromptChange={(prompt) => updateImagePrompt(shot.id, prompt)}
                   onCancelImagePrompt={() => closeImagePromptEditor(shot.id)}
@@ -1842,6 +2088,7 @@ function App() {
                   isRecognizingImage={recognizingShotIds.has(shot.id)}
                   onUpdateVoiceText={(text) => updateShotVoiceText(shot.id, text)}
                   processingImage={processingImage}
+                  grayscaleProcessingIds={grayscaleProcessingIds}
                   generatingShotIds={generatingShotIds}
                   onCrop={(assetId) => processGeneratedImage(assetId, 'crop-square')}
                   onRemoveWatermark={(assetId) => processGeneratedImage(assetId, 'remove-watermark')}
@@ -1899,6 +2146,7 @@ function App() {
                     onSelect={(assetId, assetSource) => selectAsset(shot.id, assetId, assetSource)}
                     onPreview={setPreviewAsset}
                     imagePrompt={imagePromptEditors[shot.id]}
+                    savedImagePrompt={shot.image_prompt}
                     onOpenImagePrompt={() => openImagePromptEditor(shot.id)}
                     onImagePromptChange={(prompt) => updateImagePrompt(shot.id, prompt)}
                     onCancelImagePrompt={() => closeImagePromptEditor(shot.id)}
@@ -1909,6 +2157,7 @@ function App() {
                     isRecognizingImage={recognizingShotIds.has(shot.id)}
                     onUpdateVoiceText={(text) => updateShotVoiceText(shot.id, text)}
                     processingImage={processingImage}
+                    grayscaleProcessingIds={grayscaleProcessingIds}
                     generatingShotIds={generatingShotIds}
                     onCrop={(assetId) => processGeneratedImage(assetId, 'crop-square')}
                     onRemoveWatermark={(assetId) => processGeneratedImage(assetId, 'remove-watermark')}
@@ -2008,8 +2257,41 @@ function App() {
                 </div>
               </div>
 
+              {project.audio_url && (
+                <div className="voice-volume-section">
+                  <h3>第三步 · 调整配音音量</h3>
+                  <audio
+                    ref={mainVoicePreviewRef}
+                    controls
+                    crossOrigin="anonymous"
+                    src={`${API}${project.audio_url}`}
+                    onLoadedMetadata={(event) => {
+                      event.currentTarget.volume = Math.min(1, voiceVolume / 100);
+                    }}
+                    onPlay={(event) => {
+                      activateMainVoicePreview(event.currentTarget);
+                    }}
+                  />
+                  <label>
+                    配音音量：{voiceVolume}%
+                    <input
+                      type="range"
+                      min="0"
+                      max={MAX_VOICE_VOLUME_PERCENT}
+                      step="1"
+                      value={voiceVolume}
+                      onChange={(event) => updateVoiceVolume(event.target.value)}
+                    />
+                  </label>
+                  <button type="button" className="primary" disabled={busy} onClick={saveVoiceVolume}>
+                    <Save size={18} /> 保存配音音量
+                  </button>
+                  <small>播放后拖动滑块可实时试听 0%–200% 的音量变化；MP4 和剪映草稿会使用相同增益。</small>
+                </div>
+              )}
+
               <div className="music-section">
-                <h3>第三步 · 设置背景音乐</h3>
+                <h3>{project.audio_url ? '第四步' : '第三步'} · 设置背景音乐</h3>
                 <input
                   ref={musicInputRef}
                   className="hidden-input"
@@ -2153,7 +2435,19 @@ function App() {
           <section className="band result">
             <h2>结果导出</h2>
             <p>一次导出会同时生成 9:16 完整 MP4、按镜头编号的方形 PNG、配音字幕素材包和剪映草稿。方图居中显示，短字幕位于图片下方留白区。</p>
-            {project.audio_url && <audio controls src={`${API}${project.audio_url}`} />}
+            {project.audio_url && (
+              <div className="export-voice-preview">
+                <audio
+                  ref={mainVoicePreviewRef}
+                  controls
+                  crossOrigin="anonymous"
+                  src={`${API}${project.audio_url}`}
+                  onLoadedMetadata={(event) => { event.currentTarget.volume = Math.min(1, voiceVolume / 100); }}
+                  onPlay={(event) => activateMainVoicePreview(event.currentTarget)}
+                />
+                <span>配音音量 {voiceVolume}%</span>
+              </div>
+            )}
             <div className="export-actions">
               <VoiceSelect value={voiceType} onChange={setVoiceType} />
               <SpeechRateSelect value={speechRate} onChange={setSpeechRate} />
@@ -2503,6 +2797,7 @@ function SearchProgress({ progress, project, onStop }) {
   const stopped = project?.status === 'search_stopped';
   const analyzingIntent = project?.status === 'searching_images' && stage === 'analyzing_intent';
   const generatingAiImages = searching && stage === 'generating_ai_images';
+  const promptOnly = project?.material_source_strategy === 'prompt_only';
   const startedAt = project?.intent_analysis_started_at ? new Date(project.intent_analysis_started_at).getTime() : 0;
   const elapsed = startedAt ? Math.floor((Date.now() - startedAt) / 1000) : 0;
   const keywordEstimate = project?.intent_keyword_estimate || (progress.total ? `${progress.total}` : '');
@@ -2519,7 +2814,7 @@ function SearchProgress({ progress, project, onStop }) {
     ? 'GLM 正在按 10 个镜头一批生成关键词；每批完成后会立即保存，全部完成后自动进入逐镜头搜图。'
     : '';
   const label = progress.total
-    ? `${progress.completed} / ${progress.total} 个分镜图片完成`
+    ? `${progress.completed} / ${progress.total} 个分镜${promptOnly ? '提示词' : '图片'}完成`
     : '等待生成分镜';
 
   useEffect(() => {
@@ -2532,7 +2827,7 @@ function SearchProgress({ progress, project, onStop }) {
     <div className="progress-panel">
       <div className="progress-row">
         <strong>
-          分镜图片进度
+          分镜{promptOnly ? '提示词' : '图片'}进度
           <span className={project?.image_search_provider === 'tencent' && !generatingAiImages ? 'provider-badge tencent' : 'provider-badge'}>
             {generatingAiImages ? 'AI 生成' : project?.image_search_provider === 'tencent' ? '腾讯云联网搜图' : '360 图片'}
           </span>
@@ -2942,6 +3237,7 @@ function ShotCard({
   onSelect,
   onPreview,
   imagePrompt,
+  savedImagePrompt,
   onOpenImagePrompt,
   onImagePromptChange,
   onCancelImagePrompt,
@@ -2952,6 +3248,7 @@ function ShotCard({
   isRecognizingImage,
   onUpdateVoiceText,
   processingImage,
+  grayscaleProcessingIds,
   generatingShotIds,
   onCrop,
   onRemoveWatermark,
@@ -3020,6 +3317,15 @@ function ShotCard({
         <p>场景标签：{((shot.material_intent?.scenes?.length ? shot.material_intent.scenes : shot.scene_tags) || shot.required_scene || []).join(' / ') || '—'}</p>
         <p>关键词：{((shot.material_intent?.keywords?.length ? shot.material_intent.keywords : shot.keywords) || []).join(' / ') || '—'}</p>
         <p>搜索关键词：{(shot.search_keywords || []).join(' / ') || shot.current_search_keyword || '—'}</p>
+        {savedImagePrompt && (
+          <div className="saved-image-prompt">
+            <div>
+              <strong>AI 图片提示词</strong>
+              <button type="button" onClick={() => writeClipboardText(savedImagePrompt)}><Copy size={15} /> 复制</button>
+            </div>
+            <p>{savedImagePrompt}</p>
+          </div>
+        )}
         <button className="reanalyze-image-button" type="button" onClick={onReanalyzeImage} disabled={!canRetry || isRecognizingImage}>
           <RefreshCw size={18} /> {isRecognizingImage ? '识别中…' : '重新识别图片'}
         </button>
@@ -3069,7 +3375,7 @@ function ShotCard({
           )}
           {visibleAssets.map((item) => (
             <div
-              className={`${item.id === selectedAssetId ? 'image-choice selected' : 'image-choice'} ${processingImage === `${item.id}:grayscale` ? 'converting-grayscale' : ''}`.trim()}
+              className={`${item.id === selectedAssetId ? 'image-choice selected' : 'image-choice'} ${grayscaleProcessingIds.has(item.id) ? 'converting-grayscale' : ''}`.trim()}
               key={item.id}
             >
               <div
@@ -3105,7 +3411,7 @@ function ShotCard({
                         type="button"
                         title="居中裁剪为 1:1"
                         aria-label="裁剪为 1:1"
-                        disabled={Boolean(processingImage)}
+                        disabled={Boolean(processingImage) || grayscaleProcessingIds.has(item.id)}
                         onClick={(event) => {
                           event.stopPropagation();
                           onCrop?.(item.id);
@@ -3117,7 +3423,7 @@ function ShotCard({
                         type="button"
                         title="一键转为黑白照片"
                         aria-label="转为黑白照片"
-                        disabled={Boolean(processingImage) || item.is_grayscale}
+                        disabled={Boolean(processingImage) || grayscaleProcessingIds.has(item.id) || item.is_grayscale}
                         onClick={(event) => {
                           event.stopPropagation();
                           onGrayscale?.(item.id);
@@ -3129,7 +3435,7 @@ function ShotCard({
                         type="button"
                         title="使用 Seedream 去除水印"
                         aria-label="Seedream 去水印"
-                        disabled={Boolean(processingImage)}
+                        disabled={Boolean(processingImage) || grayscaleProcessingIds.has(item.id)}
                         onClick={(event) => {
                           event.stopPropagation();
                           onRemoveWatermark?.(item.id);
@@ -3160,7 +3466,7 @@ function ShotCard({
                   )}
                 />
               </div>
-              {processingImage === `${item.id}:grayscale` && (
+              {grayscaleProcessingIds.has(item.id) && (
                 <div className="grayscale-processing-overlay">
                   <Film size={22} />
                   <strong>黑白转换中</strong>

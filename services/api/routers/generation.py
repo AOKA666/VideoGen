@@ -44,6 +44,10 @@ class VoicePayload(BaseModel):
     speech_rate: int | None = None
 
 
+class VoiceSettingsPayload(BaseModel):
+    volume: float = 1.0
+
+
 def _first_script_sentence(text: str) -> str:
     compact = str(text or "").strip()
     if not compact:
@@ -239,14 +243,18 @@ def crop_generated_image_square_region(project_id: str, asset_id: str, payload: 
 @router.post("/{project_id}/generated-assets/{asset_id}/grayscale")
 def convert_generated_image_grayscale(project_id: str, asset_id: str):
     db = load_db()
-    asset, path = _generated_image(db, project_id, asset_id)
+    _, path = _generated_image(db, project_id, asset_id)
     try:
         _convert_grayscale(path)
     except Exception as exc:
         raise HTTPException(500, f"Convert image to grayscale failed: {exc}") from exc
-    asset["is_grayscale"] = True
-    _refresh_image_metadata(asset, path, "grayscale")
-    save_db(db)
+    # Concurrent conversions must not save stale DB snapshots over each other.
+    with GENERATED_IMAGE_SAVE_LOCK:
+        db = load_db()
+        asset, path = _generated_image(db, project_id, asset_id)
+        asset["is_grayscale"] = True
+        _refresh_image_metadata(asset, path, "grayscale")
+        save_db(db)
     return {"status": "success", "asset": asset}
 
 
@@ -364,7 +372,7 @@ def get_image_prompt(project_id: str, shot_id: str):
     shot = next((s for s in db["shots"] if s["project_id"] == project_id and s["id"] == shot_id), None)
     if not shot:
         raise HTTPException(404, "Shot not found")
-    return {"shot_id": shot_id, "prompt": build_image_prompt(shot)}
+    return {"shot_id": shot_id, "prompt": shot.get("image_prompt") or build_image_prompt(shot)}
 
 
 @router.post("/{project_id}/shots/{shot_id}/generate-image")
@@ -458,6 +466,7 @@ def generate_voice(project_id: str, payload: VoicePayload | None = None):
         encoding="utf-8",
     )
     project["voice_style"] = result["voice_type"]
+    project.setdefault("voice_volume", 1.0)
     project["audio_url"] = public_url(out)
     project["voice_timeline_url"] = public_url(voice_timeline_path)
     project["audio_format"] = result["audio_format"]
@@ -474,6 +483,21 @@ def generate_voice(project_id: str, payload: VoicePayload | None = None):
         "timestamp_provider": result.get("timestamp_provider"),
         "long_text_error": result.get("long_text_error"),
     }
+
+
+@router.patch("/{project_id}/voice-settings")
+def update_voice_settings(project_id: str, payload: VoiceSettingsPayload):
+    db = load_db()
+    project = next((p for p in db["projects"] if p["id"] == project_id), None)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    if not project.get("audio_url"):
+        raise HTTPException(400, "Voice audio has not been generated")
+    volume = max(0.0, min(2.0, float(payload.volume)))
+    project["voice_volume"] = round(volume, 3)
+    project["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    save_db(db)
+    return {"status": "success", "volume": project["voice_volume"]}
 
 
 @router.post("/{project_id}/voice-preview")

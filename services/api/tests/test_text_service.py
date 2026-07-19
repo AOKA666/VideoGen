@@ -524,6 +524,71 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertIn("85%", result["rewrite_warning"])
         self.assertEqual(3, result["rewrite_attempts"])
 
+    def test_best_rewrite_is_returned_when_multiple_quality_checks_miss(self) -> None:
+        comparison = {
+            "passed": False,
+            "non_length_quality_passed": False,
+            "length_passed": False,
+            "length_ratio": 87,
+            "overall_difference": 85,
+            "continuous_reuse": 14,
+            "source_phrase_reuse": 10,
+            "sentence_imitation": 22,
+            "text1_length": 2051,
+            "text2_length": 1782,
+            "min_rewritten_length": 1845,
+            "max_rewritten_length": 2256,
+        }
+
+        with patch(
+            "services.text_service.request_minimax_rewrite_analysis",
+            return_value={"facts": ["事实"]},
+        ), patch(
+            "services.text_service.request_minimax_rewrite",
+            return_value={
+                "rewritten_script": "这是三次生成中最好的完整二创稿。",
+                "rewrite_comparison": comparison,
+            },
+        ):
+            result = rewrite_script_with_minimax("原文" * 1025, "纪实故事型", "test-key")
+
+        self.assertEqual("这是三次生成中最好的完整二创稿。", result["rewritten_script"])
+        self.assertEqual("quality_warning", result["rewrite_quality_status"])
+        self.assertEqual("", result["rewrite_error"])
+        self.assertIn("字数为原文的 87%", result["rewrite_warning"])
+        self.assertIn("连续复用率 14%", result["rewrite_warning"])
+        self.assertEqual(3, result["rewrite_attempts"])
+
+    def test_previous_draft_is_returned_when_a_later_retry_request_fails(self) -> None:
+        comparison = {
+            "passed": False,
+            "non_length_quality_passed": False,
+            "length_passed": False,
+            "length_ratio": 87,
+            "overall_difference": 85,
+            "continuous_reuse": 14,
+            "source_phrase_reuse": 10,
+            "sentence_imitation": 22,
+        }
+        responses = [
+            {"rewritten_script": "第一次生成的完整稿件", "rewrite_comparison": comparison},
+            TimeoutError("retry timeout"),
+        ]
+
+        with patch(
+            "services.text_service.request_minimax_rewrite_analysis",
+            return_value={"facts": ["事实"]},
+        ), patch(
+            "services.text_service.request_minimax_rewrite",
+            side_effect=responses,
+        ):
+            result = rewrite_script_with_minimax("原文" * 100, "纪实故事型", "test-key")
+
+        self.assertEqual("第一次生成的完整稿件", result["rewritten_script"])
+        self.assertEqual("generation_warning", result["rewrite_quality_status"])
+        self.assertIn("第 2 次重试调用失败", result["rewrite_warning"])
+        self.assertEqual(1, result["rewrite_attempts"])
+
     def test_rewrite_prompt_requires_body_to_continue_protected_opening(self) -> None:
         source = (
             "他在台湾潜伏四十二年后终于回乡，却发现妻子身边早已儿孙满堂。"

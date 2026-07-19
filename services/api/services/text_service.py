@@ -367,11 +367,17 @@ def remove_protected_opening(text: str, protected_opening: str) -> str:
     return source
 
 
-def compare_scripts(text1: str, text2: str, protected_opening: str = "") -> dict:
+def compare_scripts(
+    text1: str,
+    text2: str,
+    protected_opening: str = "",
+    extra_min_length: int = 0,
+    extra_max_length: int = 0,
+) -> dict:
     source_length = content_length(text1)
     rewritten_length = content_length(text2)
-    min_rewritten_length = int(source_length * MIN_REWRITE_LENGTH_RATIO)
-    max_rewritten_length = int(source_length * MAX_REWRITE_LENGTH_RATIO)
+    min_rewritten_length = int(source_length * MIN_REWRITE_LENGTH_RATIO) + max(0, extra_min_length)
+    max_rewritten_length = int(source_length * MAX_REWRITE_LENGTH_RATIO) + max(0, extra_max_length)
     length_ratio = round((rewritten_length / source_length) * 100) if source_length else 0
     length_passed = bool(source_length) and min_rewritten_length <= rewritten_length <= max_rewritten_length
     # The fixed opening is intentionally included in every reuse metric. The
@@ -758,8 +764,11 @@ def ensure_rewrite_book_promotion(script: str, enabled: bool, book_title: str) -
     if bare in rewritten[-240:]:
         return rewritten
     promotion = (
-        f"如果你也想了解更多这样的中国脊梁，可以读一读{formatted}。"
-        "书里还有更多课本之外的真实人生，值得和孩子一起慢慢看。"
+        "一个人的故事讲完了，可撑起今天这份底气的，从来不止一个名字。"
+        f"如果你也想看见更多人在国家最需要的时候做过怎样的选择，可以读一读{formatted}。"
+        "它真正值得留下的，不只是人物经历，更是人在利益、亲情和责任面前如何作答。"
+        "尤其家里有孩子，与其只告诉他什么叫榜样，不如让他从这些真实人生里自己找到答案。"
+        "这不是读完就放下的一本书，而是值得放在家里，值得和孩子一起慢慢看。"
     )
     return f"{rewritten}\n\n{promotion}" if rewritten else promotion
 
@@ -796,25 +805,55 @@ def fallback_rewrite_script(
         "script_style": style,
         "rewrite_provider": "local_fallback",
         "rewrite_error": "",
-        "rewrite_comparison": compare_scripts(raw_script, rewritten),
+        "rewrite_comparison": compare_scripts(
+            raw_script,
+            rewritten,
+            extra_min_length=140 if append_book_promotion else 0,
+            extra_max_length=220 if append_book_promotion else 0,
+        ),
     }
 
 
 def ensure_min_rewrite_difference(result: dict) -> dict:
     comparison = result.get("rewrite_comparison") or {}
-    difference = comparison.get("overall_difference", 0)
     if not comparison.get("passed", False):
-        result["rewrite_error"] = (
-            f"rewrite rejected: length {comparison.get('text2_length', 0)}/"
-            f"{comparison.get('text1_length', 0)} ({comparison.get('length_ratio', 0)}%), "
-            f"required {comparison.get('min_rewritten_length', 0)}-"
-            f"{comparison.get('max_rewritten_length', 0)} characters; difference {difference}%, continuous reuse "
-            f"{comparison.get('continuous_reuse', 0)}%, source phrase reuse "
-            f"{comparison.get('source_phrase_reuse', comparison.get('phrase_overlap', 0))}%, "
-            f"sentence imitation {comparison.get('sentence_imitation', 0)}%"
-        )
-        raise RewriteQualityError(result)
+        result["rewrite_warning"] = build_rewrite_quality_warning(comparison)
+        result["rewrite_quality_status"] = "quality_warning"
+        result["rewrite_error"] = ""
     return result
+
+
+def build_rewrite_quality_warning(comparison: dict) -> str:
+    issues: list[str] = []
+    if not comparison.get("length_passed", False):
+        issues.append(
+            f"字数为原文的 {comparison.get('length_ratio', 0)}%"
+            f"（建议 {round(MIN_REWRITE_LENGTH_RATIO * 100)}%-{round(MAX_REWRITE_LENGTH_RATIO * 100)}%）"
+        )
+    if int(comparison.get("overall_difference") or 0) < MIN_REWRITE_DIFFERENCE:
+        issues.append(
+            f"总体重构度 {comparison.get('overall_difference', 0)}%"
+            f"（建议至少 {MIN_REWRITE_DIFFERENCE}%）"
+        )
+    if int(comparison.get("continuous_reuse") or 0) > MAX_REWRITE_CONTINUOUS_REUSE:
+        issues.append(
+            f"连续复用率 {comparison.get('continuous_reuse', 0)}%"
+            f"（建议不超过 {MAX_REWRITE_CONTINUOUS_REUSE}%）"
+        )
+    source_phrase_reuse = int(comparison.get("source_phrase_reuse") or 0)
+    if source_phrase_reuse > MAX_REWRITE_SOURCE_PHRASE_REUSE:
+        issues.append(
+            f"短语复用率 {source_phrase_reuse}%"
+            f"（建议不超过 {MAX_REWRITE_SOURCE_PHRASE_REUSE}%）"
+        )
+    sentence_imitation = int(comparison.get("sentence_imitation") or 0)
+    if sentence_imitation > MAX_REWRITE_SENTENCE_IMITATION:
+        issues.append(
+            f"逐句模仿率 {sentence_imitation}%"
+            f"（建议不超过 {MAX_REWRITE_SENTENCE_IMITATION}%）"
+        )
+    detail = "；".join(issues) or "部分质量指标未达到建议值"
+    return f"二创稿已生成并保留，但质量检查未完全达标：{detail}。你可以直接编辑、复制或再次改写。"
 
 
 def normalize_rewrite_result(
@@ -838,7 +877,12 @@ def normalize_rewrite_result(
     rewritten_script = ensure_rewrite_book_promotion(
         rewritten_script, append_book_promotion, promotion_book_title
     )
-    comparison = compare_scripts(raw_script, rewritten_script)
+    comparison = compare_scripts(
+        raw_script,
+        rewritten_script,
+        extra_min_length=140 if append_book_promotion else 0,
+        extra_max_length=220 if append_book_promotion else 0,
+    )
     return {
         "title": normalize_auto_title(title, raw_script),
         "hook": hook,
@@ -1093,8 +1137,8 @@ def build_rewrite_prompt(
 ) -> str:
     opening_hook = extract_opening_hook(raw_script, preserve_rule)
     raw_len = content_length(raw_script)
-    min_len = int(raw_len * MIN_REWRITE_LENGTH_RATIO)
-    max_len = int(raw_len * MAX_REWRITE_LENGTH_RATIO)
+    min_len = int(raw_len * MIN_REWRITE_LENGTH_RATIO) + (140 if append_book_promotion else 0)
+    max_len = int(raw_len * MAX_REWRITE_LENGTH_RATIO) + (220 if append_book_promotion else 0)
     source_has_book_promotion = bool(re.search(
         r"(《[^》]+》|这本书|书里|书中|翻开|读完|买给孩子|下单|购买|小黄车|带书|卖书|推荐给家长)",
         raw_script,
@@ -1104,16 +1148,23 @@ def build_rewrite_prompt(
     _, formatted_book_title = normalize_sales_book_title(promotion_book_title)
     if append_book_promotion:
         conversion_instruction = (
-            f"用户已主动开启结尾带书。最后一个自然段必须在故事完成后自然带出{formatted_book_title}，"
-            "用一到两句话说明书中还有更多相关真实人物或故事，并给出自然阅读建议。"
-            "不要突然硬广，不要编造书中具体章节、作者、价格、优惠或购买渠道。"
+            f"用户已主动开启结尾带书。最后一个自然段必须完成行动收束；在此之前，故事讲完后必须用最后 2 到 3 个自然段完成对{formatted_book_title}的价值塑造，"
+            "带书部分总计写 140 到 220 个中文字符，不能只用一两句提到书名就草草结束。"
+            "第一步先承接本篇人物最具体的选择、代价或精神落点，把观众对这个人的情绪自然转到“还有更多这样的名字值得被看见”，不能突然切广告。"
+            "第二步塑造产品价值：说清楚这本书能帮助读者看见什么、理解什么、记住什么；重点可以是课本来不及展开的真实人生、关键时刻的选择、一个国家底气背后的人，"
+            "但必须使用概括性表达，不能虚构书中具体人物、章节、故事数量、作者背书或装帧信息。"
+            "第三步给出明确的读者理由和阅读场景，例如家长希望孩子建立榜样认知、成年人想补上对这些人物的了解、全家一起读并讨论选择与责任。"
+            "最后用一句克制但有行动力的话收束，让人自然产生想把书带回家、自己读或和孩子一起读的冲动。"
+            "语言要像真诚推荐，不要喊口号，不要连续使用空泛的爱国大词；不要写“赶紧买”“点击小黄车”，也不要编造价格、优惠、稀缺性、赠品或购买渠道。"
         )
+        book_rewrite_permission = "用户已明确开启结尾带书，因此允许并必须重新设计完整的产品价值塑造与转化收束。"
     else:
         conversion_instruction = (
             "原文包含带书或图书推荐内容，可以保留原有转化意图并重新表达，但不要扩大篇幅、不要改成硬广。"
             if has_book_promotion else
             "原文不包含带书或图书推荐内容，改写稿也禁止主动添加书名、翻书、读书感受、买书、小黄车、家长购买或推荐给孩子等转化内容。结尾必须跟随原文主题自然收束。"
         )
+        book_rewrite_permission = "只有原文包含带书内容时，才可以重新设计其表达方式。"
     retry_instruction = ""
     if previous:
         comparison = previous.get("rewrite_comparison") or {}
@@ -1232,7 +1283,7 @@ def build_rewrite_prompt(
 可以删掉重复啰嗦的句子。
 可以强化画面感和冲突感。
 必须重建固定开头之后的句子组织、信息顺序、段落功能、叙述落点、转折方式和情绪推进。真实时间与因果不能打乱，但原文的讲述顺序可以而且应当改变。
-可以在不改变事实主体、真实时间关系和因果关系的前提下更换叙述视角；只有原文包含带书内容时，才可以重新设计其表达方式。
+可以在不改变事实主体、真实时间关系和因果关系的前提下更换叙述视角；{book_rewrite_permission}
 除固定开头外，不得连续照抄原文句子；不得只靠换词、增删标点或重新分段制造改写效果。
 
 【长度和质量约束】
@@ -1302,9 +1353,19 @@ def rewrite_script_with_minimax(
                 prompt, raw_script, style, api_key, raw_len, preserve_rule,
                 append_book_promotion, promotion_book_title,
             )
-        except RewriteGenerationError:
-            raise
         except Exception as exc:
+            if best_result:
+                comparison = best_result.get("rewrite_comparison") or {}
+                best_result["rewrite_attempts"] = attempt - 1
+                best_result["rewrite_warning"] = (
+                    build_rewrite_quality_warning(comparison)
+                    + f" 后续第 {attempt} 次重试调用失败，已展示此前最好的完整稿件。"
+                )
+                best_result["rewrite_quality_status"] = "generation_warning"
+                best_result["rewrite_error"] = ""
+                return best_result
+            if isinstance(exc, RewriteGenerationError):
+                raise
             raise RewriteGenerationError(f"draft generation attempt {attempt}", exc) from exc
         result["rewrite_fact_brief"] = fact_brief
         result["rewrite_analysis_warning"] = fact_brief.get("analysis_warning", "")
@@ -1328,17 +1389,13 @@ def rewrite_script_with_minimax(
         best_result["rewrite_quality_status"] = "length_warning"
         best_result["rewrite_error"] = ""
         return best_result
-    best_result["rewrite_error"] = (
-        f"rewrite quality rejected after {MAX_REWRITE_ATTEMPTS} attempts: "
-        f"length {comparison.get('text2_length', 0)}/{comparison.get('text1_length', 0)} "
-        f"({comparison.get('length_ratio', 0)}%, required "
-        f"{comparison.get('min_rewritten_length', 0)}-{comparison.get('max_rewritten_length', 0)}), "
-        f"difference {comparison.get('overall_difference', 0)}%, "
-        f"continuous reuse {comparison.get('continuous_reuse', 0)}%, "
-        f"source phrase reuse {comparison.get('source_phrase_reuse', 0)}%, "
-        f"sentence imitation {comparison.get('sentence_imitation', 0)}%"
-    )
-    raise RewriteQualityError(best_result)
+    # A quality threshold miss should not discard a complete draft. Return the
+    # best attempt with actionable metrics; reserve request failures for cases
+    # where no draft could be generated at all.
+    best_result["rewrite_warning"] = build_rewrite_quality_warning(comparison)
+    best_result["rewrite_quality_status"] = "quality_warning"
+    best_result["rewrite_error"] = ""
+    return best_result
 
 
 def request_minimax_rewrite(
@@ -1510,7 +1567,7 @@ def build_guozhijiliang_script_prompt(person_name: str = "", event_angle: str = 
 每篇文案必须围绕一个具体故事，不要写人物一生简介。可参考但不要照搬这些角度：钱学森聚焦美国海关扣下行李；黄旭华聚焦父亲去世不能奔丧；郭永怀聚焦飞机失事前用身体护住公文包；林俊德聚焦生命最后一天穿病号服坐到电脑前整理资料；王承书聚焦主动要求抹掉自己的名字。
 
 结尾带书方式：
-结尾必须自然带《国之脊梁》，但不要硬卖。可以类似“最近读《国之脊梁》，再次看到他的故事，心里久久不能平静。”“如果家里有孩子，真希望他们认识这样的人。”不要连续喊口号。
+结尾必须用 2 到 3 个自然段、约 140 到 220 字完成《国之脊梁》的价值塑造，不能只提一次书名就结束。先承接本篇人物的具体选择和代价，再说清这本书能让读者看见哪些课本来不及展开的真实人生、理解怎样的选择与责任；接着落到家长和孩子共同阅读、成年人补上认知等具体阅读理由，最后给一句克制的行动引导。不要硬卖，不要喊“赶紧购买”，不要编造章节、人物数量、价格、优惠或赠品。
 
 输出格式：
 只返回 JSON，不要 Markdown，不要解释写作思路，不要列大纲，不要加小标题，不要加“镜头一、镜头二”。JSON 字段必须包含 title, person, event_angle, script。script 字段里只放按镜头分段后的正文。"""
@@ -1620,8 +1677,11 @@ def build_guozhijiliang_script_prompt_v2(person_name: str = "", event_angle: str
 
 九、带书转化要求
 
-结尾必须自然带出《国之脊梁》。不要硬广，不要写“点击小黄车购买”。
-可以这样写：“翻开《国之脊梁》才知道，今天我们习以为常的底气，从来不是凭空来的。”“读完这本书才明白，我们不是没有英雄，只是太多人把名字藏进了历史深处。”“如果家里有孩子，真希望他们认识这些人。”“因为真正值得追的星，从来不在热搜里，而在《国之脊梁》里。”“他们不是娱乐新闻里的明星，却是中国孩子最该知道的名字。”
+结尾必须用最后 2 到 3 个自然段、总计 140 到 220 个中文字符，自然带出《国之脊梁》并完成产品价值塑造。不能只写“如果家里有孩子，希望他认识这些人”，也不能只提一次书名就结束。
+第一层先接住本篇人物带来的敬佩、心疼或亏欠感，从这个人的具体选择自然过渡到“还有更多这样的名字值得被看见”。
+第二层说清产品价值：这本书不是一串人物简介，而是帮助读者看见课本来不及展开的真实人生，理解国家底气背后一个个普通人在关键时刻如何选择。只能做概括性表达，不得虚构具体章节、收录人数、作者背书或书中不存在的细节。
+第三层给购买理由和阅读场景：家长可以和孩子一起读，让榜样不再只是一个抽象词；成年人也可以借它补上曾经错过的人物与历史。最后用一句克制但有行动力的话收束，让观众自然产生把书带回家、自己读或陪孩子读的冲动。
+不要硬广，不要写“点击小黄车购买”“赶紧买”，不要编造价格、优惠、赠品、库存或购买渠道。避免连续喊口号和堆砌“伟大、震撼、民族脊梁”等空泛大词。
 
 十、用户视角反审要求
 

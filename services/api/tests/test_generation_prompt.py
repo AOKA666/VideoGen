@@ -13,6 +13,15 @@ from services.text_service import _build_shot_visuals_prompt  # noqa: E402
 
 
 class ImagePromptTests(unittest.TestCase):
+    def test_seedream_prompt_uses_archival_old_photo_tone(self) -> None:
+        prompt = build_image_prompt({"visual_need": "昏暗实验室里的科研人员"})
+
+        self.assertTrue(prompt.startswith(
+            "真实历史纪实影像风格，档案老照片质感，旧色调；"
+            "画面需求：昏暗实验室里的科研人员。"
+        ))
+        self.assertNotIn("档案照片质感，克制色彩，电影级构图", prompt)
+
     def test_seedream_prompt_does_not_expose_visual_design_instructions(self) -> None:
         prompt = build_image_prompt({"visual_need": "实验室或者戈壁滩上的科学家"})
 

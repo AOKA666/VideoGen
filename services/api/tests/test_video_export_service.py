@@ -53,6 +53,7 @@ class ProjectVideoRenderTests(unittest.TestCase):
                     root / "result.mp4",
                     title_line1="Title one",
                     title_line2="Title two",
+                    voice_volume=0.65,
                 )
 
             command = captured["command"]
@@ -65,7 +66,7 @@ class ProjectVideoRenderTests(unittest.TestCase):
             self.assertIn("MarginV=55", filters)
             self.assertEqual(2, filters.count("fontsize=56"))
             self.assertNotIn("\u0332", filters)
-            self.assertIn("[2:a]apad", filters)
+            self.assertIn("[2:a]volume=0.650,apad", filters)
             self.assertEqual("fade", report["transition"])
             self.assertEqual(0.5, report["transition_sec"])
             self.assertTrue(report["passed"])

@@ -26,7 +26,7 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-DONE_STATUSES = {"web_downloaded", "uploaded", "no_image", "no_match", "ai_generated", "matched"}
+DONE_STATUSES = {"web_downloaded", "uploaded", "no_image", "no_match", "ai_generated", "matched", "prompt_ready"}
 ACTIVE_SEARCH_STATUSES = {"pending_search", "analyzing_intent", "searching"}
 MIN_ACCEPT_SCORE = 30
 MAX_SEARCH_ROUNDS = 2

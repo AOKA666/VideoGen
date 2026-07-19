@@ -217,7 +217,7 @@ def build_image_prompt(shot: dict) -> str:
     person_description = _anonymous_person_description(shot, person_names)
     gender_instruction = person_gender_instruction(shot)
     return (
-        "真实历史纪实影像风格，档案照片质感，克制色彩，电影级构图，"
+        "真实历史纪实影像风格，档案老照片质感，旧色调；"
         f"画面需求：{visual_need or '历史纪实人物场景'}。"
         f"{f'人物外貌：{person_description}。' if person_description else ''}"
         f"{gender_instruction}"

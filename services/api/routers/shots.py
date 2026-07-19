@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 
-from services.generation_service import generate_doubao_image
+from services.generation_service import build_image_prompt, generate_doubao_image
 from services.material_library_service import apply_material_intent
 from services.store import load_db, project_dir, public_url, save_db
 from services.text_service import ai_generate_shot_visuals, generate_shots
@@ -125,6 +125,20 @@ def _generate_ai_images(project_id: str, run_id: str, shots: list[dict]) -> None
         save_db(db)
 
 
+def _save_image_prompts(project: dict, shots: list[dict], now: str) -> None:
+    """Persist image prompts without invoking an image-generation provider."""
+    for shot in shots:
+        shot["image_prompt"] = build_image_prompt(shot)
+        shot["status"] = "prompt_ready"
+        shot["updated_at"] = now
+    project["status"] = "shots_ready"
+    project["search_stage"] = "done"
+    project["search_total"] = len(shots)
+    project["search_completed"] = len(shots)
+    project["current_shot_index"] = None
+    project["current_search_keyword"] = ""
+
+
 def _generate_project_shots(project_id: str, run_id: str, image_search_provider: str, material_source_strategy: str) -> None:
     db = load_db()
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
@@ -158,7 +172,9 @@ def _generate_project_shots(project_id: str, run_id: str, image_search_provider:
     project["image_search_provider"] = image_search_provider
     project["material_source_strategy"] = material_source_strategy
     project["updated_at"] = now
-    if material_source_strategy != "ai_only":
+    if material_source_strategy == "prompt_only":
+        _save_image_prompts(project, generated, now)
+    elif material_source_strategy != "ai_only":
         mark_project_searching(db, project_id)
     else:
         project["search_stage"] = "generating_ai_images"
@@ -168,7 +184,7 @@ def _generate_project_shots(project_id: str, run_id: str, image_search_provider:
     save_db(db)
     if material_source_strategy == "ai_only":
         _generate_ai_images(project_id, run_id, generated)
-    else:
+    elif material_source_strategy != "prompt_only":
         run_project_web_image_search(project_id)
 
 
@@ -179,7 +195,7 @@ def create_shots(
     image_search_provider: str = Query("so", pattern="^(so|tencent)$"),
     material_source_strategy: str = Query(
         "library_first",
-        pattern="^(library_first|library_only|web_only|ai_only)$",
+        pattern="^(library_first|library_only|web_only|ai_only|prompt_only)$",
     ),
 ):
     db = load_db()

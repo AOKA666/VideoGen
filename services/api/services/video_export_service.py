@@ -13,6 +13,8 @@ from PIL import Image, ImageOps
 
 
 CREATE_NO_WINDOW = 0x08000000
+SUBTITLE_ASS_PRIMARY_COLOR = "&H0000FFFF"
+SUBTITLE_RGB_COLOR = (1.0, 1.0, 0.0)
 
 
 def _escape_ffmpeg_filter_path(path: str | Path) -> str:
@@ -233,6 +235,7 @@ def render_project_video(
     title_line1: str = "",
     title_line2: str = "",
     background_music_path: Path | None = None,
+    voice_volume: float = 1.0,
 ) -> dict[str, Any]:
     if len(shots) != len(scene_paths) or not shots:
         raise RuntimeError("Every shot must have one exported scene")
@@ -301,7 +304,7 @@ def render_project_video(
         f"[{video_label}]subtitles=filename='{_escape_ffmpeg_filter_path(subtitles_path.resolve())}':"
         f"fontsdir='{preferred_font_dir}':"
         f"force_style='FontName={preferred_font_name},FontSize=15,"
-        "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
+        f"PrimaryColour={SUBTITLE_ASS_PRIMARY_COLOR},OutlineColour=&H00000000,"
         "BorderStyle=1,Outline=0.8,Shadow=0,MarginV=55,Alignment=2'[vsub]"
     )
 
@@ -345,7 +348,8 @@ def render_project_video(
         # No title - rename vsub to vout
         filters.append("[vsub]null[vout]")
     filters.append(
-        f"[{audio_input_index}:a]apad,atrim=duration={total_duration:.3f},"
+        f"[{audio_input_index}:a]volume={max(0.0, min(float(voice_volume), 2.0)):.3f},"
+        f"apad,atrim=duration={total_duration:.3f},"
         "asetpts=PTS-STARTPTS[voice]"
     )
     if background_music_path:
@@ -483,6 +487,7 @@ def create_jianying_native_draft(
     background_music_start_sec: float = 0,
     background_music_volume: float = 0.2,
     music_crossfade_sec: float = 1.0,
+    voice_volume: float = 1.0,
 ) -> dict[str, Any]:
     try:
         import pyJianYingDraft as draft
@@ -541,6 +546,7 @@ def create_jianying_native_draft(
                 audio_material,
                 draft.Timerange(0, audio_duration_us),
                 source_timerange=draft.Timerange(0, audio_duration_us),
+                volume=max(0.0, min(float(voice_volume), 2.0)),
             ),
             "voice",
         )
@@ -596,7 +602,7 @@ def create_jianying_native_draft(
         style=draft.TextStyle(
             size=15,
             bold=True,
-            color=(1.0, 1.0, 1.0),
+            color=SUBTITLE_RGB_COLOR,
             align=1,
             auto_wrapping=False,
         ),
