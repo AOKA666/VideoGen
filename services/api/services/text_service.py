@@ -9,6 +9,8 @@ import time
 import urllib.error
 import urllib.request
 from difflib import SequenceMatcher
+from functools import lru_cache
+from pathlib import Path
 
 try:
     import jieba
@@ -38,6 +40,29 @@ REWRITE_ANALYSIS_MATERIAL_RATIO = 0.30
 REWRITE_ANALYSIS_CHARS_PER_FACT_ITEM = 200
 MAX_AUTO_TITLE_LENGTH = 8
 MAX_PUBLISH_SHORT_TITLE_LENGTH = 16
+
+
+@lru_cache(maxsize=1)
+def load_rewrite_creative_guidelines() -> str:
+    """Load the editable rewrite brief without its standalone-use placeholders."""
+    filename = "二创提示词.txt"
+    candidates = (
+        Path(__file__).resolve().parents[1] / filename,
+        Path(__file__).resolve().parents[3] / filename,
+    )
+    for path in candidates:
+        try:
+            content = path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            continue
+        if not content:
+            continue
+        # The source file can also be pasted into a chat as a standalone prompt.
+        # In the app, the source body is intentionally replaced by a fact brief,
+        # and the protected opening is supplied separately below.
+        content = content.split("请根据下面提供的原文进行二创：", 1)[0].rstrip()
+        return content
+    return ""
 OPENING_HOOK_MIN_CHARS = 20
 OPENING_HOOK_MAX_CHARS = 35
 TITLE_PUNCTUATION = re.compile(r"""[，。！？、；："'“”‘’《》【】（）—…\-.!?,;:()\[\]{}<>\s]""")
@@ -1203,6 +1228,7 @@ def build_rewrite_prompt(
                     f"删去重复表达和空泛评价，最终压缩到接近 {raw_len} 字。必须返回精简后的完整全文。"
                 )
     fact_brief_json = json.dumps(fact_brief or {}, ensure_ascii=False, indent=2)
+    creative_guidelines = load_rewrite_creative_guidelines()
     prompt = f"""
 你是一名视频号爆款短视频文案改写专家，擅长改写卖书类、历史人物类、大国情绪类、爱国教育类短视频口播文案。
 
@@ -1215,6 +1241,10 @@ def build_rewrite_prompt(
 3. material_cards 是详细写作素材。把动作、条件、因果、画面和人物代价写进正文，维持原文的细节密度，不能把素材卡重新压缩成摘要。
 4. 复用的是原文奏效的内容机制，不是原文句子。必须重新设计表达、段落组织和信息出现顺序。
 5. 转发、评论、点赞、关注理由要融进观点、冲突和情绪落点；只在合适位置使用一次自然互动引导，禁止机械喊“点赞关注转发”。
+
+【二创文案创作规则】
+以下规则来自项目的《二创提示词》，必须执行。它规定创作方法；本提示词后续给出的固定开头、事实资料卡、字数、带书开关和 JSON 输出要求属于本次任务的具体约束，优先级更高。
+{creative_guidelines}
 
 【最重要要求】
 用户选定的原文开头必须一字不改保留，不允许改字、不允许换词、不允许调整顺序、不允许删减。

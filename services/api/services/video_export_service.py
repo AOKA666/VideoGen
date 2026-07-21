@@ -321,12 +321,12 @@ def render_project_video(
         # Use the preferred font (文源圆体 with fallback) for title text
         font_path = _escape_ffmpeg_filter_path(preferred_font_path)
 
-        # Large two-line title in the top safe area of the 1080x1920 canvas.
+        # Two-line title in the top safe area, lowered slightly from the canvas edge.
         if title_line1:
             filters.append(
                 f"[vsub]drawtext=text='{_escape_drawtext(title_line1)}':"
-                f"fontsize=56:fontcolor=white:borderw=4:bordercolor=black:"
-                f"x=(w-text_w)/2:y=50:"
+                f"fontsize=52:fontcolor=white:borderw=4:bordercolor=black:"
+                f"x=(w-text_w)/2:y=80:"
                 f"fontfile='{font_path}'[vt1]"
             )
             current_label = "vt1"
@@ -337,8 +337,8 @@ def render_project_video(
         if title_line2:
             filters.append(
                 f"[{current_label}]drawtext=text='{_escape_drawtext(title_line2)}':"
-                f"fontsize=56:fontcolor=yellow:borderw=4:bordercolor=black:"
-                f"x=(w-text_w)/2:y=130:"
+                f"fontsize=52:fontcolor=yellow:borderw=4:bordercolor=black:"
+                f"x=(w-text_w)/2:y=152:"
                 f"fontfile='{font_path}'[vout]"
             )
         else:
@@ -619,7 +619,7 @@ def create_jianying_native_draft(
         clip_settings=None,
     )
 
-    # Keep both title lines centered at the very top for the full video.
+    # Keep both title lines centered near the top, with breathing room above them.
     title_duration_us = max(audio_duration_us, 1)
     title_border = draft.TextBorder(
         color=(0.0, 0.0, 0.0),
@@ -633,14 +633,14 @@ def create_jianying_native_draft(
                 draft.Timerange(0, title_duration_us),
                 font=jianying_font,
                 style=draft.TextStyle(
-                    size=16,
+                    size=15,
                     bold=True,
                     color=(1.0, 1.0, 1.0),
                     align=1,
                     auto_wrapping=False,
                 ),
                 border=title_border,
-                clip_settings=draft.ClipSettings(transform_y=0.86),
+                clip_settings=draft.ClipSettings(transform_y=0.82),
             ),
             "title_line1",
         )
@@ -652,7 +652,7 @@ def create_jianying_native_draft(
                 draft.Timerange(0, title_duration_us),
                 font=jianying_font,
                 style=draft.TextStyle(
-                    size=16,
+                    size=15,
                     bold=True,
                     underline=True,
                     color=(1.0, 0.86, 0.0),
@@ -660,7 +660,7 @@ def create_jianying_native_draft(
                     auto_wrapping=False,
                 ),
                 border=title_border,
-                clip_settings=draft.ClipSettings(transform_y=0.72),
+                clip_settings=draft.ClipSettings(transform_y=0.69),
             ),
             "title_line2",
         )

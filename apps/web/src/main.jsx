@@ -13,6 +13,7 @@ const VOICE_OPTIONS = [
   { value: 'zh_male_dongfanghaoran_uranus_bigtts', label: '男声 · 东方浩然' },
   { value: 'zh_male_dayi_uranus_bigtts', label: '男声 · 大义' },
   { value: 'zh_female_vv_uranus_bigtts', label: '女声 · 清晰自然' },
+  { value: 'S_6Sd6jOE42', label: '王立群' },
 ];
 
 async function request(path, options = {}) {

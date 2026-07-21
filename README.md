@@ -61,6 +61,7 @@ VOLC_TTS_APP_ID=your_volc_tts_app_id
 VOLC_TTS_ACCESS_KEY=your_volc_tts_access_key
 VOLC_TTS_ENDPOINT=https://openspeech.bytedance.com/api/v3/tts/unidirectional
 VOLC_TTS_RESOURCE_ID=seed-tts-2.0
+VOLC_TTS_CLONED_RESOURCE_ID=seed-icl-2.0
 VOLC_TTS_VOICE=zh_male_dongfanghaoran_uranus_bigtts
 
 # 可选：部分火山账号使用 API Key 鉴权，可替代 APP ID + Access Key

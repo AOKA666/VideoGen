@@ -697,7 +697,10 @@ def volc_tts_endpoint() -> str:
     return os.getenv("VOLC_TTS_ENDPOINT", "https://openspeech.bytedance.com/api/v3/tts/unidirectional")
 
 
-def volc_tts_resource_id() -> str:
+def volc_tts_resource_id(voice_type: str | None = None) -> str:
+    voice = (voice_type or volc_tts_voice()).strip()
+    if voice.startswith("S_"):
+        return os.getenv("VOLC_TTS_CLONED_RESOURCE_ID", "seed-icl-2.0")
     return os.getenv("VOLC_TTS_RESOURCE_ID", "seed-tts-2.0")
 
 
@@ -790,11 +793,12 @@ def synthesize_volcengine_tts(text: str, voice_type: str | None = None, speech_r
     if not api_key and not (app_id and access_key):
         raise RuntimeError("Configure VOLC_TTS_API_KEY or VOLC_TTS_APP_ID + VOLC_TTS_ACCESS_KEY")
 
+    selected_voice = voice_type or volc_tts_voice()
     payload = {
         "user": {"uid": "video-draft-generator"},
         "req_params": {
             "text": text,
-            "speaker": voice_type or volc_tts_voice(),
+            "speaker": selected_voice,
             "audio_params": {
                 "format": "mp3",
                 "sample_rate": 24000,
@@ -808,7 +812,7 @@ def synthesize_volcengine_tts(text: str, voice_type: str | None = None, speech_r
     headers = {
         "Content-Type": "application/json",
         "Connection": "keep-alive",
-        "X-Api-Resource-Id": volc_tts_resource_id(),
+        "X-Api-Resource-Id": volc_tts_resource_id(selected_voice),
         "X-Api-Request-Id": str(uuid4()),
     }
     if api_key:

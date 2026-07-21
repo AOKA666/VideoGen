@@ -64,7 +64,9 @@ class ProjectVideoRenderTests(unittest.TestCase):
                 filters,
             )
             self.assertIn("MarginV=55", filters)
-            self.assertEqual(2, filters.count("fontsize=56"))
+            self.assertEqual(2, filters.count("fontsize=52"))
+            self.assertIn("x=(w-text_w)/2:y=80", filters)
+            self.assertIn("x=(w-text_w)/2:y=152", filters)
             self.assertNotIn("\u0332", filters)
             self.assertIn("[2:a]volume=0.650,apad", filters)
             self.assertEqual("fade", report["transition"])

@@ -474,6 +474,23 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertNotIn("原文正文里的独特句子", prompt)
         self.assertNotIn("<raw_script>", prompt)
 
+    def test_rewrite_prompt_uses_project_creative_guidelines_and_keeps_dynamic_opening(self) -> None:
+        source = "用户框选的固定开头。后面的原文不应直接进入第二阶段。"
+
+        prompt = build_rewrite_prompt(
+            source,
+            "纪实故事型",
+            1,
+            preserve_rule="first_sentence",
+            fact_brief={"facts": ["人物完成关键任务"]},
+        )
+
+        self.assertIn("全文必须围绕一个“母问题”展开", prompt)
+        self.assertIn("至少完成以下三项结构变化", prompt)
+        self.assertIn("用户框选的固定开头。", prompt)
+        self.assertIn("用户选定的原文开头必须一字不改保留", prompt)
+        self.assertNotIn("【在这里粘贴原文】", prompt)
+
     def test_short_rewrite_retry_uses_targeted_expansion(self) -> None:
         previous = {
             "rewritten_script": "上一版短稿" * 100,
