@@ -371,6 +371,26 @@ h3 { font-size: 16px; line-height: 1.48; }
 }
 .opening-selection-hint button { min-height: 30px; padding: 0 9px; font-size: 12px; }
 .project-workspace { display: grid; gap: 22px; }
+.create-project-layout {
+  display: grid;
+  grid-template-columns: minmax(280px, .72fr) minmax(0, 1.28fr);
+  gap: 22px;
+  align-items: stretch;
+}
+.create-project-layout > .panel { min-width: 0; }
+.create-options-panel,
+.create-script-panel {
+  display: flex;
+  flex-direction: column;
+}
+.create-options-panel .ai-script-options { grid-template-columns: 1fr; }
+.create-script-panel .script-panel-heading { margin-bottom: 16px; }
+.create-script-textarea {
+  flex: 1;
+  min-height: 390px;
+  resize: vertical;
+}
+.create-script-panel .script-create-actions { margin-top: 14px; }
 .project-manager { min-width: 0; }
 .project-manager-heading, .project-manager-toolbar, .project-row-actions {
   display: flex;
@@ -1979,7 +1999,7 @@ h3 { font-size: 16px; line-height: 1.48; }
 @media (max-width: 900px) {
   .app { grid-template-columns: 1fr; }
   .sidebar { position: static; height: auto; }
-  .two-col, .shot-card { grid-template-columns: 1fr; }
+  .two-col, .create-project-layout, .shot-card { grid-template-columns: 1fr; }
   .shot-images { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .toolbar, .grid, .ai-script-options, .script-create-actions { grid-template-columns: 1fr; }
   .topbar { align-items: flex-start; flex-direction: column; }

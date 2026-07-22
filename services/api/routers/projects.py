@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from services.store import PROJECTS_DIR, load_db, project_dir, save_db
-from services.text_service import RewriteGenerationError, RewriteQualityError, compare_scripts, generate_guozhijiliang_script, infer_title, merge_short_script_paragraphs, rewrite_script
+from services.text_service import RewriteGenerationError, RewriteQualityError, compare_scripts, extract_opening_hook, generate_guozhijiliang_script, infer_title, merge_short_script_paragraphs, rewrite_script
 from services.web_image_pipeline import DONE_STATUSES, recover_interrupted_searches
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
@@ -233,7 +233,8 @@ def merge_script_paragraphs(project_id: str, payload: MergeParagraphsPayload):
     if "".join(source.split()) != "".join(merged.split()):
         raise HTTPException(500, "Paragraph merge unexpectedly changed script content")
     raw_script = project.get("raw_script", "")
-    comparison = compare_scripts(raw_script, merged)
+    protected_opening = extract_opening_hook(raw_script, project.get("opening_preserve_rule", "auto"))
+    comparison = compare_scripts(raw_script, merged, protected_opening)
     project["rewritten_script"] = merged
     project["rewrite_comparison"] = comparison
     project["rewrite_difference"] = comparison["overall_difference"]
@@ -264,7 +265,8 @@ def update_script(project_id: str, payload: ScriptUpdate):
     if payload.rewritten_script is not None:
         project["rewritten_script"] = payload.rewritten_script
         raw_script = project.get("raw_script", "")
-        comparison = compare_scripts(raw_script, payload.rewritten_script)
+        protected_opening = extract_opening_hook(raw_script, project.get("opening_preserve_rule", "auto"))
+        comparison = compare_scripts(raw_script, payload.rewritten_script, protected_opening)
         project["rewrite_comparison"] = comparison
         project["rewrite_difference"] = comparison["overall_difference"]
         project["status"] = "script_ready"

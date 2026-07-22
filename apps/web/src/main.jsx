@@ -1685,51 +1685,51 @@ function App() {
 
         {tab === 'create' && (
           <section className="band project-workspace">
-            <div className="two-col">
-              <form onSubmit={createProject} className="panel">
-              <h2>创建项目</h2>
-              <label className="promotion-book-setting">
-                带货书籍设置
-                <input
-                  value={promotionBookTitle}
-                  maxLength="60"
-                  onChange={(event) => setPromotionBookTitle(event.target.value)}
-                  onBlur={() => {
-                    if (!promotionBookTitle.trim()) setPromotionBookTitle(DEFAULT_PROMOTION_BOOK);
-                  }}
-                  placeholder={DEFAULT_PROMOTION_BOOK}
-                />
-                <small>开启“结尾带书”后，将用 2–3 段完成情绪承接、产品价值塑造和阅读理由，引导观众产生购买兴趣。</small>
-              </label>
-              <label>项目名称<input name="name" placeholder="可留空，系统自动取标题" /></label>
-              <div className="ai-script-options">
-                <label>人物名称（可选）<input value={aiScriptPerson} onChange={(event) => setAiScriptPerson(event.target.value)} placeholder="留空则随机选择《国之脊梁》院士" /></label>
-                <label>核心事件或角度（可选）<input value={aiScriptAngle} onChange={(event) => setAiScriptAngle(event.target.value)} placeholder="如：生命最后一天整理资料" /></label>
+            <form onSubmit={createProject} className="create-project-layout">
+              <div className="panel create-options-panel">
+                <h2>创建项目</h2>
+                <label>项目名称<input name="name" placeholder="可留空，系统自动取标题" /></label>
+                <label className="promotion-book-setting">
+                  带货书籍设置
+                  <input
+                    value={promotionBookTitle}
+                    maxLength="60"
+                    onChange={(event) => setPromotionBookTitle(event.target.value)}
+                    onBlur={() => {
+                      if (!promotionBookTitle.trim()) setPromotionBookTitle(DEFAULT_PROMOTION_BOOK);
+                    }}
+                    placeholder={DEFAULT_PROMOTION_BOOK}
+                  />
+                  <small>开启“结尾带书”后，将完成情绪承接、产品价值塑造和阅读理由，引导观众产生购买兴趣。</small>
+                </label>
+                <div className="ai-script-options">
+                  <label>人物名称（可选）<input value={aiScriptPerson} onChange={(event) => setAiScriptPerson(event.target.value)} placeholder="留空则随机选择《国之脊梁》院士" /></label>
+                  <label>核心事件或角度（可选）<input value={aiScriptAngle} onChange={(event) => setAiScriptAngle(event.target.value)} placeholder="如：生命最后一天整理资料" /></label>
+                </div>
               </div>
-              <label>
-                原始文案
+
+              <div className="panel create-script-panel">
+                <div className="script-title script-panel-heading">
+                  <h2>视频文案</h2>
+                  <span className="script-character-count">{scriptCharacterCount(rawScriptDraft)} 字</span>
+                </div>
                 <textarea
+                  className="create-script-textarea"
                   name="raw_script"
                   required
-                  rows="12"
                   value={rawScriptDraft}
                   onChange={(event) => setRawScriptDraft(event.target.value)}
-                  placeholder="粘贴历史人物/纪实解说文案，或点击 AI 写《国之脊梁》文案"
+                  placeholder="粘贴历史人物或纪实解说文案，也可以点击“AI 写文案”自动生成"
+                  aria-label="视频文案"
                 />
-              </label>
-              <div className="script-create-actions">
-                <button type="button" onClick={generateAiRawScript} disabled={busy}>
-                  <Wand2 size={18} /> AI 写文案
-                </button>
-                <button className="primary" disabled={!rawScriptDraft.trim()}><Save size={18} /> 创建并进入文案</button>
+                <div className="script-create-actions">
+                  <button type="button" onClick={generateAiRawScript} disabled={busy}>
+                    <Wand2 size={18} /> AI 写文案
+                  </button>
+                  <button className="primary" disabled={!rawScriptDraft.trim()}><Save size={18} /> 创建并进入文案</button>
+                </div>
               </div>
-              </form>
-              <div className="notes">
-              <h2>V1 范围</h2>
-              <p>本版本不抓取外网视频，不自动判断版权，不直接生成成片。重点解决“文案拆成镜头，并帮你从素材库里找到合适画面”。</p>
-              <p>选择素材后会先让你填写标签，再上传并自动打标；手动标签会优先保留。</p>
-              </div>
-            </div>
+            </form>
             <ProjectManager
               projects={projects}
               activeProjectId={projectId}
@@ -1961,6 +1961,9 @@ function App() {
                   {' · '}短语复用率：{project.rewrite_comparison.source_phrase_reuse ?? project.rewrite_comparison.phrase_overlap ?? '-'}%
                   {' · '}逐句模仿率：{project.rewrite_comparison.sentence_imitation ?? '-'}%
                   {' · '}关键词重合率：{project.rewrite_comparison.keyword_overlap ?? project.rewrite_comparison.semantic_similarity ?? '-'}%
+                  {' · '}篇幅比例：{project.rewrite_comparison.length_ratio ?? '-'}%
+                  {' · '}事实卡覆盖：{project.rewrite_comparison.covered_fact_cards?.length ?? '-'}
+                  /{project.rewrite_comparison.expected_fact_cards ?? '-'}
                 </small>
               )}
               {project.rewrite_warning && <p className="rewrite-warning">{project.rewrite_warning}</p>}
