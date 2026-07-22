@@ -34,8 +34,6 @@ MAX_REWRITE_SENTENCE_IMITATION = 35
 MAX_REWRITE_ATTEMPTS = 3
 MAX_REWRITE_ANALYSIS_ATTEMPTS = 2
 MAX_REWRITE_ANALYSIS_REQUEST_ATTEMPTS = 2
-REWRITE_ANALYSIS_MATERIAL_RATIO = 0.75
-REWRITE_ANALYSIS_CHARS_PER_FACT_ITEM = 120
 REWRITE_COMPRESSION_WARNING_RATIO = 75
 MAX_AUTO_TITLE_LENGTH = 8
 MAX_PUBLISH_SHORT_TITLE_LENGTH = 16
@@ -60,6 +58,11 @@ def load_rewrite_creative_guidelines() -> str:
         # In the app, the source body is intentionally replaced by a fact brief,
         # and the protected opening is supplied separately below.
         content = content.split("请根据下面提供的原文进行二创：", 1)[0].rstrip()
+        # The caller already supplies the writing role and task. Keep the
+        # standalone introduction in the editable file, but avoid repeating it
+        # in every API request.
+        if "一、事实与主线" in content:
+            content = "一、事实与主线" + content.split("一、事实与主线", 1)[1]
         return content
     return ""
 TITLE_PUNCTUATION = re.compile(r"""[，。！？、；："'“”‘’《》【】（）—…\-.!?,;:()\[\]{}<>\s]""")
@@ -389,6 +392,15 @@ def remove_protected_opening(text: str, protected_opening: str) -> str:
     return source
 
 
+def remove_protected_passages(text: str, passages: list[str] | None) -> str:
+    cleaned = str(text or "")
+    for passage in passages or []:
+        exact = str(passage or "").strip()
+        if exact:
+            cleaned = cleaned.replace(exact, "")
+    return cleaned
+
+
 def ai_outline_fragments(text: str) -> list[str]:
     body = str(text or "")
     patterns = (
@@ -409,6 +421,7 @@ def compare_scripts(
     text1: str,
     text2: str,
     protected_opening: str = "",
+    protected_passages: list[str] | None = None,
 ) -> dict:
     source_length = content_length(text1)
     rewritten_length = content_length(text2)
@@ -422,6 +435,8 @@ def compare_scripts(
     # similarity and reconstruction metric.
     body1 = remove_protected_opening(text1, protected_opening)
     body2 = remove_protected_opening(text2, protected_opening)
+    body1 = remove_protected_passages(body1, protected_passages)
+    body2 = remove_protected_passages(body2, protected_passages)
     outline_fragments = ai_outline_fragments(body2)
     outline_structure_passed = not outline_fragments
     compact1 = compact_similarity_text(body1)
@@ -487,6 +502,7 @@ def compare_scripts(
         "min_rewritten_length": min_rewritten_length,
         "max_rewritten_length": max_rewritten_length,
         "protected_opening_length": content_length(protected_opening),
+        "protected_passage_count": len([item for item in protected_passages or [] if str(item).strip()]),
         "reused_passages": reused_passages,
         "common_keywords": sorted(terms1 & terms2, key=len, reverse=True)[:10],
         "unique_keywords1": sorted(terms1 - terms2, key=len, reverse=True)[:10],
@@ -550,8 +566,18 @@ def normalize_rewrite_fact_coverage(audit: dict, fact_brief: dict | None) -> dic
         }
         for number in failed
     ]
+    order_items = audit.get("out_of_order_cards")
+    order_items = order_items if isinstance(order_items, list) else []
+    timeline_order_passed = audit.get("timeline_order_passed") is not False and not order_items
+    emotional_items = audit.get("emotional_issues")
+    emotional_items = emotional_items if isinstance(emotional_items, list) else []
+    emotional_quality_passed = audit.get("emotional_quality_passed") is not False and not emotional_items
     return {
         "fact_coverage_passed": bool(cards) and not failed,
+        "timeline_order_passed": timeline_order_passed,
+        "timeline_order_issues": order_items,
+        "emotional_quality_passed": emotional_quality_passed,
+        "emotional_issues": emotional_items,
         "covered_fact_cards": sorted(covered),
         "expected_fact_cards": len(cards),
         "missing_fact_cards": missing_fact_cards,
@@ -574,6 +600,8 @@ def apply_rewrite_fact_coverage_quality(result: dict, coverage: dict) -> dict:
         and bool(comparison.get("length_passed"))
         and comparison.get("outline_structure_passed") is not False
         and bool(comparison.get("fact_coverage_passed"))
+        and comparison.get("timeline_order_passed") is not False
+        and comparison.get("emotional_quality_passed") is not False
     )
     result["rewrite_comparison"] = comparison
     return result
@@ -931,6 +959,24 @@ def build_rewrite_quality_warning(comparison: dict) -> str:
             if isinstance(item, dict):
                 card_summaries.append(f"素材卡 {item.get('card')}：{item.get('missing') or item.get('fact')}")
         issues.append("重要事实覆盖不完整：" + ("；".join(card_summaries) or "存在未写入的素材卡"))
+    if comparison.get("timeline_order_passed") is False:
+        order_issues = comparison.get("timeline_order_issues") or []
+        summaries = []
+        for item in order_issues[:6]:
+            if isinstance(item, dict):
+                summaries.append(str(item.get("reason") or item.get("issue") or item))
+            else:
+                summaries.append(str(item))
+        issues.append("正文时间线乱序：" + ("；".join(summaries) or "素材卡没有按真实时间顺序出现"))
+    if comparison.get("emotional_quality_passed") is False:
+        emotional_issues = comparison.get("emotional_issues") or []
+        summaries = []
+        for item in emotional_issues[:6]:
+            if isinstance(item, dict):
+                summaries.append(str(item.get("reason") or item.get("issue") or item))
+            else:
+                summaries.append(str(item))
+        issues.append("情感递进不足或失真：" + ("；".join(summaries) or "关键代价和关系变化没有形成情绪落点"))
     if comparison.get("compression_warning"):
         issues.append(
             f"成稿约为原文的 {comparison.get('length_ratio', 0)}%，低于 "
@@ -969,6 +1015,7 @@ def normalize_rewrite_result(
     preserve_rule: str = "auto",
     append_book_promotion: bool = False,
     promotion_book_title: str = "国之脊梁",
+    verified_quotes: list[str] | None = None,
 ) -> dict:
     title = str(result.get("title") or infer_title(raw_script)).strip()
     hook = extract_opening_hook(raw_script, preserve_rule) or str(result.get("hook") or build_fallback_hook(raw_script, title)).strip()
@@ -987,6 +1034,7 @@ def normalize_rewrite_result(
         raw_script,
         rewritten_script,
         protected_opening=hook,
+        protected_passages=verified_quotes,
     )
     return {
         "title": normalize_auto_title(title, raw_script),
@@ -1000,30 +1048,41 @@ def normalize_rewrite_result(
     }
 
 
-def build_rewrite_analysis_prompt(raw_script: str) -> str:
+def rewrite_minimum_fact_items(raw_length: int) -> int:
+    if raw_length <= 240:
+        return 1
+    if raw_length <= 600:
+        return 2
+    if raw_length <= 1000:
+        return 3
+    return 4
+
+
+def build_rewrite_analysis_prompt(raw_script: str, preserve_rule: str = "auto") -> str:
     raw_len = content_length(raw_script)
-    minimum_fact_items = max(4, round(raw_len / REWRITE_ANALYSIS_CHARS_PER_FACT_ITEM))
-    minimum_material_length = int(raw_len * REWRITE_ANALYSIS_MATERIAL_RATIO)
-    maximum_analysis_length = max(1800, min(6000, int(raw_len * 1.6)))
+    minimum_fact_items = rewrite_minimum_fact_items(raw_len)
+    protected_opening = extract_opening_hook(raw_script, preserve_rule)
     return f"""你是短视频事实编辑。完整通读原文，制作一份供第二个模型重新写作的紧凑素材包。本阶段只做内容理解和事实拆解，不写二创文案。
 
-原文去除空白后约 {raw_len} 字。最终二创稿有效字数不得低于原文的 75%。事实资料卡负责筛选写作内容；凡进入资料卡的信息，无论属于主线、背景还是同类事实，都必须在成稿中完整保留，不得在写作阶段二次压缩。素材包有效内容至少约 {minimum_material_length} 字，不得为了精简漏掉事实。
+原文去除空白后约 {raw_len} 字。最终二创稿的篇幅要求由写作阶段负责，资料卡不承担原文 75% 的长度目标。资料卡只负责完整覆盖事实方向：核心事实必须保留；重复背景、同类履历和同类成就可以标记为 mergeable，在写作阶段合并概括。
 
-【爆款分析】总计不超过200字，只写4条短结论：
-1. 钩子结构：最主要的停留原因和视频结构。
+【传播分析】总计不超过200字，只写4条短结论。这些结论只能指导承接方式、信息密度、情绪递进和互动价值，不得建议倒叙、插叙、提前结果或改变真实时间顺序：
+1. 开头承接：固定开头之后如何自然接入正文，不得另起钩子。
 2. 完播机制：最有效的细节密度、信息释放和情绪递进。
 3. 转发机制：这是核心。最主要的转发理由、用户痛点和情绪点。
 4. 互动机制：评论、点赞、关注的真实理由；原文没有就写“无明显设计”。
 
 【紧凑事实卡】资料卡不是摘要，但禁止重复：
 1. core_subject 必须概括本篇讲谁；protagonists 必须逐项列出所有主要人物的完整姓名。多人题材不能只写“宋氏三姐妹”“这群科学家”等群体称呼，还必须列出每一位主要人物；protagonist_relationship 必须写清他们之间的关系或各自最简身份。
-2. material_cards 至少 {minimum_fact_items} 条，严格按真实时间先后排列并编号。每条使用语言中性的事实表述，写清时间阶段、人物姓名、发生了什么、原因、结果、关键数字和能支撑画面的细节；同一事件只写一次。
-3. 完整保留原文所有重要事实、人物关系、转折、代价、因果、关键动作和画面。不得把突发疾病、死亡、事故、被捕、离婚等命运事件吞进“某事后”这种时间状语中；必须分别记录“事件发生”和“人物应对”。
-4. 不复制原文完整句子，不保留原文修辞、金句和段落结构。资料卡只记录事实，不能提前替第二个模型改写句子。进入 material_cards 的每一项内容都视为必须完整写入成稿的信息，不再区分可压缩卡片。
-5. section_plan 默认使用顺叙：固定开头后只允许回到一次最早的必要时间节点，随后按 material_cards 的真实时间顺序向前推进。每个阶段规定叙事任务和使用哪些素材卡，并确保最终成稿达到原文有效字数的 75%，不设计反复倒叙或插叙。
-6. 判断原文是否包含图书推荐；没有就标记 false。
+2. 按独立事件建立 material_cards，通常至少 {minimum_fact_items} 条；如果原文确实只有更少的独立事件，不得为了凑数量拆分或重复同一事件。严格按真实时间先后排列并编号。只有删除后会破坏核心主线的冲突、因果、人物关系、选择、转折、结果和关键数字标记 must；普通背景、履历、同类困难和同类成就默认标记 mergeable。除非全文几乎全是主线事件，否则不得把所有卡都标成 must。
+3. 完整保留原文所有重要事实、人物关系、转折、代价、因果、关键动作和画面；事件卡要写清事件发生和人物应对。有明确依据时才给卡片增加 emotional_stakes（人物可能失去什么或已经付出什么）或 relationship_change（关系如何变化）；没有依据时直接省略字段，不要输出空字符串。不得虚构人物内心、眼泪、台词或心理活动。
+4. 不复制原文完整句子，不保留原文修辞、金句和段落结构。资料卡只记录事实，不能提前替第二个模型改写句子。must 卡必须完整进入成稿；mergeable 卡允许与相邻同类卡合并表达，不要求逐卡展开。
+5. section_plan 是叙事阶段计划，不等于最终自然段数量：1到2张卡可设1个阶段，3到4张卡通常2个，5到6张卡通常3个，更多卡通常4个；必须按 material_cards 编号顺叙。另给出 emotional_arc，把确有情感价值的卡片编号与感受对应起来；短文1到3个、长文最多5个关键节点，不得为了凑数量硬加。情绪必须跟随事实推进，不能凌驾于时间线。
+6. 只把原文中有明确说话者、内容和出处语境的直接引语放入 verified_quotes，逐字保留；无法确认的引语不要收录，改由事实卡记录其含义。
+7. 判断原文是否包含图书推荐。存在时记录 original_intent、selling_points、target_readers 和 transition_angle；没有就标记 present=false 并把其他字段留空。
+8. 仅当下方 protected_opening 已经写到后期结果时，允许 section_plan 用一句承接语回到最早节点；此后仍须顺叙，且不要重复固定开头已覆盖的事实。
 
-整个 JSON 去除空白后不得超过约 {maximum_analysis_length} 字符。只返回以下单层紧凑 JSON，不得增加字段，不得使用 Markdown：
+只返回以下 JSON，不得增加字段，不得使用 Markdown。优先避免重复，但不能为了缩短 JSON 删除事实：
 {{
   "core_subject": "本篇主人公概括",
   "protagonists": ["主要人物完整姓名1", "主要人物完整姓名2"],
@@ -1031,13 +1090,17 @@ def build_rewrite_analysis_prompt(raw_script: str) -> str:
   "core_conflict": "冲突",
   "key_choice": "选择",
   "story_outcome": "结果",
-  "viral_analysis": {{"hook": "短句", "completion": "短句", "share": "短句", "interaction": "短句"}},
-  "material_cards": ["01｜时间阶段｜人物姓名｜中性事实、原因、结果与关键细节", "02｜时间阶段｜人物姓名｜中性事实、原因、结果与关键细节"],
+  "viral_analysis": {{"opening_continuation": "固定开头后的承接方式", "completion": "短句", "share": "短句", "interaction": "短句"}},
+  "emotional_arc": [{{"card": 2, "beat": "憋屈"}}, {{"card": 4, "beat": "心疼"}}, {{"card": 6, "beat": "敬佩"}}],
+  "timeline_verified": true,
+  "material_cards": [{{"id": 1, "priority": "must", "time": "时间阶段", "person": "人物姓名", "fact": "中性事实", "details": "原因、结果、动作、代价、数字与关键画面", "emotional_stakes": "有依据的实际代价", "relationship_change": "有依据的关系变化"}}, {{"id": 2, "priority": "mergeable", "time": "时间阶段", "person": "人物姓名", "fact": "可合并表达的背景或履历", "details": "必要信息"}}],
   "must_preserve_terms": ["人名地名年份数字专名"],
-  "section_plan": [{{"task": "段落任务", "cards": [1, 2]}}],
-  "book_promotion": {{"present": false}}
+  "verified_quotes": ["可核实且允许逐字保留的原文直接引语"],
+  "section_plan": [{{"task": "叙事阶段任务", "cards": [1, 2]}}],
+  "book_promotion": {{"present": false, "original_intent": "", "selling_points": [], "target_readers": [], "transition_angle": ""}}
 }}
 
+<protected_opening>{protected_opening}</protected_opening>
 <raw_script>{raw_script}</raw_script>
 """
 
@@ -1061,16 +1124,42 @@ def normalize_rewrite_fact_brief(result: dict, raw_length: int = 0) -> dict:
     promotion = result.get("book_promotion")
     if not isinstance(promotion, dict):
         promotion = {"present": False, "facts": []}
-    viral_analysis = result.get("viral_analysis") if isinstance(result.get("viral_analysis"), dict) else {}
+    viral_analysis = dict(result.get("viral_analysis")) if isinstance(result.get("viral_analysis"), dict) else {}
+    if not str(viral_analysis.get("opening_continuation") or "").strip() and viral_analysis.get("hook"):
+        viral_analysis["opening_continuation"] = viral_analysis.get("hook")
+    viral_analysis.pop("hook", None)
     structure_summary = result.get("structure_summary") if isinstance(result.get("structure_summary"), dict) else {}
-    section_plan = result.get("section_plan") if isinstance(result.get("section_plan"), list) else []
+    raw_section_plan = result.get("section_plan") if isinstance(result.get("section_plan"), list) else []
+    section_plan = []
+    legacy_emotional_nodes = []
+    for item in raw_section_plan:
+        if not isinstance(item, dict):
+            section_plan.append(item)
+            continue
+        normalized_item = dict(item)
+        legacy_beat = str(normalized_item.pop("emotional_beat", "") or "").strip()
+        cards_for_stage = normalized_item.get("cards")
+        if legacy_beat and isinstance(cards_for_stage, list) and cards_for_stage:
+            legacy_emotional_nodes.append({"card": cards_for_stage[0], "beat": legacy_beat})
+        section_plan.append(normalized_item)
     protagonists = normalized_protagonists(result)
     protagonist_relationship = str(result.get("protagonist_relationship") or "").strip()
+    normalized_material_cards = []
+    for item in material_cards:
+        if not isinstance(item, dict):
+            normalized_material_cards.append(item)
+            continue
+        normalized_item = dict(item)
+        legacy_beat = str(normalized_item.pop("emotional_beat", "") or "").strip()
+        if legacy_beat:
+            legacy_emotional_nodes.append({"card": normalized_item.get("id"), "beat": legacy_beat})
+        for optional_field in ("emotional_stakes", "relationship_change"):
+            if not str(normalized_item.get(optional_field) or "").strip():
+                normalized_item.pop(optional_field, None)
+        normalized_material_cards.append(normalized_item)
+    material_cards = normalized_material_cards
     fact_item_count = len(timeline) + len(facts) + len(material_cards)
-    minimum_fact_items = (
-        max(4, round(raw_length / REWRITE_ANALYSIS_CHARS_PER_FACT_ITEM))
-        if raw_length else 1
-    )
+    minimum_fact_items = rewrite_minimum_fact_items(raw_length) if raw_length else 1
     material_content = {
         "timeline": timeline,
         "facts": facts,
@@ -1083,25 +1172,56 @@ def normalize_rewrite_fact_brief(result: dict, raw_length: int = 0) -> dict:
         "section_plan": section_plan,
     }
     material_length = nested_value_content_length(material_content)
-    minimum_material_length = int(raw_length * REWRITE_ANALYSIS_MATERIAL_RATIO) if raw_length else 1
     material_density_ratio = round((material_length / raw_length) * 100) if raw_length else 0
-    section_plan_passed = len(section_plan) >= 4
+    minimum_section_count = min(4, max(1, (fact_item_count + 1) // 2))
+    section_plan_passed = len(section_plan) >= minimum_section_count
     protagonist_identity_passed = bool(protagonists)
+    structured_cards = [item for item in material_cards if isinstance(item, dict)]
+    mergeable_count = sum(
+        1 for item in structured_cards
+        if str(item.get("priority") or "").strip().lower() == "mergeable"
+    )
+    priority_balance_passed = len(structured_cards) < 6 or mergeable_count > 0
     coverage_passed = (
-        fact_item_count >= minimum_fact_items
-        and material_length >= minimum_material_length
+        fact_item_count > 0
         and section_plan_passed
         and protagonist_identity_passed
+        and priority_balance_passed
     )
+    verified_quotes = result.get("verified_quotes")
+    verified_quotes = [str(item).strip() for item in verified_quotes] if isinstance(verified_quotes, list) else []
+    emotional_arc = result.get("emotional_arc")
+    emotional_arc = emotional_arc if isinstance(emotional_arc, list) else []
+    normalized_emotional_arc = []
+    for item in emotional_arc:
+        if isinstance(item, dict):
+            beat = str(item.get("beat") or "").strip()
+            if beat:
+                normalized_emotional_arc.append({"card": item.get("card"), "beat": beat})
+        else:
+            beat = str(item or "").strip()
+            if beat:
+                normalized_emotional_arc.append(beat)
+    if not normalized_emotional_arc:
+        seen_legacy_cards = set()
+        for item in legacy_emotional_nodes:
+            card = item.get("card")
+            if not item.get("beat") or card in seen_legacy_cards:
+                continue
+            seen_legacy_cards.add(card)
+            normalized_emotional_arc.append(item)
     return {
         "source_length": raw_length,
         "fact_item_count": fact_item_count,
         "minimum_fact_items": minimum_fact_items,
         "material_length": material_length,
-        "minimum_material_length": minimum_material_length,
+        "minimum_material_length": 0,
         "material_density_ratio": material_density_ratio,
+        "timeline_verified": result.get("timeline_verified") is not False,
+        "minimum_section_count": minimum_section_count,
         "section_plan_passed": section_plan_passed,
         "protagonist_identity_passed": protagonist_identity_passed,
+        "priority_balance_passed": priority_balance_passed,
         "fact_coverage_passed": coverage_passed,
         "core_subject": str(result.get("core_subject") or "").strip(),
         "protagonists": protagonists,
@@ -1114,21 +1234,161 @@ def normalize_rewrite_fact_brief(result: dict, raw_length: int = 0) -> dict:
         "material_cards": material_cards,
         "relationships": result.get("relationships") if isinstance(result.get("relationships"), list) else [],
         "must_preserve_terms": result.get("must_preserve_terms") if isinstance(result.get("must_preserve_terms"), list) else [],
+        "verified_quotes": [item for item in verified_quotes if item],
         "viral_analysis": viral_analysis,
+        "emotional_arc": normalized_emotional_arc[:5],
         "structure_summary": structure_summary,
         "section_plan": section_plan,
         "book_promotion": {
             "present": bool(promotion.get("present")),
             "facts": promotion.get("facts") if isinstance(promotion.get("facts"), list) else [],
+            "original_intent": str(promotion.get("original_intent") or "").strip(),
+            "selling_points": promotion.get("selling_points") if isinstance(promotion.get("selling_points"), list) else [],
+            "target_readers": promotion.get("target_readers") if isinstance(promotion.get("target_readers"), list) else [],
+            "transition_angle": str(promotion.get("transition_angle") or "").strip(),
         },
     }
 
 
-def request_minimax_rewrite_analysis(raw_script: str, api_key: str) -> dict:
-    base_prompt = build_rewrite_analysis_prompt(raw_script)
+def parse_rewrite_analysis_json(content: str) -> dict:
+    """Parse analysis JSON and repair a common missing-comma model error."""
+    candidate = extract_json(content)
+    for _ in range(8):
+        try:
+            parsed = json.loads(candidate)
+            if not isinstance(parsed, dict):
+                raise ValueError("Rewrite analysis must return a JSON object")
+            return parsed
+        except json.JSONDecodeError as exc:
+            if exc.msg != "Expecting ',' delimiter":
+                raise
+            position = exc.pos
+            if position >= len(candidate) or candidate[position] != '"':
+                raise
+            # Only repair when the token at the error position is clearly the
+            # next object key. This avoids changing ordinary quotation marks in
+            # a string value.
+            if not re.match(r'"(?:[^"\\]|\\.)*"\s*:', candidate[position:]):
+                raise
+            previous = position - 1
+            while previous >= 0 and candidate[previous].isspace():
+                previous -= 1
+            if previous < 0 or candidate[previous] not in {'"', ']', '}'}:
+                raise
+            candidate = candidate[:position] + "," + candidate[position:]
+    raise ValueError("Rewrite analysis JSON needs too many repairs")
+
+
+def fallback_rewrite_fact_brief(
+    raw_script: str,
+    error: Exception,
+    protected_opening: str = "",
+) -> dict:
+    """Keep rewriting available when the provider repeatedly emits bad JSON."""
+    original_source = str(raw_script or "").strip()
+    source = original_source
+    if protected_opening and source.startswith(protected_opening):
+        source = source[len(protected_opening):].lstrip()
+    if not source:
+        source = original_source
+    sentences = [
+        item.strip()
+        for item in re.split(r"(?<=[。！？!?；;])\s*|\n+", source)
+        if item.strip()
+    ]
+    if not sentences and source:
+        sentences = [source]
+
+    # Merge very short sentences while keeping cards small enough for the
+    # writing model to reorganize instead of treating the source as one block.
+    cards: list[str] = []
+    buffer = ""
+    for sentence in sentences:
+        if buffer and content_length(buffer + sentence) > 180:
+            cards.append(buffer)
+            buffer = sentence
+        else:
+            buffer += sentence
+    if buffer:
+        cards.append(buffer)
+
+    if len(cards) == 1 and content_length(cards[0]) > 240:
+        text = cards[0]
+        cards = [text[index:index + 160] for index in range(0, len(text), 160)]
+
+    protagonists = [person for person in PERSON_HINTS if person in original_source]
+    card_count = len(cards)
+    fallback_material_cards = []
+    must_signal = re.compile(
+        r"(决定|拒绝|选择|回国|离开|被捕|牺牲|死亡|去世|离婚|成功|完成|发明|研制|解决|结果|真相|获奖)"
+    )
+    for index, card in enumerate(cards, 1):
+        is_boundary = index == 1 or index == card_count
+        priority = "must" if is_boundary or must_signal.search(card) else "mergeable"
+        fallback_material_cards.append({
+            "id": index,
+            "priority": priority,
+            "time": "时间待核",
+            "person": "按原文事实交代",
+            "fact": card,
+            "details": "保底资料卡按原文出现顺序生成，编号不代表真实时间",
+        })
+
+    task_sets = {
+        1: ("完整讲述核心事件并收束",),
+        2: ("交代人物与事件起点", "推进结果并收束"),
+        3: ("交代人物与事件起点", "推进冲突与选择", "交代结果并收束"),
+        4: ("承接开头并交代人物", "推进核心事件", "展开选择与代价", "交代结果并收束"),
+    }
+    stage_count = min(4, max(1, (card_count + 1) // 2))
+    tasks = task_sets[stage_count]
+    section_plan = []
+    for index, task in enumerate(tasks):
+        start = (card_count * index) // len(tasks)
+        end = (card_count * (index + 1)) // len(tasks)
+        assigned = list(range(start + 1, end + 1))
+        if not assigned and card_count:
+            assigned = [min(index + 1, card_count)]
+        section_plan.append({"task": task, "cards": assigned})
+
+    brief = normalize_rewrite_fact_brief({
+        "core_subject": "、".join(protagonists[:4]) or "原文人物与事件",
+        "protagonists": protagonists,
+        "protagonist_relationship": "按原文事实交代",
+        "core_conflict": "根据资料卡提炼核心冲突",
+        "timeline_verified": False,
+        "material_cards": fallback_material_cards,
+        "section_plan": section_plan,
+        "viral_analysis": {},
+        "emotional_arc": [],
+        "book_promotion": {
+            "present": bool(re.search(
+                r"(《[^》]+》|这本书|书里|书中|翻开|读完|买给孩子|下单|购买|小黄车|带书|卖书)",
+                original_source,
+            )),
+            "original_intent": "",
+            "selling_points": [],
+            "target_readers": [],
+            "transition_angle": "",
+        },
+        "verified_quotes": [],
+    }, content_length(source))
+    brief["analysis_warning"] = (
+        "MiniMax 两次返回的资料卡 JSON 均无法解析，系统已按原文段落生成保底资料卡继续二创；"
+        f"建议生成后重点核对事实。错误：{type(error).__name__}: {str(error)[:160]}"
+    )
+    return brief
+
+
+def request_minimax_rewrite_analysis(
+    raw_script: str,
+    api_key: str,
+    preserve_rule: str = "auto",
+) -> dict:
+    protected_opening = extract_opening_hook(raw_script, preserve_rule)
+    base_prompt = build_rewrite_analysis_prompt(raw_script, preserve_rule)
     raw_len = content_length(raw_script)
-    minimum_fact_items = max(4, round(raw_len / REWRITE_ANALYSIS_CHARS_PER_FACT_ITEM))
-    minimum_material_length = int(raw_len * REWRITE_ANALYSIS_MATERIAL_RATIO)
+    minimum_fact_items = rewrite_minimum_fact_items(raw_len)
     analysis_timeout = max(
         30,
         min(300, int(os.getenv("MINIMAX_ANALYSIS_TIMEOUT_SECONDS", "120"))),
@@ -1151,13 +1411,17 @@ def request_minimax_rewrite_analysis(raw_script: str, api_key: str) -> dict:
                 else "主人公名单为空；必须补齐所有主要人物的完整姓名及其关系，群体称呼不算姓名。"
             )
             retry_note = (
-                f"\n\n上一版分析未达到写作素材密度要求：事实/素材卡 {last_brief.get('fact_item_count', 0)} 条，"
-                f"最低 {minimum_fact_items} 条；有效分析与素材约 {last_brief.get('material_length', 0)} 字，"
-                f"最低 {minimum_material_length} 字；结构计划 {len(last_brief.get('section_plan') or [])} 段，最低4段。"
+                f"\n\n上一版分析未达到可用要求：事实/素材卡 {last_brief.get('fact_item_count', 0)} 条，"
+                f"建议约 {minimum_fact_items} 条，但独立事件更少时不得硬拆；结构计划 {len(last_brief.get('section_plan') or [])} 段，"
+                f"当前至少需要 {last_brief.get('minimum_section_count', 1)} 段。"
                 f"{protagonist_note}"
-                "请重新通读原文，补齐爆点、完播、转发、评论、点赞、关注机制，"
+                + (
+                    "上一版把较多卡片全部标成 must；请只保留真正决定主线的 must，其余同类背景和履历改为 mergeable。"
+                    if last_brief.get("priority_balance_passed") is False else ""
+                )
+                + "请重新通读原文，补齐爆点、完播、转发、评论、点赞、关注机制，"
                 "把遗漏的动作、原因、结果、人物关系、时间节点、画面与情绪细节补齐，"
-                "并重新给出明确叙事任务、覆盖全部素材卡且能支撑最终成稿达到原文 75% 的写作计划。"
+                "并重新给出明确叙事任务。资料卡不需要凑到原文 75%，也不得为凑卡片数量重复同一事件。"
             )
         payload = {
             "model": minimax_model(),
@@ -1167,7 +1431,7 @@ def request_minimax_rewrite_analysis(raw_script: str, api_key: str) -> dict:
             ],
             "temperature": 0.2,
             "top_p": 0.8,
-            "max_tokens": max(1600, min(4500, round(raw_len * 1.10))),
+            "max_tokens": max(4000, min(12000, round(raw_len * 2.2) + 1600)),
             "stream": False,
             "thinking": {"type": "disabled"},
             "response_format": {"type": "json_object"},
@@ -1206,7 +1470,7 @@ def request_minimax_rewrite_analysis(raw_script: str, api_key: str) -> dict:
         if isinstance(content, list):
             content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
         try:
-            parsed_analysis = json.loads(extract_json(str(content)))
+            parsed_analysis = parse_rewrite_analysis_json(str(content))
             last_brief = normalize_rewrite_fact_brief(parsed_analysis, raw_len)
             last_analysis_error = None
         except (json.JSONDecodeError, ValueError) as exc:
@@ -1217,25 +1481,19 @@ def request_minimax_rewrite_analysis(raw_script: str, api_key: str) -> dict:
         if attempt < MAX_REWRITE_ANALYSIS_ATTEMPTS:
             continue
         last_brief["analysis_warning"] = (
-            f"资料卡两次提炼后仍未达到建议密度：素材卡共 {last_brief.get('fact_item_count', 0)} 条，"
-            f"有效素材约 {last_brief.get('material_length', 0)} 字，"
+            f"资料卡两次提炼后仍未完全达到可用要求：素材卡共 {last_brief.get('fact_item_count', 0)} 条，"
             f"主人公名单 {len(last_brief.get('protagonists') or [])} 人。已使用当前较完整版本继续写作。"
         )
         return last_brief
     if last_brief:
         last_brief["analysis_warning"] = (
-            f"素材分析密度未完全达标：事实 {last_brief.get('fact_item_count', 0)}/{minimum_fact_items}，"
-            f"有效素材 {last_brief.get('material_length', 0)}/{minimum_material_length} 字，"
-            f"结构计划 {len(last_brief.get('section_plan') or [])}/4 段，"
+            f"素材分析未完全达标：事实卡 {last_brief.get('fact_item_count', 0)} 条（建议约 {minimum_fact_items} 条），"
+            f"结构计划 {len(last_brief.get('section_plan') or [])}/{last_brief.get('minimum_section_count', 1)} 段，"
             f"主人公名单 {len(last_brief.get('protagonists') or [])} 人。已使用当前最完整资料卡继续写作。"
         )
         return last_brief
     if last_analysis_error:
-        raise RuntimeError(
-            "MiniMax source analysis returned invalid JSON after "
-            f"{MAX_REWRITE_ANALYSIS_ATTEMPTS} analysis attempts: "
-            f"{type(last_analysis_error).__name__}: {last_analysis_error}"
-        ) from last_analysis_error
+        return fallback_rewrite_fact_brief(raw_script, last_analysis_error, protected_opening)
     raise RuntimeError("Rewrite analysis did not return a usable fact brief")
 
 
@@ -1250,33 +1508,38 @@ def build_rewrite_prompt(
     promotion_book_title: str = "国之脊梁",
 ) -> str:
     opening_hook = extract_opening_hook(raw_script, preserve_rule)
-    raw_len = content_length(raw_script)
     source_has_book_promotion = bool(re.search(
         r"(《[^》]+》|这本书|书里|书中|翻开|读完|买给孩子|下单|购买|小黄车|带书|卖书|推荐给家长)",
         raw_script,
     ))
     brief_promotion = (fact_brief or {}).get("book_promotion") or {}
     has_book_promotion = bool(brief_promotion.get("present", source_has_book_promotion))
+    promotion_details = {
+        "original_intent": str(brief_promotion.get("original_intent") or "").strip(),
+        "selling_points": brief_promotion.get("selling_points") or [],
+        "target_readers": brief_promotion.get("target_readers") or [],
+        "transition_angle": str(brief_promotion.get("transition_angle") or "").strip(),
+    }
     _, formatted_book_title = normalize_sales_book_title(promotion_book_title)
     if append_book_promotion:
         conversion_instruction = (
-            f"用户已主动开启结尾带书。最后一个自然段必须完成行动收束；在此之前，故事讲完后必须用最后 2 到 3 个自然段完成对{formatted_book_title}的价值塑造，"
-            "这部分必须表达完整并自然承接，不能只用一两句提到书名就草草结束，也不要重复表达。"
-            "先从本篇人物最具体的选择、代价或精神落点自然承接，把观众对这个人的情绪转到“还有更多这样的名字值得被看见”，不能突然切广告。"
-            "随后自然说清楚这本书能帮助读者看见什么、理解什么、记住什么；重点可以是课本来不及展开的真实人生、关键时刻的选择、一个国家底气背后的人，"
-            "但必须使用概括性表达，不能虚构书中具体人物、章节、故事数量、作者背书或装帧信息。"
-            "再把价值自然落到明确的读者理由和阅读场景，例如家长希望孩子建立榜样认知、成年人想补上对这些人物的了解、全家一起读并讨论选择与责任。"
-            "结尾用一句克制但有行动力的话收束，让人自然产生想把书带回家、自己读或和孩子一起读的冲动。"
-            "语言要像真诚推荐，不要喊口号，不要连续使用空泛的爱国大词；不要写“赶紧买”“点击小黄车”，也不要编造价格、优惠、稀缺性、赠品或购买渠道。"
+            f"用户已开启结尾带书。故事结束后，用最后 2 到 3 个自然段自然带出{formatted_book_title}："
+            "从人物的选择或代价过渡到书的价值，说明读者能看见什么以及适合谁读，最后用一句克制的行动表达收束。"
+            "不得虚构书中人物、章节、作者背书或装帧信息，不写价格、优惠、赠品、购买渠道和催单话术。"
         )
-        book_rewrite_permission = "用户已明确开启结尾带书，因此允许并必须重新设计完整的产品价值塑造与转化收束。"
     else:
         conversion_instruction = (
-            "原文包含带书或图书推荐内容，可以保留原有转化意图并重新表达，但不要扩大篇幅、不要改成硬广。"
+            "原文含带书内容：依据 book_promotion 中的 original_intent、selling_points、target_readers 和 transition_angle 保留原有转化意图并重新表达，不扩大篇幅，不写成硬广。"
+            f"原始转化资料：{json.dumps(promotion_details, ensure_ascii=False)}。"
             if has_book_promotion else
-            "原文不包含带书或图书推荐内容，改写稿也禁止主动添加书名、翻书、读书感受、买书、小黄车、家长购买或推荐给孩子等转化内容。结尾必须跟随原文主题自然收束。"
+            "原文不含带书内容：禁止主动添加书名、阅读感受、购买或推荐话术，按故事主题自然收束。"
         )
-        book_rewrite_permission = "只有原文包含带书内容时，才可以重新设计其表达方式。"
+    timeline_verified = (fact_brief or {}).get("timeline_verified") is not False
+    chronology_instruction = (
+        "资料卡时间线已经核验。固定开头之后按 material_cards 的 id 从小到大、按真实时间从早到晚推进。"
+        if timeline_verified else
+        "这是保底资料卡，卡片 id 仅代表原文出现顺序，不代表真实时间。先依据 time、人物年龄、事件因果和明确年份恢复真实时间线，再从早到晚写作；不得照抄卡片编号顺序。"
+    )
     retry_instruction = ""
     if previous:
         comparison = previous.get("rewrite_comparison") or {}
@@ -1317,6 +1580,35 @@ def build_rewrite_prompt(
                 "不得使用“先说、再说、最后说”“第一、第二、第三”或“接下来我们来看”等写作框架，"
                 "必须让事件通过人物、时间、动作和因果自然衔接。"
             )
+        if comparison.get("timeline_order_passed") is False:
+            issues = comparison.get("timeline_order_issues") or []
+            issue_text = "；".join(
+                str(item.get("reason") or item.get("issue") or item)
+                for item in issues[:8]
+                if isinstance(item, dict)
+            )
+            retry_instruction += (
+                f"\n【本轮必须修正时间线】{issue_text or '上一版没有按素材卡编号顺叙'}。"
+                + (
+                    "固定开头之外，从最早的素材卡开始，严格按编号从小到大推进；"
+                    if timeline_verified else
+                    "卡片编号未经时间核验，不得照编号写；先根据年份、年龄和因果恢复真实时间，再从早到晚推进；"
+                )
+                + "不得提前透露后期结果，不得讲到后期再跳回早年。"
+            )
+        if comparison.get("emotional_quality_passed") is False:
+            issues = comparison.get("emotional_issues") or []
+            issue_text = "；".join(
+                str(item.get("reason") or item.get("issue") or item)
+                for item in issues[:8]
+                if isinstance(item, dict)
+            )
+            retry_instruction += (
+                f"\n【本轮必须补足情感递进】{issue_text or '上一版只交代事实，没有写出关键代价和关系变化'}。"
+                "回到 emotional_arc 和素材卡中的 emotional_stakes、relationship_change，"
+                "用人物动作、他人反应、选择和实际后果形成3到5个关键情感节点；短文1到3个即可。"
+                "不得添加资料卡没有的哭泣、内心独白、台词或心理活动，也不要靠形容词和金句硬煽情。"
+            )
         if comparison.get("fact_coverage_passed") is False:
             missing_cards = comparison.get("missing_fact_cards") or []
             missing_text = "\n".join(
@@ -1333,114 +1625,28 @@ def build_rewrite_prompt(
     fact_brief_json = json.dumps(fact_brief or {}, ensure_ascii=False, indent=2)
     creative_guidelines = load_rewrite_creative_guidelines()
     prompt = f"""
-你是一名视频号爆款短视频文案改写专家，擅长改写卖书类、历史人物类、大国情绪类、爱国教育类短视频口播文案。
+你是一名短视频口播文案编剧。请只依据事实资料卡，独立创作一篇适合视频号发布的完整文案。你看不到原文正文，也不要猜测原文句式；系统会在生成后检查事实覆盖、篇幅和重复率。
 
-这是两步创作流程的第二步。事实编辑已经通读完整原文，核对并提炼出语言中性、按真实时间排序的事实资料卡。你不能看到原文正文，也不得猜测或还原原文句式；必须只根据资料卡独立构思、独立写作。系统会在生成后另行使用原文恢复固定开头并检查重复率。
-请重新创作适合视频号发布的完整文案。事实资料卡已经完成内容筛选；凡进入资料卡的信息，无论属于主线、背景还是同类事实，都不能压缩或省略。成稿有效字数不得低于原文有效字数的 75%；补足篇幅必须展开资料卡中的事实、原因、结果、动作、代价和关键画面，不能填充空话或重复评价。
+【资料卡约定】
+- 用 core_subject、core_conflict 和 section_plan 确定主线；viral_analysis.opening_continuation 只指导固定开头后的承接。
+- 时间线：{chronology_instruction}只有固定开头本身位于后期结果时，才允许用一句承接语回到最早节点，之后始终顺叙。
+- emotional_arc 用卡片编号标出关键情感节点；结合对应卡片的 emotional_stakes 和 relationship_change 克制展开，不得虚构内心。
 
-【写作前必须使用第一步分析】
-1. 先读取 viral_analysis，理解原文的停留爆点、完播机制、情绪曲线、转发价值以及评论、点赞、关注理由；不要只读取 timeline 和 facts。
-2. 再读取 core_subject、section_plan 和按时间排序的 material_cards，确定主角、核心冲突和顺叙主线；只服从叙事任务、事实完整和成稿不得低于原文 75% 的要求，不机械分配各段字数。
-3. material_cards 是唯一的事实写作素材。把动作、条件、因果、画面和人物代价写进正文，不能把素材卡重新压缩成摘要，也不能自行补充资料卡没有的事实。
-4. 只复用 viral_analysis 总结的有效内容机制，不接触、不模仿原文句子。必须独立设计自然的表达和段落组织，不要为了差异化强行换词或故意说反常的话。
-5. 转发、评论、点赞、关注理由要融进观点、冲突和情绪落点；只在合适位置使用一次自然互动引导，禁止机械喊“点赞关注转发”。
-6. 固定开头之后默认顺叙：只允许回到一次最早的必要时间节点，随后严格沿 material_cards 的真实时间顺序向前推进直到结尾。禁止反复倒叙、插叙、跨年代来回跳，也不要连续横向扩展背景、评价或旁支而不推进主线。
-7. 突发疾病、死亡、事故、被捕、离婚等命运事件先单独交代，再写人物应对。不能把事件吞进“某事后他……”的时间状语中，写出仿佛坏事理所当然会发生的语气；要保留“事件突然发生 → 人物主动应对”的因果和力度。
-
-【二创文案创作规则】
-以下规则来自项目的《二创提示词》，必须执行。它规定创作方法；本提示词后续给出的固定开头、事实资料卡、带书开关和 JSON 输出要求属于本次任务的具体约束，优先级更高。
+【核心创作规则】
 {creative_guidelines}
 
-【最重要要求】
-原文第一句话是默认固定开头；如果用户主动框选了更长的开头，则以用户选定范围为准。固定开头必须一字不改保留，不允许改字、不允许换词、不允许调整顺序、不允许删减。
-你只能从这段受保护内容之后开始创作。即使你判断开头不够好，也不能擅自改动。
-必须原样保留的开头是：{opening_hook}
+【本次任务】
+- 文案风格：{style}
+- 第 {attempt} 次生成
+- 固定开头必须一字不改并单独成段：{opening_hook}
+- 后续正文必须自然承接固定开头，不能另起钩子；固定开头不参与重复率和总体重构度计算。
+- 带书规则：{conversion_instruction}
+{retry_instruction}
 
-【固定开头后的连续叙事】
-固定开头单独保留，不要求它独立构成完整画面，也不得为了排版删改或拆碎。后续正文必须自然承接固定开头，不能另起一个开头。
-固定开头之后必须根据 core_subject、section_plan 和 material_cards 独立写作。原文的真实时间线和合理叙事骨架可以保留，但不能沿着原文逐句寻找同义词。
-固定开头后的第一句必须承担过渡作用，让观众知道后文和开头是同一个故事。主人公姓名应服从自然叙事，不硬性规定必须在第几句出现。后续事实按资料卡真实时间排序，场景组合、详略、转折表达和情绪递进则独立设计。
-禁止在固定开头后再次使用“谁能想到”“你敢相信吗”“很多人不知道”“他到底是谁”等二次钩子来重启文案；也不要长时间只用代词隐藏同一个人物。需要转入人物早年时，必须写成承接上文的一次性回溯，之后持续顺叙。
-例如固定开头以“妻子追出来说了一番话，把他感动得老泪纵横”结束，而原文接下来转入他早年的经历，可以写“而这场迟到了四十二年的重逢，还要从他当年离开广东说起”，不能直接写“谁能想到，一个广东读书人……”另起一个开头。
-
-【改写目标】
-保留原文的短视频味道，不要改成书面文章。
-改写后的文案要像一个懂视频号的人在口播，而不是像公众号社论、新闻评论、AI润色稿、学生作文。
-整体风格要：口语化、有网感、有情绪、有画面、有节奏、有冲突。
-表达要狠、有攻击性、有爽感，但必须来自真实处境、动作、冲突和结果，自然、具体、有分寸；不要为了显得狠而堆狠话或强行挑衅。
-不要追求文采高级，要追求用户愿意听下去、愿意点赞、愿意评论、愿意转发。
-
-【只允许原样保留的内容】
-1. 只有固定开头必须逐字保留；未手动选择时固定开头就是原文第一句话，用户手动选择时以选定范围为准。
-2. 人名、地名、年份、数字、事件等客观事实可以保留，但承载这些事实的句子必须重新表达。
-3. 除固定开头和无法改写的专有名词外，原文中的完整句子、金句、狠话、过渡句、情绪表达和带书话术都不要照抄。
-4. 必须保留客观事实、真实时间关系和因果关系；正文按照资料卡时间顺序推进，但句式、段落功能、叙述落点和转折表达必须独立设计。
-
-【独立表达：把事实资料卡当素材库】
-1. 禁止“读一句、换一种说法”；必须根据资料卡重新组织句子和场景表达，但原文合理的真实时间线和叙事骨架可以保留。
-2. 先找出全文最值得讲的核心冲突和人物选择，以它为主轴；资料卡中的背景、履历和评价也必须完整保留，但应融入事件与因果，不能写成脱离主线的百科介绍。
-3. 可以把资料卡中属于同一时间节点、同一事件的内容合并到同一场景，但每张卡里的事实、原因、结果、动作、数字、人物代价和关键画面都必须完整保留；不得把后面的结果提前、把必要背景延后或调换事件顺序，不能篡改真实时间、因果和事实。
-4. 每一段都要有新的叙述任务：推进冲突、揭示代价、制造反差、补关键证据或完成情绪转折。
-5. 使用新的句式、新的观察角度、新的场景切入和新的转折。不要保留原文的金句、排比、设问、比喻、段尾结论和情绪口号。
-6. 输出前在心里做一次“遮住原文测试”：如果读者能明显看出新稿是在沿着原文一句句改，应回到资料卡重新组织重合部分的表达；不要求为了差异推翻合理的真实时间线或叙事骨架。
-
-【禁止事项】
-不要做简单同义词替换。
-不要把口语改成书面语。
-不要把“咱妈、塞铁、刷666、小鱼小虾、你可以试试、护筷子”这类短视频表达全部洗掉。
-不要使用过多书面词，例如：悍然、方知、伟岸、至此、乃、赴汤蹈火、径直、再至、苍生、星光、抉择、壮烈史诗、强国气场、脱胎换骨、恩重如山。
-不要频繁使用空泛大词，例如：伟大、震撼、辉煌、底蕴、史诗、精神源泉、民族脊梁、大国情怀。这些词可以少量使用，但不能堆。
-不要把文案改成端着的播音腔。
-不要一上来介绍背景，不要平铺直叙。
-固定开头不受“必须是爆点、冲突、结果、反差或悬念”的要求约束，因为它必须原样保留。固定开头后的新正文不要用与当前故事无关的背景、环境、天气、时代或氛围重新起头。
-固定开头后的第一句不要生硬套用“在那个年代”“当时的环境”“故事要从某年说起”。需要按原文结构转入背景时，要先建立它与固定开头的联系，再自然过渡。
-不要削弱原文的爽感、反差感和情绪冲击。
-不要在正文中使用“先说……再说……最后说……”“第一……第二……第三……”等提纲式、步骤式结构，也不要用“接下来我们来看”“下面再讲”暴露写作框架。事件之间必须靠人物、时间、动作和因果自然承接。
-
-【短视频改写原则】
-一、句子要短。适合真人口播。能用短句就不要用长句。能用人话就不要用书面话。
-二、表达要狠。该硬的地方要硬。比如：“你可以试试敢不敢将它击落。”这种句子不要改成：“那便试试看是否敢于动用武力击落。”
-三、要有画面。多保留或强化具体画面：飞机起飞、国旗铺满街道、地图包围、旧照片、病房电脑、公文包、胶鞋、行李箱、实验室灯光、戈壁风沙。少写抽象评价。
-四、要有情绪递进。固定开头保持不变，后文围绕核心冲突沿真实时间线推进，在不调换事实节点的前提下重新设计详略、转折表达和情绪爆发。
-五、带书内容跟随原文：{conversion_instruction}
-
-【分段要求】
-固定开头单独保留，不要求它独立构成完整画面，也不得为了排版删改或拆碎。
-从固定开头后的第一句话开始，按完整画面组织自然段。每段应对应一个完整画面，方便后续 AI 配图、素材搜索和剪映剪辑；同一人物、同一时间地点、同一连续动作应尽量放在一段。
-段落长度服从画面和语义完整性，不能为了达到全文最低篇幅硬拆画面或填充空话；只有出现时间、地点、人物动作、画面主体或情绪节点变化时才换段。
-一个自然段内部不要换行，段落之间使用空行分隔。
-换段标准是：时间变化、地点变化、人物动作变化、画面主体变化、情绪节点变化。
-不要按朗读断句分段，而要按画面分段。
-不要在 rewritten_script 中添加 [1]、[2] 等序号，序号由前端界面展示。
-
-【改写尺度】
-不是洗稿式同义替换。应依据资料卡独立组织表达，但不要求为了追求差异推翻合理的真实时间线或叙事骨架。
-可以删掉重复啰嗦的句子。
-可以强化画面感和冲突感。
-固定开头之后的句子、场景衔接和转折表达必须独立完成；事实按资料卡的真实时间顺序推进，不要求重建合理叙事骨架，也不为追求结构差异反复调换时间节点。
-可以在不改变事实主体、真实时间关系和因果关系的前提下更换叙述视角；{book_rewrite_permission}
-除固定开头外，不得连续照抄原文句子；不得只靠换词、增删标点或重新分段制造改写效果。
-
-【内容完整和质量约束】
-rewritten_script 的有效字数不得低于原文有效字数的 75%。事实资料卡中的全部内容都不能压缩或省略；补足篇幅时必须展开卡片中的原因、结果、动作、代价和画面，不得凑空话。
-不要压缩成摘要、提纲或只剩结论的短版解说。
-事实边界：不虚构；不添加没有依据的具体时间、地点、人物关系；人物、年代、事件、因果关系必须保留。
-除必须原样保留的固定开头、专有名词、年份、数字和固定称谓之外，整体表达必须重新组织。
-系统检查固定开头之后的正文；固定开头不参与重复率和总体重构度计算。正文总体重构度应达到 {MIN_REWRITE_DIFFERENCE}% 以上，连续照抄率不得超过 {MAX_REWRITE_CONTINUOUS_REUSE}%，原文六字短语复用率不得超过 {MAX_REWRITE_SOURCE_PHRASE_REUSE}%，逐句模仿率不得超过 {MAX_REWRITE_SENTENCE_IMITATION}%。
-新增一两句话、增加段落、换行、调整标点、调换少量句子都不能稀释这些指标。未达标时系统最多生成三次，三次后返回其中质量最好且内容完整的一版并明确提示，不会无限重写。
-人名、地点、年份和事实关键词的正常重合只单独展示，不计入差异度；不要为了降低关键词重合而篡改事实。
-不能通过加句、换行、调整标点、段落错位或同义词替换伪造差异；固定开头之后的正文必须让读者明显感到作者重新构思、重新组织、重新讲述了一遍。
-
-【本次生成信息】
-文案风格：{style}。
-这是第 {attempt} 次生成。{retry_instruction}
-
-【输出要求】
-只返回可解析 JSON，字段必须包含 title, hook, rewritten_script, script_style。
-rewritten_script 字段里只能放改写后的完整文案正文，禁止包含原文、原始文案、对照稿、解释、标题标签或“二创口播稿：”这类前缀。
-不要先输出一遍原文再输出二创稿，也不要把原文和二创内容混在一起。
-输出前自检固定开头与第一句新正文：如果第一句像与前文无关的新钩子，或像同一人物第一次出场一样重新介绍，必须在不改变事实与因果关系的前提下重写成自然过渡。
-输出前检查分段：除固定开头外，每段必须是完整画面；不能为了任何字数目标拆散连续画面或扩写空话。
+【输出】
+只返回可解析 JSON，字段为 title、hook、rewritten_script、script_style。
+rewritten_script 只能包含完整成稿正文，不得混入原文、分析、说明、标题标签或段落序号。
+输出前自检：固定开头是否原样保留；事实是否按真实时间顺叙；must 卡是否完整进入且 mergeable 卡是否合理合并；关键代价和关系变化是否形成克制的情绪递进；正文是否按完整画面分段并达到原文有效字数的 75%。
 
 【事实资料卡】
 <fact_brief>{fact_brief_json}</fact_brief>
@@ -1452,11 +1658,16 @@ def request_minimax_rewrite_fact_coverage(
     fact_brief: dict,
     rewritten_script: str,
     api_key: str,
+    protected_opening: str = "",
 ) -> dict:
     cards = fact_brief.get("material_cards")
     if not isinstance(cards, list) or not cards:
         return {
             "fact_coverage_passed": True,
+            "timeline_order_passed": True,
+            "timeline_order_issues": [],
+            "emotional_quality_passed": True,
+            "emotional_issues": [],
             "covered_fact_cards": [],
             "expected_fact_cards": 0,
             "missing_fact_cards": [],
@@ -1468,32 +1679,43 @@ def request_minimax_rewrite_fact_coverage(
         "protagonists": fact_brief.get("protagonists", []),
         "protagonist_relationship": fact_brief.get("protagonist_relationship", ""),
         "material_cards": cards,
+        "emotional_arc": fact_brief.get("emotional_arc", []),
+        "timeline_verified": fact_brief.get("timeline_verified") is not False,
         "must_preserve_terms": fact_brief.get("must_preserve_terms", []),
     }
-    prompt = f"""你是短视频人物文案的事实覆盖审稿员。请逐条对照事实资料卡和二创成稿，只判断事实是否完整进入成稿，不评价文采，也不要因为换了说法就判定缺失。
+    prompt = f"""你是短视频人物文案的事实与时间线审稿员。请逐条对照事实资料卡和二创成稿，判断事实是否完整，并检查固定开头之后是否按素材卡编号顺叙。不评价文采，也不要因为换了说法就判定缺失。
 
 审核标准：
-1. 每张 material_cards 都必须在成稿中找到明确对应；允许合并到同一段，但不能只剩模糊结论。
-2. 卡片中的事件、人物、原因、结果、关键数字、人物动作、代价和能形成画面的关键细节，缺少任何关键部分都标记 partial。
+1. 事实覆盖要检查完整成稿，包括 protected_opening。priority=must 的卡必须在成稿中找到完整对应；如果固定开头已经完整表达某张卡，就直接标记 covered，不得要求正文重复。其中的事件、人物、原因、结果、关键数字、人物动作、代价和关键细节，缺少关键部分就标记 partial。
+2. priority=mergeable 的卡允许与相邻同类卡合并概括，不要求逐项展开细节；只要核心事实方向已经表达就标记 covered，完全没有表达才标记 missing。
 3. 完全没有对应内容标记 missing。只有主要事实和关键细节均已表达，才标记 covered。
 4. 不以篇幅长短直接判定；删掉重复评价不算遗漏，但不得把具体事实压成抽象评价。
-5. 必须逐张审核，不能漏掉编号。只输出 JSON，不使用 Markdown。
+5. protected_opening 只排除时间顺序审查，不排除事实覆盖审查。timeline_verified=true 时，从固定开头后的正文开始，各素材卡第一次实质出现的顺序应当从小到大；timeline_verified=false 时，不按卡片编号判断，而要根据卡片时间、人物年龄和事件因果判断正文是否从早到晚。同一事件的相邻卡可以合并，但后期结果提前出现、讲到后期又返回早年，都判定为乱序。
+6. 只有固定开头本身已经位于后期结果时，紧接固定开头的一句回溯承接不算乱序；回到最早节点之后必须始终顺叙。
+7. 再检查情感质量：如果素材卡提供了 emotional_stakes 或 relationship_change，成稿不能只写事件结论，必须用有依据的动作、关系反应、选择或实际后果让观众感受到代价。长文通常应形成3到5个、短文1到3个清晰但克制的情感节点。
+8. 不得因为缺少形容词、哭泣或内心独白就判定情感不足；也不得接受脱离资料卡的煽情、虚构心理、虚构台词和连续金句。没有任何情感素材时，emotional_quality_passed 应为 true。
+9. 必须逐张审核，不能漏掉编号。只输出 JSON，不使用 Markdown。
 
 输出格式：
 {{
   "covered_cards": [1, 2],
   "partial_cards": [{{"card": 3, "missing": "缺少的原因、结果、动作或关键细节"}}],
   "missing_cards": [{{"card": 4, "missing": "整项事件未出现"}}],
+  "timeline_order_passed": true,
+  "out_of_order_cards": [],
+  "emotional_quality_passed": true,
+  "emotional_issues": [],
   "summary": "一句话总结"
 }}
 
 <fact_brief>{json.dumps(audit_input, ensure_ascii=False)}</fact_brief>
+<protected_opening>{protected_opening}</protected_opening>
 <rewritten_script>{rewritten_script}</rewritten_script>
 """
     payload = {
         "model": minimax_model(),
         "messages": [
-            {"role": "system", "content": "你只做逐项事实覆盖审查，只输出可解析 JSON。"},
+            {"role": "system", "content": "你只做事实覆盖、时间顺序和情感递进审查，只输出可解析 JSON。"},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.1,
@@ -1535,7 +1757,7 @@ def rewrite_script_with_minimax(
 ) -> dict:
     raw_len = content_length(raw_script)
     try:
-        fact_brief = request_minimax_rewrite_analysis(raw_script, api_key)
+        fact_brief = request_minimax_rewrite_analysis(raw_script, api_key, preserve_rule)
     except RewriteGenerationError:
         raise
     except Exception as exc:
@@ -1543,11 +1765,13 @@ def rewrite_script_with_minimax(
     best_result: dict | None = None
     last_result: dict | None = None
 
-    def candidate_rank(candidate: dict) -> tuple[int, int, int, int, int, int, int]:
+    def candidate_rank(candidate: dict) -> tuple[int, int, int, int, int, int, int, int, int]:
         metrics = candidate.get("rewrite_comparison") or {}
         return (
             int(bool(metrics.get("passed"))),
             int(metrics.get("fact_coverage_passed") is not False),
+            int(metrics.get("timeline_order_passed") is not False),
+            int(metrics.get("emotional_quality_passed") is not False),
             int(bool(metrics.get("length_passed"))),
             int(metrics.get("outline_structure_passed") is not False),
             int(metrics.get("overall_difference") or 0),
@@ -1564,6 +1788,7 @@ def rewrite_script_with_minimax(
             result = request_minimax_rewrite(
                 prompt, raw_script, style, api_key, raw_len, preserve_rule,
                 append_book_promotion, promotion_book_title,
+                fact_brief.get("verified_quotes") or [],
             )
         except Exception as exc:
             if best_result:
@@ -1586,10 +1811,15 @@ def rewrite_script_with_minimax(
                 fact_brief,
                 str(result.get("rewritten_script") or ""),
                 api_key,
+                extract_opening_hook(raw_script, preserve_rule),
             )
         except Exception as exc:
             coverage = {
                 "fact_coverage_passed": False,
+                "timeline_order_passed": False,
+                "timeline_order_issues": [{"reason": "时间顺序审稿调用失败"}],
+                "emotional_quality_passed": False,
+                "emotional_issues": [{"reason": "情感递进审稿调用失败"}],
                 "covered_fact_cards": [],
                 "expected_fact_cards": len(fact_brief.get("material_cards") or []),
                 "missing_fact_cards": [{
@@ -1637,11 +1867,12 @@ def request_minimax_rewrite(
     preserve_rule: str = "auto",
     append_book_promotion: bool = False,
     promotion_book_title: str = "国之脊梁",
+    verified_quotes: list[str] | None = None,
 ) -> dict:
     payload = {
         "model": minimax_model(),
         "messages": [
-            {"role": "system", "content": "你只输出可解析 JSON。除固定开头外，只依据事实资料卡独立写作，不接触或模仿原文。原文第一句话或用户选定的固定开头必须原样保留。主人公姓名服从自然叙事，不硬性规定必须在第几句出现。成稿有效字数不得低于原文的 75%，资料卡中的每项内容都不得压缩或省略。固定开头后只允许一次必要回溯，随后按资料卡真实时间顺叙到底。突发事件与人物应对分开交代。固定开头单独保留，不要求它独立构成完整画面，也不得为了排版删改或拆碎；后续正文每个自然段必须对应一个完整画面，不能为达到字数硬拆画面或填充空话。正文不得出现“先说、再说、最后说”或“第一、第二、第三”等提纲式结构。一个自然段内部不要换行，段落之间使用空行，不要在正文中添加段落序号。"},
+            {"role": "system", "content": "你是短视频口播文案编剧。严格执行用户提供的事实资料卡、固定开头和创作规则，只输出可解析 JSON。"},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.65,
@@ -1674,7 +1905,8 @@ def request_minimax_rewrite(
     result = json.loads(extract_json(str(content)))
     result["rewrite_provider"] = minimax_model()
     return normalize_rewrite_result(
-        result, raw_script, style, preserve_rule, append_book_promotion, promotion_book_title
+        result, raw_script, style, preserve_rule, append_book_promotion, promotion_book_title,
+        verified_quotes,
     )
 
 

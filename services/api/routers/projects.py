@@ -13,6 +13,47 @@ from services.text_service import RewriteGenerationError, RewriteQualityError, c
 from services.web_image_pipeline import DONE_STATUSES, recover_interrupted_searches
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
+DEFAULT_PROMOTION_BOOK_TITLE = "国之脊梁"
+
+
+def normalize_promotion_book_title(value: object) -> str:
+    title = str(value or "").strip().strip("《》").strip()
+    if not title:
+        raise HTTPException(400, "Promotion book title must not be empty")
+    if len(title) > 60:
+        raise HTTPException(400, "Promotion book title must not exceed 60 characters")
+    return title
+
+
+def promotion_book_titles(db: dict) -> list[str]:
+    titles = [DEFAULT_PROMOTION_BOOK_TITLE]
+    titles.extend(db.get("promotion_books") or [])
+    titles.extend(project.get("promotion_book_title") for project in db.get("projects", []))
+    normalized = []
+    seen = set()
+    for value in titles:
+        try:
+            title = normalize_promotion_book_title(value)
+        except HTTPException:
+            continue
+        key = title.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(title)
+    return normalized
+
+
+def register_promotion_book_title(db: dict, value: object) -> tuple[str, bool]:
+    title = normalize_promotion_book_title(value)
+    existing = next(
+        (item for item in promotion_book_titles(db) if item.casefold() == title.casefold()),
+        None,
+    )
+    if existing is not None:
+        return existing, False
+    db.setdefault("promotion_books", []).append(title)
+    return title, True
 
 
 class ProjectCreate(BaseModel):
@@ -22,6 +63,7 @@ class ProjectCreate(BaseModel):
     script_style: str = "纪实故事型"
     voice_style: str = "沉稳男声"
     video_ratio: str = "9:16"
+    promotion_book_title: str = DEFAULT_PROMOTION_BOOK_TITLE
 
 
 class ScriptUpdate(BaseModel):
@@ -45,7 +87,11 @@ class RewritePayload(BaseModel):
     opening_preserve_rule: str = "auto"
     opening_preserve_chars: int | None = None
     append_book_promotion: bool = False
-    promotion_book_title: str = "国之脊梁"
+    promotion_book_title: str = DEFAULT_PROMOTION_BOOK_TITLE
+
+
+class PromotionBookCreate(BaseModel):
+    title: str
 
 
 @router.get("")
@@ -72,6 +118,7 @@ def create_project(payload: ProjectCreate):
     db = load_db()
     now = datetime.now().isoformat(timespec="seconds")
     project_id = str(uuid4())
+    promotion_book_title = normalize_promotion_book_title(payload.promotion_book_title)
     project = {
         "id": project_id,
         "name": payload.name or infer_title(payload.raw_script),
@@ -81,11 +128,13 @@ def create_project(payload: ProjectCreate):
         "script_style": payload.script_style,
         "voice_style": payload.voice_style,
         "video_ratio": payload.video_ratio,
+        "promotion_book_title": promotion_book_title,
         "status": "created",
         "archived": False,
         "created_at": now,
         "updated_at": now,
     }
+    register_promotion_book_title(db, promotion_book_title)
     db["projects"].append(project)
     save_db(db)
     project_dir(project_id)
@@ -102,6 +151,21 @@ def generate_ai_script(payload: AiScriptPayload | None = None):
     except Exception as exc:
         raise HTTPException(502, f"AI script generation failed: {exc}") from exc
     return {"status": "success", **result}
+
+
+@router.get("/promotion-books")
+def list_promotion_books():
+    db = load_db(copy_data=False)
+    return {"books": [f"《{title}》" for title in promotion_book_titles(db)]}
+
+
+@router.post("/promotion-books")
+def create_promotion_book(payload: PromotionBookCreate):
+    db = load_db()
+    title, created = register_promotion_book_title(db, payload.title)
+    if created:
+        save_db(db)
+    return {"title": f"《{title}》", "books": [f"《{item}》" for item in promotion_book_titles(db)]}
 
 
 @router.get("/{project_id}")
@@ -181,11 +245,9 @@ def rewrite(project_id: str, payload: RewritePayload | None = None):
             preserve_rule = (payload.opening_preserve_rule if payload else "auto")
         if preserve_rule not in {"auto", "first_sentence", "first_paragraph"} and not preserve_rule.startswith("chars_"):
             raise HTTPException(400, "Invalid opening preserve rule")
-        promotion_book_title = str(payload.promotion_book_title if payload else "国之脊梁").strip().strip("《》").strip()
-        if not promotion_book_title:
-            promotion_book_title = "国之脊梁"
-        if len(promotion_book_title) > 60:
-            raise HTTPException(400, "Promotion book title must not exceed 60 characters")
+        promotion_book_title = normalize_promotion_book_title(
+            payload.promotion_book_title if payload else DEFAULT_PROMOTION_BOOK_TITLE
+        )
         append_book_promotion = bool(payload and payload.append_book_promotion)
         result = rewrite_script(
             project["raw_script"],
@@ -208,9 +270,14 @@ def rewrite(project_id: str, payload: RewritePayload | None = None):
     project["rewrite_comparison"] = result.get("rewrite_comparison", {})
     project["rewrite_difference"] = result.get("rewrite_difference", 0)
     project["rewrite_attempts"] = result.get("rewrite_attempts", 1)
+    fact_brief = result.get("rewrite_fact_brief") or {}
+    project["rewrite_verified_quotes"] = (
+        fact_brief.get("verified_quotes", []) if isinstance(fact_brief, dict) else []
+    )
     project["opening_preserve_rule"] = preserve_rule
     project["opening_preserve_chars"] = payload.opening_preserve_chars if payload else None
     project["append_book_promotion"] = append_book_promotion
+    register_promotion_book_title(db, promotion_book_title)
     project["promotion_book_title"] = promotion_book_title
     project["status"] = "script_ready"
     project["updated_at"] = datetime.now().isoformat(timespec="seconds")
@@ -234,7 +301,12 @@ def merge_script_paragraphs(project_id: str, payload: MergeParagraphsPayload):
         raise HTTPException(500, "Paragraph merge unexpectedly changed script content")
     raw_script = project.get("raw_script", "")
     protected_opening = extract_opening_hook(raw_script, project.get("opening_preserve_rule", "auto"))
-    comparison = compare_scripts(raw_script, merged, protected_opening)
+    comparison = compare_scripts(
+        raw_script,
+        merged,
+        protected_opening,
+        project.get("rewrite_verified_quotes") or [],
+    )
     project["rewritten_script"] = merged
     project["rewrite_comparison"] = comparison
     project["rewrite_difference"] = comparison["overall_difference"]
@@ -266,7 +338,12 @@ def update_script(project_id: str, payload: ScriptUpdate):
         project["rewritten_script"] = payload.rewritten_script
         raw_script = project.get("raw_script", "")
         protected_opening = extract_opening_hook(raw_script, project.get("opening_preserve_rule", "auto"))
-        comparison = compare_scripts(raw_script, payload.rewritten_script, protected_opening)
+        comparison = compare_scripts(
+            raw_script,
+            payload.rewritten_script,
+            protected_opening,
+            project.get("rewrite_verified_quotes") or [],
+        )
         project["rewrite_comparison"] = comparison
         project["rewrite_difference"] = comparison["overall_difference"]
         project["status"] = "script_ready"

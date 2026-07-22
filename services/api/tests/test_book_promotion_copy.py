@@ -22,12 +22,11 @@ class BookPromotionCopyTests(unittest.TestCase):
         )
 
         self.assertIn("最后 2 到 3 个自然段", prompt)
-        self.assertIn("这部分必须表达完整并自然承接", prompt)
         self.assertNotIn("140 到 220 个中文字符", prompt)
-        self.assertIn("自然说清楚这本书能帮助读者看见什么", prompt)
-        self.assertIn("明确的读者理由和阅读场景", prompt)
-        self.assertIn("自然产生想把书带回家", prompt)
-        self.assertIn("允许并必须重新设计完整的产品价值塑造", prompt)
+        self.assertIn("从人物的选择或代价过渡到书的价值", prompt)
+        self.assertIn("说明读者能看见什么以及适合谁读", prompt)
+        self.assertIn("克制的行动表达收束", prompt)
+        self.assertIn("不得虚构书中人物、章节、作者背书或装帧信息", prompt)
 
     def test_fallback_promotion_is_more_than_a_book_name_mention(self) -> None:
         promoted = ensure_rewrite_book_promotion("故事正文。", True, "国之脊梁")

@@ -23,6 +23,7 @@ DEFAULT_DB: dict[str, Any] = {
     "project_assets": [],
     "generated_assets": [],
     "music_library": [],
+    "promotion_books": ["国之脊梁"],
     "asset_library": None,
     "web_image_failures": [],
     "web_image_diagnostics": [],

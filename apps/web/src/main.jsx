@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Archive, Check, Copy, Crop, Download, Eraser, Film, FolderOpen, ImagePlus, Library, Mic, Music, RefreshCw, Save, Scissors, Search, Tags, Trash2, Wand2 } from 'lucide-react';
+import { Archive, Check, Copy, Crop, Download, Eraser, Film, FolderOpen, ImagePlus, Library, Mic, Music, Plus, RefreshCw, Save, Scissors, Search, Tags, Trash2, Wand2, X } from 'lucide-react';
 import './styles.css';
 
 const API = import.meta.env.VITE_API_URL ?? (import.meta.env.DEV ? 'http://127.0.0.1:8000' : '');
@@ -15,6 +15,11 @@ const VOICE_OPTIONS = [
   { value: 'zh_female_vv_uranus_bigtts', label: '女声 · 清晰自然' },
   { value: 'S_6Sd6jOE42', label: '王立群' },
 ];
+
+function formatPromotionBookTitle(value) {
+  const title = String(value || '').trim().replace(/^《|》$/g, '').trim();
+  return title ? `《${title}》` : DEFAULT_PROMOTION_BOOK;
+}
 
 async function request(path, options = {}) {
   const res = await fetch(`${API}${path}`, options);
@@ -268,8 +273,11 @@ function App() {
   const [openingPreserveChars, setOpeningPreserveChars] = useState(0);
   const [appendBookPromotion, setAppendBookPromotion] = useState(false);
   const [promotionBookTitle, setPromotionBookTitle] = useState(
-    () => window.localStorage.getItem(PROMOTION_BOOK_STORAGE_KEY) || DEFAULT_PROMOTION_BOOK,
+    () => formatPromotionBookTitle(window.localStorage.getItem(PROMOTION_BOOK_STORAGE_KEY)),
   );
+  const [promotionBooks, setPromotionBooks] = useState([DEFAULT_PROMOTION_BOOK]);
+  const [addingPromotionBook, setAddingPromotionBook] = useState(false);
+  const [newPromotionBookTitle, setNewPromotionBookTitle] = useState('');
   const [voiceType, setVoiceType] = useState(VOICE_OPTIONS[0].value);
   const [speechRate, setSpeechRate] = useState(0);
   const [voicePreviewUrl, setVoicePreviewUrl] = useState('');
@@ -411,17 +419,19 @@ function App() {
   }
 
   async function refreshAll(id = projectId) {
-    const [projectList, assetList, libraryData, musicData, projectData] = await Promise.all([
+    const [projectList, assetList, libraryData, musicData, promotionBookData, projectData] = await Promise.all([
       request('/api/projects'),
       request('/api/assets'),
       request('/api/assets/library'),
       request('/api/assets/music'),
+      request('/api/projects/promotion-books'),
       id ? request(`/api/projects/${id}`) : Promise.resolve(null),
     ]);
     setProjects(projectList.projects);
     setAssets(assetList.assets);
     setLibrary(validLibrary(libraryData.library) ? libraryData.library : null);
     setMusicLibrary(musicData.music || []);
+    setPromotionBooks(promotionBookData.books?.length ? promotionBookData.books : [DEFAULT_PROMOTION_BOOK]);
     if (projectData) {
       setProject(projectData.project);
       setShots(projectData.shots);
@@ -477,6 +487,9 @@ function App() {
     if (!project) return;
     setProjectNameDraft(project.name || '');
     setAppendBookPromotion(Boolean(project.append_book_promotion));
+    setPromotionBookTitle(formatPromotionBookTitle(
+      project.promotion_book_title || window.localStorage.getItem(PROMOTION_BOOK_STORAGE_KEY),
+    ));
     setTitleLine1(project.title_line1 || '');
     setTitleLine2(project.title_line2 || '');
     setTitleConfirmed(Boolean(project.title_line1 && project.title_line2) || Boolean(project.cover_url));
@@ -491,6 +504,7 @@ function App() {
     project?.id,
     project?.name,
     project?.append_book_promotion,
+    project?.promotion_book_title,
     project?.title_line1,
     project?.title_line2,
     project?.publish_short_title,
@@ -634,6 +648,7 @@ function App() {
     const form = new FormData(ev.currentTarget);
     const payload = Object.fromEntries(form.entries());
     payload.raw_script = rawScriptDraft;
+    payload.promotion_book_title = promotionBookTitle;
     const data = await run('创建项目', () => request('/api/projects', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -646,6 +661,24 @@ function App() {
       await refreshAll(data.project_id);
       setTab('script');
     }
+  }
+
+  async function addPromotionBook() {
+    const title = newPromotionBookTitle.trim();
+    if (!title) {
+      setMessage('请输入要新增的图书名称');
+      return;
+    }
+    const data = await run('新增图书', () => request('/api/projects/promotion-books', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    }));
+    if (!data?.title) return;
+    setPromotionBooks(data.books || [data.title]);
+    setPromotionBookTitle(data.title);
+    setNewPromotionBookTitle('');
+    setAddingPromotionBook(false);
   }
 
   async function generateAiRawScript() {
@@ -1691,15 +1724,42 @@ function App() {
                 <label>项目名称<input name="name" placeholder="可留空，系统自动取标题" /></label>
                 <label className="promotion-book-setting">
                   带货书籍设置
-                  <input
-                    value={promotionBookTitle}
-                    maxLength="60"
-                    onChange={(event) => setPromotionBookTitle(event.target.value)}
-                    onBlur={() => {
-                      if (!promotionBookTitle.trim()) setPromotionBookTitle(DEFAULT_PROMOTION_BOOK);
-                    }}
-                    placeholder={DEFAULT_PROMOTION_BOOK}
-                  />
+                  <div className="promotion-book-picker">
+                    <select
+                      value={promotionBookTitle}
+                      onChange={(event) => setPromotionBookTitle(event.target.value)}
+                      aria-label="选择带货书籍"
+                    >
+                      {[...new Set([...promotionBooks, promotionBookTitle].filter(Boolean))].map((title) => (
+                        <option key={title} value={title}>{title}</option>
+                      ))}
+                    </select>
+                    <button type="button" onClick={() => setAddingPromotionBook((current) => !current)}>
+                      {addingPromotionBook ? <X size={16} /> : <Plus size={16} />}
+                      {addingPromotionBook ? '取消' : '新增图书'}
+                    </button>
+                  </div>
+                  {addingPromotionBook && (
+                    <div className="promotion-book-add-row">
+                      <input
+                        value={newPromotionBookTitle}
+                        maxLength="60"
+                        onChange={(event) => setNewPromotionBookTitle(event.target.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter') {
+                            event.preventDefault();
+                            addPromotionBook();
+                          }
+                        }}
+                        placeholder="输入图书名称，如：中国科学家家书"
+                        aria-label="新增图书名称"
+                        autoFocus
+                      />
+                      <button type="button" className="primary" onClick={addPromotionBook} disabled={busy || !newPromotionBookTitle.trim()}>
+                        <Check size={16} /> 保存
+                      </button>
+                    </div>
+                  )}
                   <small>开启“结尾带书”后，将完成情绪承接、产品价值塑造和阅读理由，引导观众产生购买兴趣。</small>
                 </label>
                 <div className="ai-script-options">
