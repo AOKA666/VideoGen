@@ -38,7 +38,6 @@ MAX_REWRITE_ANALYSIS_ATTEMPTS = 2
 MAX_REWRITE_ANALYSIS_REQUEST_ATTEMPTS = 2
 REWRITE_COMPRESSION_WARNING_RATIO = 75
 MAX_AUTO_TITLE_LENGTH = 8
-MAX_PUBLISH_SHORT_TITLE_LENGTH = 16
 
 
 @lru_cache(maxsize=1)
@@ -2854,7 +2853,7 @@ def fallback_publish_assistant(script: str) -> dict:
     sentences = split_sentences(script)
     first = sentences[0] if sentences else script[:40]
     short_title = (
-        strip_title_punctuation(first)[:MAX_PUBLISH_SHORT_TITLE_LENGTH]
+        strip_title_punctuation(first)
         or "这个故事值得被看见"
     )
     description_source = " ".join(sentences[:3]) if sentences else script
@@ -2871,13 +2870,14 @@ def generate_publish_assistant(script: str) -> dict:
     prompt = (
         "你是短视频发布运营助手。请根据下面的中文口播文案，生成发布用内容。"
         "\n\n要求："
-        "\n1. short_title 是一句话短标题，8 到 16 个汉字，不要任何标点符号，绝对不能超过16个字。"
-        "\n2. short_title 要有悬念或反差，但必须忠于文案事实，不要标题党造假。"
-        "\n3. description 是视频描述，80 到 140 个汉字，适合发视频号/抖音/小红书。"
-        "\n4. description 开头要吸引人，点出故事冲突、反差、情绪爆点或评论点，让人想点开看完。"
-        "\n5. description 只写视频内容本身，不要介绍书，不要提书名，不要写读书感受，不要出现买书、带书、小黄车、家长购买等表达。"
-        "\n6. description 不要写成片头文案，不要写“本视频讲述”，不要堆砌空话。"
-        "\n7. 只返回 JSON，不要 Markdown，不要解释。"
+        "\n1. short_title 是一句语义完整的短标题，建议 8 到 24 个汉字，不要任何标点符号。"
+        "\n2. short_title 必须表达完整，不能为了控制字数截断词语、人物、事件或句意。"
+        "\n3. short_title 要有悬念或反差，但必须忠于文案事实，不要标题党造假。"
+        "\n4. description 是视频描述，80 到 140 个汉字，适合发视频号/抖音/小红书。"
+        "\n5. description 开头要吸引人，点出故事冲突、反差、情绪爆点或评论点，让人想点开看完。"
+        "\n6. description 只写视频内容本身，不要介绍书，不要提书名，不要写读书感受，不要出现买书、带书、小黄车、家长购买等表达。"
+        "\n7. description 不要写成片头文案，不要写“本视频讲述”，不要堆砌空话。"
+        "\n8. 只返回 JSON，不要 Markdown，不要解释。"
         "\n\n文案内容："
         f"\n{script[:1200]}"
         "\n\n返回格式："
@@ -2912,7 +2912,7 @@ def generate_publish_assistant(script: str) -> dict:
         if isinstance(content, list):
             content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
         result = json.loads(extract_json(str(content)))
-        short_title = strip_title_punctuation(result.get("short_title", ""))[:MAX_PUBLISH_SHORT_TITLE_LENGTH]
+        short_title = strip_title_punctuation(result.get("short_title", ""))
         description = clean_publish_description(result.get("description", ""))
         if not short_title or not description:
             return fallback_publish_assistant(script)

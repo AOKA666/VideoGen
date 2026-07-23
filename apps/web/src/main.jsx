@@ -93,23 +93,35 @@ function formatBatchImagePrompts(prompts) {
     const safetyIndex = prompt.indexOf(safetyMarker, visualIndex + visualMarker.length);
     if (visualIndex < 0 || safetyIndex < 0) return null;
     return {
-      style: prompt.slice(0, visualIndex).trim(),
-      visual: prompt.slice(visualIndex + visualMarker.length, safetyIndex).trim(),
-      safety: prompt.slice(safetyIndex).trim(),
+      sharedStyle: prompt.slice(0, visualIndex).trim(),
+      shotPrompt: prompt.slice(visualIndex + visualMarker.length, safetyIndex).trim(),
+      sharedSafety: prompt.slice(safetyIndex).trim(),
     };
   });
-  const canLiftSharedText = parsed.length > 0
+  const hasSharedPromptParts = parsed.length > 0
     && parsed.every(Boolean)
-    && parsed.every((item) => item.style === parsed[0].style && item.safety === parsed[0].safety);
-  if (!canLiftSharedText) {
+    && parsed.every((item) => (
+      item.sharedStyle === parsed[0].sharedStyle
+      && item.sharedSafety === parsed[0].sharedSafety
+    ));
+  if (!hasSharedPromptParts) {
     return normalized
       .map((prompt, index) => `${String(index + 1).padStart(2, '0')}. ${prompt}`)
       .join('\n\n');
   }
-  const numberedVisuals = parsed
-    .map((item, index) => `${String(index + 1).padStart(2, '0')}. ${item.visual}`)
+  const numberedShotPrompts = parsed
+    .map((item, index) => (
+      `${String(index + 1).padStart(2, '0')}. ${visualMarker}${item.shotPrompt}`
+    ))
     .join('\n\n');
-  return `共同要求：\n${parsed[0].style}${parsed[0].safety}\n\n分镜画面需求：\n${numberedVisuals}`;
+  return [
+    '共同提示词：',
+    parsed[0].sharedStyle,
+    parsed[0].sharedSafety,
+    '',
+    '各分镜独立提示词：',
+    numberedShotPrompts,
+  ].join('\n');
 }
 
 function numberScriptParagraphs(value) {
@@ -2537,9 +2549,8 @@ function App() {
                   一句话短标题
                   <input
                     value={publishShortTitle}
-                    maxLength={16}
-                    onChange={(e) => setPublishShortTitle(e.target.value.slice(0, 16))}
-                    placeholder="不超过16字不带标点"
+                    onChange={(e) => setPublishShortTitle(e.target.value)}
+                    placeholder="一句完整的短标题"
                   />
                 </label>
                 <label>

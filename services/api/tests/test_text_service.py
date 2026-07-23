@@ -32,9 +32,11 @@ from services.text_service import (  # noqa: E402
     ensure_original_opening,
     ensure_rewrite_book_promotion,
     extract_leading_title,
+    fallback_publish_assistant,
     fallback_infer_title,
     extract_opening_hook,
     fallback_rewrite_fact_brief,
+    generate_publish_assistant,
     generate_viral_title,
     generate_shots,
     guozhijiliang_opening_needs_rewrite,
@@ -50,6 +52,41 @@ from services.text_service import (  # noqa: E402
     rewrite_script,
     rewrite_script_with_minimax,
 )
+
+
+class PublishAssistantTests(unittest.TestCase):
+    def test_generated_short_title_is_not_hard_truncated(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "choices": [{
+                        "message": {
+                            "content": json.dumps({
+                                "short_title": "他隐姓埋名二十年只为守住中国的秘密",
+                                "description": "他把名字藏进岁月，把选择留给国家。那些无人知晓的坚持，最终变成了守护无数人的力量，也让今天的我们重新看见沉默背后的重量。",
+                            }, ensure_ascii=False)
+                        }
+                    }]
+                }, ensure_ascii=False).encode("utf-8")
+
+        with patch.dict("os.environ", {"MINIMAX_API_KEY": "test"}), patch(
+            "services.text_service.urllib.request.urlopen",
+            return_value=FakeResponse(),
+        ):
+            result = generate_publish_assistant("他隐姓埋名二十年，只为守住中国的秘密。")
+
+        self.assertEqual("他隐姓埋名二十年只为守住中国的秘密", result["short_title"])
+
+    def test_fallback_short_title_keeps_the_complete_first_sentence(self) -> None:
+        result = fallback_publish_assistant("他隐姓埋名二十年，只为守住中国的秘密。后来人们才知道他的名字。")
+
+        self.assertEqual("他隐姓埋名二十年只为守住中国的秘密", result["short_title"])
 
 
 class ShotTagGenerationTests(unittest.TestCase):
