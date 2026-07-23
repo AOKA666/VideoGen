@@ -43,6 +43,7 @@ from services.text_service import (  # noqa: E402
     normalize_auto_title,
     normalize_rewrite_fact_brief,
     normalize_rewrite_fact_coverage,
+    parse_rewrite_analysis_json,
     parse_title_candidates,
     request_minimax_rewrite_fact_coverage,
     request_minimax_rewrite_analysis,
@@ -90,7 +91,8 @@ class ShotTagGenerationTests(unittest.TestCase):
             with self.assertRaises(RewriteGenerationError) as raised:
                 rewrite_script_with_minimax("source text", "documentary", "test-key")
 
-        self.assertIn("draft generation attempt 1", raised.exception.detail)
+        self.assertIn("draft generation candidates", raised.exception.detail)
+        self.assertIn("候选稿 1", raised.exception.detail)
         self.assertIn("request timed out", raised.exception.detail)
 
     def test_source_analysis_retries_read_timeout_and_reports_attempts(self) -> None:
@@ -270,6 +272,25 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertFalse(brief["priority_balance_passed"])
         self.assertFalse(brief["fact_coverage_passed"])
 
+    def test_material_cards_cannot_all_expand_as_focus_scenes(self) -> None:
+        brief = normalize_rewrite_fact_brief({
+            "protagonists": ["测试人物"],
+            "material_cards": [
+                {"id": index, "priority": "mergeable", "expansion_level": "focus", "fact": f"事实{index}"}
+                for index in range(1, 5)
+            ],
+            "section_plan": [{"task": "起点", "cards": [1, 2]}, {"task": "结果", "cards": [3, 4]}],
+            "narrative_angles": [
+                {"strategy": "关键选择", "focus_cards": [2], "guidance": "突出选择"},
+                {"strategy": "实际代价", "focus_cards": [3], "guidance": "突出代价"},
+                {"strategy": "行动现场", "focus_cards": [1], "guidance": "突出行动"},
+            ],
+        }, raw_length=500)
+
+        self.assertFalse(brief["expansion_balance_passed"])
+        self.assertFalse(brief["fact_coverage_passed"])
+        self.assertEqual("关键选择", brief["narrative_angles"][0]["strategy"])
+
     def test_section_plan_counts_story_stages_instead_of_fact_cards(self) -> None:
         brief = normalize_rewrite_fact_brief({
             "protagonists": ["测试人物"],
@@ -307,6 +328,26 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertNotIn("relationship_change", brief["material_cards"][0])
         self.assertNotIn("emotional_beat", brief["section_plan"][0])
         self.assertEqual({"card": 1, "beat": "敬佩"}, brief["emotional_arc"][0])
+
+    def test_analysis_json_repairs_missing_comma_before_next_key(self) -> None:
+        parsed = parse_rewrite_analysis_json(
+            '{"core_subject":"测试人物" "material_cards":[{"id":1,"fact":"关键事实"}]}'
+        )
+
+        self.assertEqual("测试人物", parsed["core_subject"])
+        self.assertEqual(1, parsed["material_cards"][0]["id"])
+
+    def test_analysis_json_repairs_unescaped_quotes_inside_string(self) -> None:
+        parsed = parse_rewrite_analysis_json(
+            '{"material_cards":[{"id":1,"details":"他说"马上回家"并立即出发"}]}'
+        )
+
+        self.assertEqual('他说"马上回家"并立即出发', parsed["material_cards"][0]["details"])
+
+    def test_analysis_json_repairs_missing_comma_between_array_items(self) -> None:
+        parsed = parse_rewrite_analysis_json('{"verified_quotes":["第一句" "第二句"]}')
+
+        self.assertEqual(["第一句", "第二句"], parsed["verified_quotes"])
 
     def test_book_promotion_details_and_verified_quotes_survive_normalization(self) -> None:
         brief = normalize_rewrite_fact_brief({
@@ -816,6 +857,8 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertIn('"emotional_stakes"', prompt)
         self.assertIn('"relationship_change"', prompt)
         self.assertIn('"opening_continuation"', prompt)
+        self.assertNotIn('"narrative_angles"', prompt)
+        self.assertIn('"expansion_level": "focus"', prompt)
         self.assertNotIn('"emotional_beat"', prompt)
         self.assertIn("没有依据时直接省略字段", prompt)
         self.assertNotIn("不得超过约 6000 字符", prompt)
@@ -958,7 +1001,33 @@ class ShotTagGenerationTests(unittest.TestCase):
 
         self.assertNotIn("rewrite_quality_status", result)
         self.assertNotIn("rewrite_warning", result)
-        self.assertEqual(1, result["rewrite_attempts"])
+        self.assertEqual(3, result["rewrite_attempts"])
+        self.assertEqual(3, result["rewrite_candidates_generated"])
+
+    def test_three_strategy_candidates_compete_and_best_difference_wins(self) -> None:
+        prompts = []
+        differences = iter([72, 91, 84])
+
+        def fake_rewrite(prompt, *_args, **_kwargs):
+            prompts.append(prompt)
+            difference = next(differences)
+            return {"rewritten_script": f"差异得分为{difference}的候选稿", "rewrite_comparison": {
+                "passed": True, "non_length_quality_passed": True, "length_passed": True,
+                "outline_structure_passed": True, "narrative_difference": difference,
+                "overall_difference": difference, "continuous_reuse": 2, "sentence_imitation": 2,
+            }}
+
+        with patch("services.text_service.request_minimax_rewrite_analysis", return_value={"facts": ["事实"]}), patch(
+            "services.text_service.request_minimax_rewrite", side_effect=fake_rewrite
+        ) as rewrite:
+            result = rewrite_script_with_minimax("原文事实。后续事实。", "纪实故事型", "test-key")
+
+        self.assertEqual(3, rewrite.call_count)
+        self.assertEqual("差异得分为91的候选稿", result["rewritten_script"])
+        self.assertEqual("关键选择", result["rewrite_narrative_strategy"]["strategy"])
+        self.assertIn("本稿叙事策略：核心冲突", prompts[0])
+        self.assertIn("本稿叙事策略：关键选择", prompts[1])
+        self.assertIn("本稿叙事策略：行动与代价", prompts[2])
 
     def test_below_seventy_five_percent_triggers_rewrite_retry(self) -> None:
         base = {
@@ -998,8 +1067,9 @@ class ShotTagGenerationTests(unittest.TestCase):
         ) as rewrite:
             result = rewrite_script_with_minimax("原文事实。后续事实。", "纪实故事型", "test-key")
 
-        self.assertEqual(2, rewrite.call_count)
-        self.assertEqual(2, result["rewrite_attempts"])
+        self.assertEqual(3, rewrite.call_count)
+        self.assertEqual(3, result["rewrite_attempts"])
+        self.assertEqual(2, result["rewrite_candidates_generated"])
         self.assertTrue(result["rewrite_comparison"]["length_passed"])
 
     def test_missing_fact_card_triggers_rewrite_retry(self) -> None:
@@ -1034,6 +1104,12 @@ class ShotTagGenerationTests(unittest.TestCase):
                 "expected_fact_cards": 2,
                 "missing_fact_cards": [],
             },
+            {
+                "fact_coverage_passed": True,
+                "covered_fact_cards": [1, 2],
+                "expected_fact_cards": 2,
+                "missing_fact_cards": [],
+            },
         ]
 
         with patch(
@@ -1051,9 +1127,9 @@ class ShotTagGenerationTests(unittest.TestCase):
         ) as audit:
             result = rewrite_script_with_minimax("测试人物的原文。后续内容。", "纪实故事型", "test-key")
 
-        self.assertEqual(2, rewrite.call_count)
-        self.assertEqual(2, audit.call_count)
-        self.assertEqual(2, result["rewrite_attempts"])
+        self.assertEqual(3, rewrite.call_count)
+        self.assertEqual(3, audit.call_count)
+        self.assertEqual(3, result["rewrite_attempts"])
         self.assertTrue(result["rewrite_comparison"]["fact_coverage_passed"])
         self.assertNotIn("rewrite_compression_warning", result)
 
@@ -1089,7 +1165,9 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertEqual("quality_warning", result["rewrite_quality_status"])
         self.assertEqual("", result["rewrite_error"])
         self.assertNotIn("字数为原文的 87%", result["rewrite_warning"])
-        self.assertIn("连续复用率 14%", result["rewrite_warning"])
+        self.assertIn("独立表达不足", result["rewrite_warning"])
+        self.assertIn("存在连续复用", result["rewrite_warning"])
+        self.assertNotIn("连续复用率 14%", result["rewrite_warning"])
         self.assertEqual(3, result["rewrite_attempts"])
 
     def test_previous_draft_is_returned_when_a_later_retry_request_fails(self) -> None:
@@ -1118,9 +1196,11 @@ class ShotTagGenerationTests(unittest.TestCase):
             result = rewrite_script_with_minimax("原文" * 100, "纪实故事型", "test-key")
 
         self.assertEqual("第一次生成的完整稿件", result["rewritten_script"])
-        self.assertEqual("generation_warning", result["rewrite_quality_status"])
-        self.assertIn("第 2 次重试调用失败", result["rewrite_warning"])
-        self.assertEqual(1, result["rewrite_attempts"])
+        self.assertEqual("quality_warning", result["rewrite_quality_status"])
+        self.assertIn("候选生成异常", result["rewrite_warning"])
+        self.assertIn("候选稿 2", result["rewrite_warning"])
+        self.assertEqual(3, result["rewrite_attempts"])
+        self.assertEqual(1, result["rewrite_candidates_generated"])
 
     def test_rewrite_prompt_requires_body_to_continue_protected_opening(self) -> None:
         source = (
@@ -1139,6 +1219,8 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertIn("默认不使用倒叙", prompt)
         self.assertIn("之后始终顺叙", prompt)
         self.assertIn("不能为制造悬念提前透露后面的结果", prompt)
+        self.assertIn("每个自然段至少完成一项明确任务", prompt)
+        self.assertIn("必要的承接句可以服务于上下文，不必强行制造转折", prompt)
 
     def test_rewrite_retry_requires_timeline_correction(self) -> None:
         previous = {
@@ -1269,6 +1351,24 @@ class ShotTagGenerationTests(unittest.TestCase):
         comparison = compare_scripts(source, imitation)
 
         self.assertGreater(comparison["sentence_imitation"], 35)
+        self.assertFalse(comparison["passed"])
+
+    def test_rewrite_comparison_detects_matching_rhythm_and_detail_distribution(self) -> None:
+        source = (
+            "他离开家乡走进学校。老师把一封信交给了他。\n\n"
+            "后来他进入工厂工作。几年里他解决了许多难题。\n\n"
+            "最终那台设备顺利启动。"
+        )
+        rewritten = (
+            "她告别亲友来到医院。院长将一份名单递给她。\n\n"
+            "此后她留在病房值守。几年间她帮助了很多病人。\n\n"
+            "最终这项救治圆满结束。"
+        )
+        comparison = compare_scripts(source, rewritten)
+        self.assertIsNotNone(comparison["structure_similarity"])
+        self.assertIsNotNone(comparison["detail_distribution_similarity"])
+        self.assertFalse(comparison["structure_similarity_passed"])
+        self.assertFalse(comparison["detail_distribution_passed"])
         self.assertFalse(comparison["passed"])
 
     def test_rewrite_comparison_rejects_identical_text(self) -> None:

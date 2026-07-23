@@ -2016,11 +2016,8 @@ function App() {
               </div>
               {project.rewrite_comparison && (
                 <small className="raw-script-hint rewrite-comparison">
-                  总体重构度：{project.rewrite_comparison.overall_difference ?? project.rewrite_difference ?? '-'}%
-                  {' · '}连续重复率：{project.rewrite_comparison.continuous_reuse ?? project.rewrite_comparison.character_similarity ?? '-'}%
-                  {' · '}短语复用率：{project.rewrite_comparison.source_phrase_reuse ?? project.rewrite_comparison.phrase_overlap ?? '-'}%
-                  {' · '}逐句模仿率：{project.rewrite_comparison.sentence_imitation ?? '-'}%
-                  {' · '}关键词重合率：{project.rewrite_comparison.keyword_overlap ?? project.rewrite_comparison.semantic_similarity ?? '-'}%
+                  综合差异：{project.rewrite_comparison.narrative_difference ?? project.rewrite_comparison.overall_difference ?? '-'}%
+                  {' · '}入选策略：{project.rewrite_narrative_strategy?.strategy || '-'}
                   {' · '}篇幅比例：{project.rewrite_comparison.length_ratio ?? '-'}%
                   {' · '}事实卡覆盖：{project.rewrite_comparison.covered_fact_cards?.length ?? '-'}
                   /{project.rewrite_comparison.expected_fact_cards ?? '-'}

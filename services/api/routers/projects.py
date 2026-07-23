@@ -270,6 +270,8 @@ def rewrite(project_id: str, payload: RewritePayload | None = None):
     project["rewrite_comparison"] = result.get("rewrite_comparison", {})
     project["rewrite_difference"] = result.get("rewrite_difference", 0)
     project["rewrite_attempts"] = result.get("rewrite_attempts", 1)
+    project["rewrite_candidates_generated"] = result.get("rewrite_candidates_generated", 1)
+    project["rewrite_narrative_strategy"] = result.get("rewrite_narrative_strategy", {})
     fact_brief = result.get("rewrite_fact_brief") or {}
     project["rewrite_verified_quotes"] = (
         fact_brief.get("verified_quotes", []) if isinstance(fact_brief, dict) else []

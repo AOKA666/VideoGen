@@ -31,6 +31,8 @@ MIN_REWRITE_DIFFERENCE = 70
 MAX_REWRITE_CONTINUOUS_REUSE = 12
 MAX_REWRITE_SOURCE_PHRASE_REUSE = 20
 MAX_REWRITE_SENTENCE_IMITATION = 35
+MAX_REWRITE_STRUCTURE_SIMILARITY = 82
+MAX_REWRITE_DETAIL_DISTRIBUTION_SIMILARITY = 85
 MAX_REWRITE_ATTEMPTS = 3
 MAX_REWRITE_ANALYSIS_ATTEMPTS = 2
 MAX_REWRITE_ANALYSIS_REQUEST_ATTEMPTS = 2
@@ -417,6 +419,68 @@ def ai_outline_fragments(text: str) -> list[str]:
     return matches[:6]
 
 
+def sentence_structure_signature(text: str) -> list[str]:
+    signatures = []
+    for sentence in split_sentences(text):
+        compact = compact_similarity_text(sentence)
+        if not compact:
+            continue
+        length_bucket = min(6, len(compact) // 12)
+        ending = "question" if sentence.rstrip().endswith(("？", "?")) else "statement"
+        opener = "plain"
+        if re.match(r"^(但|然而|可是|偏偏|没想到|直到)", sentence):
+            opener = "turn"
+        elif re.match(r"^(因为|由于|为了|正是)", sentence):
+            opener = "cause"
+        elif re.match(r"^(后来|随后|此后|当时|那一年|\d{4}年)", sentence):
+            opener = "time"
+        quoted = "quote" if re.search(r"[“”\"‘’]", sentence) else "narration"
+        signatures.append(f"{length_bucket}:{ending}:{opener}:{quoted}")
+    return signatures
+
+
+def sequence_structure_similarity(text1: str, text2: str) -> int | None:
+    signature1 = sentence_structure_signature(text1)
+    signature2 = sentence_structure_signature(text2)
+    if min(len(signature1), len(signature2)) < 5:
+        return None
+    return round(SequenceMatcher(None, signature1, signature2, autojunk=False).ratio() * 100)
+
+
+def paragraph_length_profile(text: str) -> list[float]:
+    paragraphs = [item.strip() for item in re.split(r"\n\s*\n", str(text or "")) if item.strip()]
+    if len(paragraphs) < 3:
+        return []
+    lengths = [max(1, content_length(item)) for item in paragraphs]
+    total = sum(lengths)
+    return [item / total for item in lengths]
+
+
+def resample_profile(values: list[float], size: int = 8) -> list[float]:
+    if not values:
+        return []
+    if len(values) == 1:
+        return [values[0]] * size
+    sampled = []
+    for index in range(size):
+        position = index * (len(values) - 1) / max(1, size - 1)
+        lower = int(position)
+        upper = min(len(values) - 1, lower + 1)
+        weight = position - lower
+        sampled.append(values[lower] * (1 - weight) + values[upper] * weight)
+    total = sum(sampled) or 1
+    return [item / total for item in sampled]
+
+
+def detail_distribution_similarity(text1: str, text2: str) -> int | None:
+    profile1 = resample_profile(paragraph_length_profile(text1))
+    profile2 = resample_profile(paragraph_length_profile(text2))
+    if not profile1 or not profile2:
+        return None
+    distance = sum(abs(left - right) for left, right in zip(profile1, profile2)) / 2
+    return round(max(0.0, 1 - distance) * 100)
+
+
 def compare_scripts(
     text1: str,
     text2: str,
@@ -463,12 +527,19 @@ def compare_scripts(
     keyword_overlap = round((len(terms1 & terms2) / len(term_union)) * 100) if term_union else 0
 
     sentence_imitation = sentence_imitation_rate(body1, body2)
+    structure_similarity = sequence_structure_similarity(body1, body2)
+    detail_similarity = detail_distribution_similarity(body1, body2)
+    structure_similarity_passed = structure_similarity is None or structure_similarity <= MAX_REWRITE_STRUCTURE_SIMILARITY
+    detail_distribution_passed = detail_similarity is None or detail_similarity <= MAX_REWRITE_DETAIL_DISTRIBUTION_SIMILARITY
     overall_similarity = round(
         (continuous_reuse * 0.35)
         + (source_phrase_reuse * 0.35)
         + (sentence_imitation * 0.30)
     )
     overall_difference = max(0, min(100, 100 - overall_similarity))
+    structure_difference = 100 - structure_similarity if structure_similarity is not None else overall_difference
+    detail_difference = 100 - detail_similarity if detail_similarity is not None else overall_difference
+    narrative_difference = round(overall_difference * 0.6 + structure_difference * 0.2 + detail_difference * 0.2)
     reused_passages = sorted(
         {compact1[block.a:block.a + block.size] for block in reused_blocks},
         key=len,
@@ -480,6 +551,8 @@ def compare_scripts(
         and continuous_reuse <= MAX_REWRITE_CONTINUOUS_REUSE
         and source_phrase_reuse <= MAX_REWRITE_SOURCE_PHRASE_REUSE
         and sentence_imitation <= MAX_REWRITE_SENTENCE_IMITATION
+        and structure_similarity_passed
+        and detail_distribution_passed
     )
     passed = non_length_quality_passed and length_passed and outline_structure_passed
     return {
@@ -487,6 +560,11 @@ def compare_scripts(
         "phrase_overlap": phrase_overlap,
         "source_phrase_reuse": source_phrase_reuse,
         "sentence_imitation": sentence_imitation,
+        "structure_similarity": structure_similarity,
+        "structure_similarity_passed": structure_similarity_passed,
+        "detail_distribution_similarity": detail_similarity,
+        "detail_distribution_passed": detail_distribution_passed,
+        "narrative_difference": narrative_difference,
         "keyword_overlap": keyword_overlap,
         # Backward-compatible aliases for existing stored projects and API clients.
         "character_similarity": continuous_reuse,
@@ -982,28 +1060,23 @@ def build_rewrite_quality_warning(comparison: dict) -> str:
             f"成稿约为原文的 {comparison.get('length_ratio', 0)}%，低于 "
             f"最低 {REWRITE_COMPRESSION_WARNING_RATIO}% 的篇幅要求"
         )
+    expression_problems = []
     if int(comparison.get("overall_difference") or 0) < MIN_REWRITE_DIFFERENCE:
-        issues.append(
-            f"总体重构度 {comparison.get('overall_difference', 0)}%"
-            f"（建议至少 {MIN_REWRITE_DIFFERENCE}%）"
-        )
+        expression_problems.append("整体表达仍接近原文")
     if int(comparison.get("continuous_reuse") or 0) > MAX_REWRITE_CONTINUOUS_REUSE:
-        issues.append(
-            f"连续复用率 {comparison.get('continuous_reuse', 0)}%"
-            f"（建议不超过 {MAX_REWRITE_CONTINUOUS_REUSE}%）"
-        )
+        expression_problems.append("存在连续复用")
     source_phrase_reuse = int(comparison.get("source_phrase_reuse") or 0)
     if source_phrase_reuse > MAX_REWRITE_SOURCE_PHRASE_REUSE:
-        issues.append(
-            f"短语复用率 {source_phrase_reuse}%"
-            f"（建议不超过 {MAX_REWRITE_SOURCE_PHRASE_REUSE}%）"
-        )
+        expression_problems.append("原文短语偏多")
     sentence_imitation = int(comparison.get("sentence_imitation") or 0)
     if sentence_imitation > MAX_REWRITE_SENTENCE_IMITATION:
-        issues.append(
-            f"逐句模仿率 {sentence_imitation}%"
-            f"（建议不超过 {MAX_REWRITE_SENTENCE_IMITATION}%）"
-        )
+        expression_problems.append("句子推进方式相似")
+    if comparison.get("structure_similarity_passed") is False:
+        expression_problems.append("句式节奏相似")
+    if comparison.get("detail_distribution_passed") is False:
+        expression_problems.append("详略分配相似")
+    if expression_problems:
+        issues.append("独立表达不足：" + "、".join(expression_problems))
     detail = "；".join(issues) or "部分质量指标未达到建议值"
     return f"二创稿已生成并保留，但质量检查未完全达标：{detail}。你可以直接编辑、复制或再次改写。"
 
@@ -1074,13 +1147,14 @@ def build_rewrite_analysis_prompt(raw_script: str, preserve_rule: str = "auto") 
 
 【紧凑事实卡】资料卡不是摘要，但禁止重复：
 1. core_subject 必须概括本篇讲谁；protagonists 必须逐项列出所有主要人物的完整姓名。多人题材不能只写“宋氏三姐妹”“这群科学家”等群体称呼，还必须列出每一位主要人物；protagonist_relationship 必须写清他们之间的关系或各自最简身份。
-2. 按独立事件建立 material_cards，通常至少 {minimum_fact_items} 条；如果原文确实只有更少的独立事件，不得为了凑数量拆分或重复同一事件。严格按真实时间先后排列并编号。只有删除后会破坏核心主线的冲突、因果、人物关系、选择、转折、结果和关键数字标记 must；普通背景、履历、同类困难和同类成就默认标记 mergeable。除非全文几乎全是主线事件，否则不得把所有卡都标成 must。
+2. 按独立事件建立 material_cards，通常至少 {minimum_fact_items} 条；如果原文确实只有更少的独立事件，不得为了凑数量拆分或重复同一事件。严格按真实时间先后排列并编号。只有删除后会破坏核心主线的冲突、因果、人物关系、选择、转折、结果和关键数字标记 must；普通背景、履历、同类困难和同类成就默认标记 mergeable。每张卡设置 expansion_level：focus=重点场景，support=正常交代，brief=一句带过。同类卡不能全设为 focus。
 3. 完整保留原文所有重要事实、人物关系、转折、代价、因果、关键动作和画面；事件卡要写清事件发生和人物应对。有明确依据时才给卡片增加 emotional_stakes（人物可能失去什么或已经付出什么）或 relationship_change（关系如何变化）；没有依据时直接省略字段，不要输出空字符串。不得虚构人物内心、眼泪、台词或心理活动。
 4. 不复制原文完整句子，不保留原文修辞、金句和段落结构。资料卡只记录事实，不能提前替第二个模型改写句子。must 卡必须完整进入成稿；mergeable 卡允许与相邻同类卡合并表达，不要求逐卡展开。
 5. section_plan 是叙事阶段计划，不等于最终自然段数量：1到2张卡可设1个阶段，3到4张卡通常2个，5到6张卡通常3个，更多卡通常4个；必须按 material_cards 编号顺叙。另给出 emotional_arc，把确有情感价值的卡片编号与感受对应起来；短文1到3个、长文最多5个关键节点，不得为了凑数量硬加。情绪必须跟随事实推进，不能凌驾于时间线。
 6. 只把原文中有明确说话者、内容和出处语境的直接引语放入 verified_quotes，逐字保留；无法确认的引语不要收录，改由事实卡记录其含义。
 7. 判断原文是否包含图书推荐。存在时记录 original_intent、selling_points、target_readers 和 transition_angle；没有就标记 present=false 并把其他字段留空。
 8. 仅当下方 protected_opening 已经写到后期结果时，允许 section_plan 用一句承接语回到最早节点；此后仍须顺叙，且不要重复固定开头已覆盖的事实。
+9. JSON 字符串内容若需要引号，一律使用中文引号“”，不得在字符串内部直接使用未转义的英文双引号。
 
 只返回以下 JSON，不得增加字段，不得使用 Markdown。优先避免重复，但不能为了缩短 JSON 删除事实：
 {{
@@ -1093,7 +1167,7 @@ def build_rewrite_analysis_prompt(raw_script: str, preserve_rule: str = "auto") 
   "viral_analysis": {{"opening_continuation": "固定开头后的承接方式", "completion": "短句", "share": "短句", "interaction": "短句"}},
   "emotional_arc": [{{"card": 2, "beat": "憋屈"}}, {{"card": 4, "beat": "心疼"}}, {{"card": 6, "beat": "敬佩"}}],
   "timeline_verified": true,
-  "material_cards": [{{"id": 1, "priority": "must", "time": "时间阶段", "person": "人物姓名", "fact": "中性事实", "details": "原因、结果、动作、代价、数字与关键画面", "emotional_stakes": "有依据的实际代价", "relationship_change": "有依据的关系变化"}}, {{"id": 2, "priority": "mergeable", "time": "时间阶段", "person": "人物姓名", "fact": "可合并表达的背景或履历", "details": "必要信息"}}],
+  "material_cards": [{{"id": 1, "priority": "must", "expansion_level": "focus", "time": "时间阶段", "person": "人物姓名", "fact": "中性事实", "details": "原因、结果、动作、代价、数字与关键画面", "emotional_stakes": "有依据的实际代价", "relationship_change": "有依据的关系变化"}}, {{"id": 2, "priority": "mergeable", "expansion_level": "brief", "time": "时间阶段", "person": "人物姓名", "fact": "可合并表达的背景或履历", "details": "必要信息"}}],
   "must_preserve_terms": ["人名地名年份数字专名"],
   "verified_quotes": ["可核实且允许逐字保留的原文直接引语"],
   "section_plan": [{{"task": "叙事阶段任务", "cards": [1, 2]}}],
@@ -1156,6 +1230,10 @@ def normalize_rewrite_fact_brief(result: dict, raw_length: int = 0) -> dict:
         for optional_field in ("emotional_stakes", "relationship_change"):
             if not str(normalized_item.get(optional_field) or "").strip():
                 normalized_item.pop(optional_field, None)
+        expansion_level = str(normalized_item.get("expansion_level") or "").strip().lower()
+        if expansion_level not in {"focus", "support", "brief"}:
+            expansion_level = "support" if str(normalized_item.get("priority") or "").strip().lower() == "must" else "brief"
+        normalized_item["expansion_level"] = expansion_level
         normalized_material_cards.append(normalized_item)
     material_cards = normalized_material_cards
     fact_item_count = len(timeline) + len(facts) + len(material_cards)
@@ -1182,11 +1260,15 @@ def normalize_rewrite_fact_brief(result: dict, raw_length: int = 0) -> dict:
         if str(item.get("priority") or "").strip().lower() == "mergeable"
     )
     priority_balance_passed = len(structured_cards) < 6 or mergeable_count > 0
+    focus_count = sum(1 for item in structured_cards if item.get("expansion_level") == "focus")
+    maximum_focus_count = max(1, (len(structured_cards) * 3 + 4) // 5)
+    expansion_balance_passed = len(structured_cards) < 4 or focus_count <= maximum_focus_count
     coverage_passed = (
         fact_item_count > 0
         and section_plan_passed
         and protagonist_identity_passed
         and priority_balance_passed
+        and expansion_balance_passed
     )
     verified_quotes = result.get("verified_quotes")
     verified_quotes = [str(item).strip() for item in verified_quotes] if isinstance(verified_quotes, list) else []
@@ -1210,6 +1292,18 @@ def normalize_rewrite_fact_brief(result: dict, raw_length: int = 0) -> dict:
                 continue
             seen_legacy_cards.add(card)
             normalized_emotional_arc.append(item)
+    raw_narrative_angles = result.get("narrative_angles")
+    raw_narrative_angles = raw_narrative_angles if isinstance(raw_narrative_angles, list) else []
+    narrative_angles = []
+    for item in raw_narrative_angles:
+        if isinstance(item, dict):
+            strategy = str(item.get("strategy") or "").strip()
+            guidance = str(item.get("guidance") or "").strip()
+            focus_cards = item.get("focus_cards") if isinstance(item.get("focus_cards"), list) else []
+        else:
+            strategy, guidance, focus_cards = str(item or "").strip(), "", []
+        if strategy and strategy not in {angle["strategy"] for angle in narrative_angles}:
+            narrative_angles.append({"strategy": strategy, "focus_cards": focus_cards[:6], "guidance": guidance})
     return {
         "source_length": raw_length,
         "fact_item_count": fact_item_count,
@@ -1222,6 +1316,7 @@ def normalize_rewrite_fact_brief(result: dict, raw_length: int = 0) -> dict:
         "section_plan_passed": section_plan_passed,
         "protagonist_identity_passed": protagonist_identity_passed,
         "priority_balance_passed": priority_balance_passed,
+        "expansion_balance_passed": expansion_balance_passed,
         "fact_coverage_passed": coverage_passed,
         "core_subject": str(result.get("core_subject") or "").strip(),
         "protagonists": protagonists,
@@ -1236,6 +1331,7 @@ def normalize_rewrite_fact_brief(result: dict, raw_length: int = 0) -> dict:
         "must_preserve_terms": result.get("must_preserve_terms") if isinstance(result.get("must_preserve_terms"), list) else [],
         "verified_quotes": [item for item in verified_quotes if item],
         "viral_analysis": viral_analysis,
+        "narrative_angles": narrative_angles[:3],
         "emotional_arc": normalized_emotional_arc[:5],
         "structure_summary": structure_summary,
         "section_plan": section_plan,
@@ -1251,9 +1347,9 @@ def normalize_rewrite_fact_brief(result: dict, raw_length: int = 0) -> dict:
 
 
 def parse_rewrite_analysis_json(content: str) -> dict:
-    """Parse analysis JSON and repair a common missing-comma model error."""
+    """Parse analysis JSON and repair common MiniMax punctuation mistakes."""
     candidate = extract_json(content)
-    for _ in range(8):
+    for _ in range(20):
         try:
             parsed = json.loads(candidate)
             if not isinstance(parsed, dict):
@@ -1263,19 +1359,51 @@ def parse_rewrite_analysis_json(content: str) -> dict:
             if exc.msg != "Expecting ',' delimiter":
                 raise
             position = exc.pos
-            if position >= len(candidate) or candidate[position] != '"':
+            if position >= len(candidate):
                 raise
-            # Only repair when the token at the error position is clearly the
-            # next object key. This avoids changing ordinary quotation marks in
-            # a string value.
-            if not re.match(r'"(?:[^"\\]|\\.)*"\s*:', candidate[position:]):
-                raise
+
+            # A missing comma before the next object key. The decoder normally
+            # points at that key, but some provider outputs include whitespace.
+            key_match = re.match(r'\s*("(?:[^"\\]|\\.)*"\s*:)', candidate[position:])
+            if key_match:
+                key_position = position + len(key_match.group(0)) - len(key_match.group(1))
+                previous = key_position - 1
+                while previous >= 0 and candidate[previous].isspace():
+                    previous -= 1
+                if previous >= 0 and candidate[previous] in {'"', ']', '}'} | set("0123456789"):
+                    candidate = candidate[:key_position] + "," + candidate[key_position:]
+                    continue
+
+            # Missing comma between array items or adjacent objects.
             previous = position - 1
             while previous >= 0 and candidate[previous].isspace():
                 previous -= 1
-            if previous < 0 or candidate[previous] not in {'"', ']', '}'}:
-                raise
-            candidate = candidate[:position] + "," + candidate[position:]
+            if (
+                previous >= 0
+                and candidate[previous] in {'"', ']', '}'} | set("0123456789")
+                and candidate[position] in {'"', '[', '{'}
+            ):
+                candidate = candidate[:position] + "," + candidate[position:]
+                continue
+
+            # An ASCII quote was used inside a JSON string without escaping,
+            # for example: "details":"他说"马上回家"". The decoder treats
+            # the first inner quote as the end of the value and points at the
+            # following text. Escape that quote and let the next pass repair
+            # any matching inner quote in the same value.
+            previous = position - 1
+            while previous >= 0 and candidate[previous].isspace():
+                previous -= 1
+            if previous >= 0 and candidate[previous] == '"' and candidate[position] not in ",}]":
+                backslashes = 0
+                cursor = previous - 1
+                while cursor >= 0 and candidate[cursor] == "\\":
+                    backslashes += 1
+                    cursor -= 1
+                if backslashes % 2 == 0:
+                    candidate = candidate[:previous] + "\\" + candidate[previous:]
+                    continue
+            raise
     raise ValueError("Rewrite analysis JSON needs too many repairs")
 
 
@@ -1328,6 +1456,7 @@ def fallback_rewrite_fact_brief(
         fallback_material_cards.append({
             "id": index,
             "priority": priority,
+            "expansion_level": "focus" if is_boundary else ("support" if priority == "must" else "brief"),
             "time": "时间待核",
             "person": "按原文事实交代",
             "fact": card,
@@ -1360,6 +1489,11 @@ def fallback_rewrite_fact_brief(
         "material_cards": fallback_material_cards,
         "section_plan": section_plan,
         "viral_analysis": {},
+        "narrative_angles": [
+            {"strategy": "核心冲突", "focus_cards": [1], "guidance": "围绕主要阻力及其解决过程推进"},
+            {"strategy": "关键选择", "focus_cards": [max(1, card_count // 2)], "guidance": "突出人物选择以及选择带来的后果"},
+            {"strategy": "行动与结果", "focus_cards": [max(1, card_count)], "guidance": "用关键行动串联过程并落到真实结果"},
+        ],
         "emotional_arc": [],
         "book_promotion": {
             "present": bool(re.search(
@@ -1402,7 +1536,8 @@ def request_minimax_rewrite_analysis(
                 "\n\n上一版返回的 JSON 无法解析，错误为："
                 f"{type(last_analysis_error).__name__}: {str(last_analysis_error)[:240]}。"
                 "请重新输出完整且严格合法的 JSON；检查所有逗号、引号、括号，"
-                "不要使用 Markdown 代码块，不要在 JSON 前后添加解释；通过去掉重复措辞控制 JSON 长度，不能压缩或省略素材卡事实。"
+                "不要使用 Markdown 代码块，不要在 JSON 前后添加解释；字符串内容中的引号改用中文引号“”，"
+                "不要直接写未转义的英文双引号；通过去掉重复措辞控制 JSON 长度，不能压缩或省略素材卡事实。"
             )
         elif last_brief:
             protagonist_note = (
@@ -1412,12 +1547,16 @@ def request_minimax_rewrite_analysis(
             )
             retry_note = (
                 f"\n\n上一版分析未达到可用要求：事实/素材卡 {last_brief.get('fact_item_count', 0)} 条，"
-                f"建议约 {minimum_fact_items} 条，但独立事件更少时不得硬拆；结构计划 {len(last_brief.get('section_plan') or [])} 段，"
-                f"当前至少需要 {last_brief.get('minimum_section_count', 1)} 段。"
+                f"建议约 {minimum_fact_items} 条，但独立事件更少时不得硬拆；结构计划 {len(last_brief.get('section_plan') or [])} 个阶段，"
+                f"当前至少需要 {last_brief.get('minimum_section_count', 1)} 个阶段。"
                 f"{protagonist_note}"
                 + (
                     "上一版把较多卡片全部标成 must；请只保留真正决定主线的 must，其余同类背景和履历改为 mergeable。"
                     if last_brief.get("priority_balance_passed") is False else ""
+                )
+                + (
+                    "上一版把过多卡片设为 focus；只保留真正值得形成场景的重点卡，其余改为 support 或 brief。"
+                    if last_brief.get("expansion_balance_passed") is False else ""
                 )
                 + "请重新通读原文，补齐爆点、完播、转发、评论、点赞、关注机制，"
                 "把遗漏的动作、原因、结果、人物关系、时间节点、画面与情绪细节补齐，"
@@ -1429,7 +1568,7 @@ def request_minimax_rewrite_analysis(
                 {"role": "system", "content": "你只做原文事实拆解，只输出可解析 JSON，不写二创稿。"},
                 {"role": "user", "content": base_prompt + retry_note},
             ],
-            "temperature": 0.2,
+            "temperature": 0.1,
             "top_p": 0.8,
             "max_tokens": max(4000, min(12000, round(raw_len * 2.2) + 1600)),
             "stream": False,
@@ -1497,6 +1636,34 @@ def request_minimax_rewrite_analysis(
     raise RuntimeError("Rewrite analysis did not return a usable fact brief")
 
 
+def rewrite_narrative_strategies(fact_brief: dict | None) -> list[dict]:
+    brief = fact_brief or {}
+    strategies = []
+    supplied = brief.get("narrative_angles")
+    if isinstance(supplied, list):
+        for item in supplied:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("strategy") or "").strip()
+            if not name or any(existing["strategy"] == name for existing in strategies):
+                continue
+            strategies.append({"strategy": name, "focus_cards": item.get("focus_cards") if isinstance(item.get("focus_cards"), list) else [], "guidance": str(item.get("guidance") or "").strip()})
+    cards = [item for item in brief.get("material_cards") or [] if isinstance(item, dict)]
+    focus_ids = [item.get("id") for item in cards if item.get("expansion_level") == "focus" and item.get("id") is not None]
+    all_ids = [item.get("id") for item in cards if item.get("id") is not None]
+    defaults = [
+        {"strategy": "核心冲突", "focus_cards": focus_ids[:3] or all_ids[:2], "guidance": "围绕主要阻力、应对动作和解决过程推进，背景只在需要时补入。"},
+        {"strategy": "关键选择", "focus_cards": focus_ids[-3:] or all_ids[1:4], "guidance": "突出人物在关键节点做出的选择，以及每次选择带来的实际后果。"},
+        {"strategy": "行动与代价", "focus_cards": focus_ids[::2] or all_ids[-3:], "guidance": "用可见行动串联事实，把代价和关系变化落到具体后果上。"},
+    ]
+    for item in defaults:
+        if len(strategies) >= MAX_REWRITE_ATTEMPTS:
+            break
+        if not any(existing["strategy"] == item["strategy"] for existing in strategies):
+            strategies.append(item)
+    return strategies[:MAX_REWRITE_ATTEMPTS]
+
+
 def build_rewrite_prompt(
     raw_script: str,
     style: str,
@@ -1508,6 +1675,8 @@ def build_rewrite_prompt(
     promotion_book_title: str = "国之脊梁",
 ) -> str:
     opening_hook = extract_opening_hook(raw_script, preserve_rule)
+    narrative_strategies = rewrite_narrative_strategies(fact_brief)
+    narrative_strategy = narrative_strategies[(max(1, attempt) - 1) % len(narrative_strategies)]
     source_has_book_promotion = bool(re.search(
         r"(《[^》]+》|这本书|书里|书中|翻开|读完|买给孩子|下单|购买|小黄车|带书|卖书|推荐给家长)",
         raw_script,
@@ -1556,6 +1725,10 @@ def build_rewrite_prompt(
             structure_issues.append("存在连续复用原文表达")
         if int(comparison.get("source_phrase_reuse") or 0) > MAX_REWRITE_SOURCE_PHRASE_REUSE:
             structure_issues.append("原文短语复用过多")
+        if comparison.get("structure_similarity_passed") is False:
+            structure_issues.append("句长、转折位置和句式节奏与原文过于接近")
+        if comparison.get("detail_distribution_passed") is False:
+            structure_issues.append("各阶段篇幅和详略分配与原文过于接近")
         structure_summary = "；".join(structure_issues) or "需要进一步提高独立表达程度"
         retry_instruction = (
             f"上一版没有通过真正重写验收：总体重构度 {comparison.get('overall_difference', 0)}%，"
@@ -1631,13 +1804,16 @@ def build_rewrite_prompt(
 - 用 core_subject、core_conflict 和 section_plan 确定主线；viral_analysis.opening_continuation 只指导固定开头后的承接。
 - 时间线：{chronology_instruction}只有固定开头本身位于后期结果时，才允许用一句承接语回到最早节点，之后始终顺叙。
 - emotional_arc 用卡片编号标出关键情感节点；结合对应卡片的 emotional_stakes 和 relationship_change 克制展开，不得虚构内心。
+- expansion_level 决定详略：focus 写成关键场景，support 交代完整因果，brief 合并或一句带过；不得把所有卡平均展开。
 
 【核心创作规则】
 {creative_guidelines}
 
 【本次任务】
 - 文案风格：{style}
-- 第 {attempt} 次生成
+- 候选稿 {attempt}/{MAX_REWRITE_ATTEMPTS}，本稿叙事策略：{narrative_strategy['strategy']}
+- 策略说明：{narrative_strategy['guidance'] or '按该观察角度重新分配详略，但保持真实时间顺序。'}
+- 优先展开素材卡：{json.dumps(narrative_strategy['focus_cards'], ensure_ascii=False)}。其他事实仍按 priority 完整覆盖，但不要沿用原文详略。
 - 固定开头必须一字不改并单独成段：{opening_hook}
 - 后续正文必须自然承接固定开头，不能另起钩子；固定开头不参与重复率和总体重构度计算。
 - 带书规则：{conversion_instruction}
@@ -1763,9 +1939,12 @@ def rewrite_script_with_minimax(
     except Exception as exc:
         raise RewriteGenerationError("source analysis", exc) from exc
     best_result: dict | None = None
-    last_result: dict | None = None
+    last_failed_result: dict | None = None
+    generation_errors: list[str] = []
+    successful_candidates = 0
+    narrative_strategies = rewrite_narrative_strategies(fact_brief)
 
-    def candidate_rank(candidate: dict) -> tuple[int, int, int, int, int, int, int, int, int]:
+    def candidate_rank(candidate: dict) -> tuple:
         metrics = candidate.get("rewrite_comparison") or {}
         return (
             int(bool(metrics.get("passed"))),
@@ -1774,14 +1953,19 @@ def rewrite_script_with_minimax(
             int(metrics.get("emotional_quality_passed") is not False),
             int(bool(metrics.get("length_passed"))),
             int(metrics.get("outline_structure_passed") is not False),
+            int(metrics.get("structure_similarity_passed") is not False),
+            int(metrics.get("detail_distribution_passed") is not False),
+            int(metrics.get("narrative_difference") or metrics.get("overall_difference") or 0),
             int(metrics.get("overall_difference") or 0),
+            -int(metrics.get("structure_similarity") if metrics.get("structure_similarity") is not None else 50),
+            -int(metrics.get("detail_distribution_similarity") if metrics.get("detail_distribution_similarity") is not None else 50),
             -int(metrics.get("continuous_reuse") or 0),
             -int(metrics.get("sentence_imitation") or 0),
         )
 
     for attempt in range(1, MAX_REWRITE_ATTEMPTS + 1):
         prompt = build_rewrite_prompt(
-            raw_script, style, attempt, last_result, preserve_rule, fact_brief,
+            raw_script, style, attempt, last_failed_result, preserve_rule, fact_brief,
             append_book_promotion, promotion_book_title,
         )
         try:
@@ -1791,19 +1975,10 @@ def rewrite_script_with_minimax(
                 fact_brief.get("verified_quotes") or [],
             )
         except Exception as exc:
-            if best_result:
-                comparison = best_result.get("rewrite_comparison") or {}
-                best_result["rewrite_attempts"] = attempt - 1
-                best_result["rewrite_warning"] = (
-                    build_rewrite_quality_warning(comparison)
-                    + f" 后续第 {attempt} 次重试调用失败，已展示此前最好的完整稿件。"
-                )
-                best_result["rewrite_quality_status"] = "generation_warning"
-                best_result["rewrite_error"] = ""
-                return best_result
-            if isinstance(exc, RewriteGenerationError):
-                raise
-            raise RewriteGenerationError(f"draft generation attempt {attempt}", exc) from exc
+            generation_errors.append(f"候选稿 {attempt}：{type(exc).__name__}: {str(exc)[:180]}")
+            continue
+        successful_candidates += 1
+        result["rewrite_narrative_strategy"] = narrative_strategies[attempt - 1]
         result["rewrite_fact_brief"] = fact_brief
         result["rewrite_analysis_warning"] = fact_brief.get("analysis_warning", "")
         try:
@@ -1835,24 +2010,30 @@ def rewrite_script_with_minimax(
             result["rewrite_compression_warning"] = (
                 f"成稿约为原文的 {comparison.get('length_ratio', 0)}%，低于 "
                 f"最低 {REWRITE_COMPRESSION_WARNING_RATIO}% 的篇幅要求；"
-                "本次生成未通过篇幅验收，系统会在最多三次范围内重写。"
+                "本候选未通过篇幅验收，系统会继续比较三种叙事策略。"
             )
             result["rewrite_warning"] = result["rewrite_compression_warning"]
             result["rewrite_quality_status"] = "compression_warning"
         if not best_result or candidate_rank(result) > candidate_rank(best_result):
             best_result = result
-        if comparison.get("passed", False):
-            result["rewrite_attempts"] = attempt
-            return result
-        last_result = result
+        last_failed_result = None if comparison.get("passed", False) else result
 
-    assert best_result is not None
+    if best_result is None:
+        detail = "；".join(generation_errors) or "没有候选稿成功返回"
+        raise RewriteGenerationError("draft generation candidates", RuntimeError(detail))
     comparison = best_result.get("rewrite_comparison") or {}
     best_result["rewrite_attempts"] = MAX_REWRITE_ATTEMPTS
+    best_result["rewrite_candidates_generated"] = successful_candidates
+    if comparison.get("passed", False):
+        if generation_errors:
+            best_result["rewrite_candidate_warning"] = "；".join(generation_errors)
+        return best_result
     # A quality threshold miss should not discard a complete draft. Return the
     # best attempt with actionable metrics; reserve request failures for cases
     # where no draft could be generated at all.
     best_result["rewrite_warning"] = build_rewrite_quality_warning(comparison)
+    if generation_errors:
+        best_result["rewrite_warning"] += " 候选生成异常：" + "；".join(generation_errors)
     best_result["rewrite_quality_status"] = "quality_warning"
     best_result["rewrite_error"] = ""
     return best_result
