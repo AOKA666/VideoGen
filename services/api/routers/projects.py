@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from services.store import PROJECTS_DIR, load_db, project_dir, save_db
-from services.text_service import RewriteGenerationError, RewriteQualityError, compare_scripts, extract_opening_hook, generate_guozhijiliang_script, infer_title, merge_short_script_paragraphs, rewrite_script
+from services.text_service import SUPPORTED_PROMOTION_BOOK_TITLES, RewriteGenerationError, RewriteQualityError, compare_scripts, extract_opening_hook, generate_guozhijiliang_script, infer_title, merge_short_script_paragraphs, rewrite_script
 from services.web_image_pipeline import DONE_STATUSES, recover_interrupted_searches
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
@@ -20,40 +20,23 @@ def normalize_promotion_book_title(value: object) -> str:
     title = str(value or "").strip().strip("《》").strip()
     if not title:
         raise HTTPException(400, "Promotion book title must not be empty")
-    if len(title) > 60:
-        raise HTTPException(400, "Promotion book title must not exceed 60 characters")
-    return title
+    matched = next(
+        (item for item in SUPPORTED_PROMOTION_BOOK_TITLES if item.casefold() == title.casefold()),
+        None,
+    )
+    if matched is None:
+        supported = "、".join(f"《{item}》" for item in SUPPORTED_PROMOTION_BOOK_TITLES)
+        raise HTTPException(400, f"Unsupported promotion book. Choose one of: {supported}")
+    return matched
 
 
 def promotion_book_titles(db: dict) -> list[str]:
-    titles = [DEFAULT_PROMOTION_BOOK_TITLE]
-    titles.extend(db.get("promotion_books") or [])
-    titles.extend(project.get("promotion_book_title") for project in db.get("projects", []))
-    normalized = []
-    seen = set()
-    for value in titles:
-        try:
-            title = normalize_promotion_book_title(value)
-        except HTTPException:
-            continue
-        key = title.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        normalized.append(title)
-    return normalized
+    return list(SUPPORTED_PROMOTION_BOOK_TITLES)
 
 
 def register_promotion_book_title(db: dict, value: object) -> tuple[str, bool]:
     title = normalize_promotion_book_title(value)
-    existing = next(
-        (item for item in promotion_book_titles(db) if item.casefold() == title.casefold()),
-        None,
-    )
-    if existing is not None:
-        return existing, False
-    db.setdefault("promotion_books", []).append(title)
-    return title, True
+    return title, False
 
 
 class ProjectCreate(BaseModel):
@@ -77,6 +60,7 @@ class ScriptUpdate(BaseModel):
 class AiScriptPayload(BaseModel):
     person_name: str | None = None
     event_angle: str | None = None
+    promotion_book_title: str = DEFAULT_PROMOTION_BOOK_TITLE
 
 
 class MergeParagraphsPayload(BaseModel):
@@ -141,12 +125,17 @@ def create_project(payload: ProjectCreate):
     return {"project_id": project_id, "status": "created", "project": project}
 
 
-@router.post("/generate-guozhijiliang-script")
+@router.post("/generate-ai-script")
+@router.post("/generate-guozhijiliang-script", include_in_schema=False)
 def generate_ai_script(payload: AiScriptPayload | None = None):
     try:
+        promotion_book_title = normalize_promotion_book_title(
+            payload.promotion_book_title if payload else DEFAULT_PROMOTION_BOOK_TITLE
+        )
         result = generate_guozhijiliang_script(
             (payload.person_name if payload else "") or "",
             (payload.event_angle if payload else "") or "",
+            promotion_book_title,
         )
     except Exception as exc:
         raise HTTPException(502, f"AI script generation failed: {exc}") from exc
@@ -161,10 +150,8 @@ def list_promotion_books():
 
 @router.post("/promotion-books")
 def create_promotion_book(payload: PromotionBookCreate):
-    db = load_db()
-    title, created = register_promotion_book_title(db, payload.title)
-    if created:
-        save_db(db)
+    db = load_db(copy_data=False)
+    title, _ = register_promotion_book_title(db, payload.title)
     return {"title": f"《{title}》", "books": [f"《{item}》" for item in promotion_book_titles(db)]}
 
 

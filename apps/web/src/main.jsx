@@ -1,12 +1,27 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Archive, Check, Copy, Crop, Download, Eraser, Film, FolderOpen, ImagePlus, Library, Mic, Music, Plus, RefreshCw, Save, Scissors, Search, Tags, Trash2, Wand2, X } from 'lucide-react';
+import { Archive, Check, Copy, Crop, Download, Eraser, Film, FolderOpen, ImagePlus, Library, Mic, Music, RefreshCw, Save, Scissors, Search, Tags, Trash2, Wand2 } from 'lucide-react';
 import './styles.css';
 
 const API = import.meta.env.VITE_API_URL ?? (import.meta.env.DEV ? 'http://127.0.0.1:8000' : '');
 const ASSET_PAGE_SIZE = 60;
 const DEFAULT_PROMOTION_BOOK = '《国之脊梁》';
+const PROMOTION_BOOKS = ['《女性人物传记》', '《历史深处的民国》', '《国之脊梁》'];
 const PROMOTION_BOOK_STORAGE_KEY = 'videogen.promotionBookTitle';
+const PROMOTION_BOOK_AI_HINTS = {
+  '《女性人物传记》': {
+    person: '留空则选择一位经历不易的真实女性',
+    angle: '如：在婚姻、事业与自我之间作出的选择',
+  },
+  '《历史深处的民国》': {
+    person: '留空则选择一位晚清或民国关键人物',
+    angle: '如：一个改变个人命运与时代走向的决定',
+  },
+  '《国之脊梁》': {
+    person: '留空则选择一位隐姓埋名的国家脊梁',
+    angle: '如：生命最后一天仍在整理绝密资料',
+  },
+};
 const MAX_VOICE_VOLUME_PERCENT = 200;
 const VOICE_OPTIONS = [
   { value: 'zh_male_m191_uranus_bigtts', label: '男声 · 沉稳叙事' },
@@ -18,7 +33,8 @@ const VOICE_OPTIONS = [
 
 function formatPromotionBookTitle(value) {
   const title = String(value || '').trim().replace(/^《|》$/g, '').trim();
-  return title ? `《${title}》` : DEFAULT_PROMOTION_BOOK;
+  const formatted = title ? `《${title}》` : DEFAULT_PROMOTION_BOOK;
+  return PROMOTION_BOOKS.includes(formatted) ? formatted : DEFAULT_PROMOTION_BOOK;
 }
 
 async function request(path, options = {}) {
@@ -275,9 +291,7 @@ function App() {
   const [promotionBookTitle, setPromotionBookTitle] = useState(
     () => formatPromotionBookTitle(window.localStorage.getItem(PROMOTION_BOOK_STORAGE_KEY)),
   );
-  const [promotionBooks, setPromotionBooks] = useState([DEFAULT_PROMOTION_BOOK]);
-  const [addingPromotionBook, setAddingPromotionBook] = useState(false);
-  const [newPromotionBookTitle, setNewPromotionBookTitle] = useState('');
+  const [promotionBooks, setPromotionBooks] = useState(PROMOTION_BOOKS);
   const [voiceType, setVoiceType] = useState(VOICE_OPTIONS[0].value);
   const [speechRate, setSpeechRate] = useState(0);
   const [voicePreviewUrl, setVoicePreviewUrl] = useState('');
@@ -431,7 +445,7 @@ function App() {
     setAssets(assetList.assets);
     setLibrary(validLibrary(libraryData.library) ? libraryData.library : null);
     setMusicLibrary(musicData.music || []);
-    setPromotionBooks(promotionBookData.books?.length ? promotionBookData.books : [DEFAULT_PROMOTION_BOOK]);
+    setPromotionBooks(promotionBookData.books?.length ? promotionBookData.books : PROMOTION_BOOKS);
     if (projectData) {
       setProject(projectData.project);
       setShots(projectData.shots);
@@ -663,31 +677,14 @@ function App() {
     }
   }
 
-  async function addPromotionBook() {
-    const title = newPromotionBookTitle.trim();
-    if (!title) {
-      setMessage('请输入要新增的图书名称');
-      return;
-    }
-    const data = await run('新增图书', () => request('/api/projects/promotion-books', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title }),
-    }));
-    if (!data?.title) return;
-    setPromotionBooks(data.books || [data.title]);
-    setPromotionBookTitle(data.title);
-    setNewPromotionBookTitle('');
-    setAddingPromotionBook(false);
-  }
-
   async function generateAiRawScript() {
-    const data = await run('AI 写文案', () => request('/api/projects/generate-guozhijiliang-script', {
+    const data = await run('AI 写文案', () => request('/api/projects/generate-ai-script', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         person_name: aiScriptPerson,
         event_angle: aiScriptAngle,
+        promotion_book_title: promotionBookTitle,
       }),
     }));
     if (data?.script) {
@@ -1730,41 +1727,16 @@ function App() {
                       onChange={(event) => setPromotionBookTitle(event.target.value)}
                       aria-label="选择带货书籍"
                     >
-                      {[...new Set([...promotionBooks, promotionBookTitle].filter(Boolean))].map((title) => (
+                      {promotionBooks.map((title) => (
                         <option key={title} value={title}>{title}</option>
                       ))}
                     </select>
-                    <button type="button" onClick={() => setAddingPromotionBook((current) => !current)}>
-                      {addingPromotionBook ? <X size={16} /> : <Plus size={16} />}
-                      {addingPromotionBook ? '取消' : '新增图书'}
-                    </button>
                   </div>
-                  {addingPromotionBook && (
-                    <div className="promotion-book-add-row">
-                      <input
-                        value={newPromotionBookTitle}
-                        maxLength="60"
-                        onChange={(event) => setNewPromotionBookTitle(event.target.value)}
-                        onKeyDown={(event) => {
-                          if (event.key === 'Enter') {
-                            event.preventDefault();
-                            addPromotionBook();
-                          }
-                        }}
-                        placeholder="输入图书名称，如：中国科学家家书"
-                        aria-label="新增图书名称"
-                        autoFocus
-                      />
-                      <button type="button" className="primary" onClick={addPromotionBook} disabled={busy || !newPromotionBookTitle.trim()}>
-                        <Check size={16} /> 保存
-                      </button>
-                    </div>
-                  )}
-                  <small>开启“结尾带书”后，将完成情绪承接、产品价值塑造和阅读理由，引导观众产生购买兴趣。</small>
+                  <small>选择对应书籍并开启“结尾带书”后，系统会按该书的专属规则在二创文案末尾续写带书内容。</small>
                 </label>
                 <div className="ai-script-options">
-                  <label>人物名称（可选）<input value={aiScriptPerson} onChange={(event) => setAiScriptPerson(event.target.value)} placeholder="留空则随机选择《国之脊梁》院士" /></label>
-                  <label>核心事件或角度（可选）<input value={aiScriptAngle} onChange={(event) => setAiScriptAngle(event.target.value)} placeholder="如：生命最后一天整理资料" /></label>
+                  <label>人物名称（可选）<input value={aiScriptPerson} onChange={(event) => setAiScriptPerson(event.target.value)} placeholder={(PROMOTION_BOOK_AI_HINTS[promotionBookTitle] || PROMOTION_BOOK_AI_HINTS[DEFAULT_PROMOTION_BOOK]).person} /></label>
+                  <label>核心事件或角度（可选）<input value={aiScriptAngle} onChange={(event) => setAiScriptAngle(event.target.value)} placeholder={(PROMOTION_BOOK_AI_HINTS[promotionBookTitle] || PROMOTION_BOOK_AI_HINTS[DEFAULT_PROMOTION_BOOK]).angle} /></label>
                 </div>
               </div>
 
@@ -1956,6 +1928,17 @@ function App() {
                   <span className="script-character-count">{scriptCharacterCount(rewrittenScriptEditor)} 字</span>
                 </div>
                 <div className="actions">
+                  <select
+                    className="promotion-book-inline-select"
+                    value={promotionBookTitle}
+                    onChange={(event) => setPromotionBookTitle(event.target.value)}
+                    aria-label="选择结尾带书书籍"
+                    title="选择结尾要推荐的书籍"
+                  >
+                    {promotionBooks.map((title) => (
+                      <option key={title} value={title}>{title}</option>
+                    ))}
+                  </select>
                   <button
                     type="button"
                     className={appendBookPromotion ? 'book-promotion-toggle active' : 'book-promotion-toggle'}
@@ -1963,7 +1946,7 @@ function App() {
                     title={`在二创文案末尾带出 ${promotionBookTitle.trim() || DEFAULT_PROMOTION_BOOK}`}
                     onClick={() => setAppendBookPromotion((current) => !current)}
                   >
-                    <Tags size={15} /> {appendBookPromotion ? '已选结尾带书' : '结尾带书'}
+                    <Tags size={15} /> 结尾带书
                   </button>
                   <button
                     type="button"

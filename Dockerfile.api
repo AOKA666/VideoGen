@@ -20,6 +20,7 @@ RUN python -m pip install --upgrade pip \
 
 COPY services/api /app/services/api
 COPY 二创提示词.txt /app/services/api/二创提示词.txt
+COPY 带书提示词.txt /app/services/api/带书提示词.txt
 
 RUN useradd --create-home --uid 10001 videogen \
     && mkdir -p /app/storage /app/services/api/logs \
