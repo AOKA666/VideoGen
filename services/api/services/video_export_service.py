@@ -13,8 +13,8 @@ from PIL import Image, ImageOps
 
 
 CREATE_NO_WINDOW = 0x08000000
-SUBTITLE_ASS_PRIMARY_COLOR = "&H0000FFFF"
-SUBTITLE_RGB_COLOR = (1.0, 1.0, 0.0)
+SUBTITLE_ASS_PRIMARY_COLOR = "&H00FFFFFF"
+SUBTITLE_RGB_COLOR = (1.0, 1.0, 1.0)
 
 
 def _escape_ffmpeg_filter_path(path: str | Path) -> str:
@@ -320,12 +320,14 @@ def render_project_video(
 
         # Use the preferred font (文源圆体 with fallback) for title text
         font_path = _escape_ffmpeg_filter_path(preferred_font_path)
+        line1_font_size = max(16, min(52, 900 // max(len(title_line1), 1)))
+        line2_font_size = max(16, min(52, 900 // max(len(title_line2), 1)))
 
         # Two-line title in the top safe area, lowered slightly from the canvas edge.
         if title_line1:
             filters.append(
                 f"[vsub]drawtext=text='{_escape_drawtext(title_line1)}':"
-                f"fontsize=52:fontcolor=white:borderw=4:bordercolor=black:"
+                f"fontsize={line1_font_size}:fontcolor=white:borderw=4:bordercolor=black:"
                 f"x=(w-text_w)/2:y=80:"
                 f"fontfile='{font_path}'[vt1]"
             )
@@ -337,7 +339,7 @@ def render_project_video(
         if title_line2:
             filters.append(
                 f"[{current_label}]drawtext=text='{_escape_drawtext(title_line2)}':"
-                f"fontsize=52:fontcolor=yellow:borderw=4:bordercolor=black:"
+                f"fontsize={line2_font_size}:fontcolor=yellow:borderw=4:bordercolor=black:"
                 f"x=(w-text_w)/2:y=152:"
                 f"fontfile='{font_path}'[vout]"
             )
@@ -621,6 +623,8 @@ def create_jianying_native_draft(
 
     # Keep both title lines centered near the top, with breathing room above them.
     title_duration_us = max(audio_duration_us, 1)
+    title_line1_size = max(5, min(15, round(135 / max(len(title_line1), 1))))
+    title_line2_size = max(5, min(15, round(135 / max(len(title_line2), 1))))
     title_border = draft.TextBorder(
         color=(0.0, 0.0, 0.0),
         width=20.0,
@@ -633,7 +637,7 @@ def create_jianying_native_draft(
                 draft.Timerange(0, title_duration_us),
                 font=jianying_font,
                 style=draft.TextStyle(
-                    size=15,
+                    size=title_line1_size,
                     bold=True,
                     color=(1.0, 1.0, 1.0),
                     align=1,
@@ -652,7 +656,7 @@ def create_jianying_native_draft(
                 draft.Timerange(0, title_duration_us),
                 font=jianying_font,
                 style=draft.TextStyle(
-                    size=15,
+                    size=title_line2_size,
                     bold=True,
                     underline=True,
                     color=(1.0, 0.86, 0.0),

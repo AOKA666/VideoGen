@@ -24,6 +24,7 @@ DEFAULT_DB: dict[str, Any] = {
     "generated_assets": [],
     "music_library": [],
     "promotion_books": ["国之脊梁"],
+    "ai_script_people_history": {},
     "asset_library": None,
     "web_image_failures": [],
     "web_image_diagnostics": [],

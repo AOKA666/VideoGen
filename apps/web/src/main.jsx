@@ -309,9 +309,11 @@ function App() {
   const [voicePreviewUrl, setVoicePreviewUrl] = useState('');
   const [previewingVoice, setPreviewingVoice] = useState(false);
   const [voiceVolume, setVoiceVolume] = useState(100);
+  const [voiceAudioVersion, setVoiceAudioVersion] = useState(0);
   const [projectNameDraft, setProjectNameDraft] = useState('');
   const [titleLine1, setTitleLine1] = useState('');
   const [titleLine2, setTitleLine2] = useState('');
+  const [titleCandidates, setTitleCandidates] = useState([]);
   const [titleConfirmed, setTitleConfirmed] = useState(false);
   const [publishShortTitle, setPublishShortTitle] = useState('');
   const [publishDescription, setPublishDescription] = useState('');
@@ -335,9 +337,11 @@ function App() {
   const musicVoiceInputRef = useRef(null);
   const musicPreviewRef = useRef(null);
   const voicePreviewRef = useRef(null);
+  const generatedVoicePlayerRef = useRef(null);
   const mainVoicePreviewRef = useRef(null);
   const mainVoiceAudioGraphRef = useRef({ element: null, context: null, gain: null });
   const playVoicePreviewAfterLoadRef = useRef(false);
+  const playGeneratedVoiceAfterLoadRef = useRef(false);
   const lastProjectStatusRef = useRef('');
   const rawScriptRef = useRef(null);
   const rewrittenScriptDirtyRef = useRef(false);
@@ -518,6 +522,7 @@ function App() {
     ));
     setTitleLine1(project.title_line1 || '');
     setTitleLine2(project.title_line2 || '');
+    setTitleCandidates(project.title_candidates || []);
     setTitleConfirmed(Boolean(project.title_line1 && project.title_line2) || Boolean(project.cover_url));
     setPublishShortTitle(project.publish_short_title || '');
     setPublishDescription(project.publish_description || '');
@@ -559,6 +564,11 @@ function App() {
       player.volume = Math.max(0, Math.min(1, voiceVolume / 100));
     }
   }, [voiceVolume, project?.audio_url, tab]);
+
+  useEffect(() => {
+    const player = generatedVoicePlayerRef.current;
+    if (player) player.volume = Math.max(0, Math.min(1, voiceVolume / 100));
+  }, [voiceVolume, project?.audio_url, voiceAudioVersion, tab]);
 
   useEffect(() => () => {
     const context = mainVoiceAudioGraphRef.current.context;
@@ -701,7 +711,17 @@ function App() {
     }));
     if (data?.script) {
       setRawScriptDraft(data.script);
-      setMessage(data.person ? `AI 文案已生成：${data.person}` : 'AI 文案已生成');
+      const sourceCount = Array.isArray(data.research_sources) ? data.research_sources.length : 0;
+      const selectionLabel = data.person_selection === 'online_search'
+        ? `联网发现${sourceCount ? ` · ${sourceCount} 条资料` : ''}`
+        : data.person_selection === 'local_fallback'
+          ? '联网搜索失败，已使用本地兜底'
+          : sourceCount
+            ? `联网核实 · ${sourceCount} 条资料`
+            : '按指定人物生成';
+      setMessage(data.person
+        ? `AI 文案已生成（${selectionLabel}）：${data.person}`
+        : `AI 文案已生成（${selectionLabel}）`);
     }
   }
 
@@ -1323,8 +1343,10 @@ function App() {
     if (!voiceResult) return false;
     const subtitleResult = await run('生成字幕', () => request(`/api/projects/${projectId}/generate-subtitles`, { method: 'POST' }));
     if (!subtitleResult) return false;
+    playGeneratedVoiceAfterLoadRef.current = true;
     await refreshAll(projectId);
-    setTab('cover');
+    setVoiceAudioVersion(Date.now());
+    setMessage('配音与字幕已生成，可直接试听；不满意可以重新生成');
     return true;
   }
 
@@ -1567,11 +1589,10 @@ function App() {
       method: 'POST',
     }));
     if (!result) return;
-    setTitleLine1(result.line1);
-    setTitleLine2(result.line2);
+    setTitleCandidates(result.candidates || []);
     setTitleConfirmed(false);
     await refreshAll(projectId);
-    setMessage('爆款标题生成完成，请确认或编辑');
+    setMessage(`已生成 ${result.candidates?.length || 0} 组标题，请选择或手动编辑`);
   }
 
   async function confirmTitle(options = {}) {
@@ -2187,8 +2208,35 @@ function App() {
               >
                 <Music size={18} /> 用音乐库生成歌词字幕
               </button>
-              <button className="primary" onClick={generateVoiceAndSubtitles}><Mic size={18} /> 生成配音与字幕</button>
+              <button className="primary" onClick={generateVoiceAndSubtitles} disabled={busy}>
+                <Mic size={18} /> {project?.audio_url ? '重新生成配音与字幕' : '生成配音与字幕'}
+              </button>
             </div>
+            {project?.audio_url && (
+              <div className="generated-voice-preview">
+                <div>
+                  <strong>完整配音试听</strong>
+                  <small>不满意可调整音色或语速后重新生成。</small>
+                </div>
+                <audio
+                  key={`${project.audio_url}-${voiceAudioVersion}`}
+                  ref={generatedVoicePlayerRef}
+                  controls
+                  preload="metadata"
+                  src={`${API}${project.audio_url}?v=${voiceAudioVersion || encodeURIComponent(project.updated_at || '')}`}
+                  onLoadedMetadata={(event) => {
+                    event.currentTarget.volume = Math.min(1, voiceVolume / 100);
+                  }}
+                  onCanPlay={(event) => {
+                    if (!playGeneratedVoiceAfterLoadRef.current) return;
+                    playGeneratedVoiceAfterLoadRef.current = false;
+                    event.currentTarget.play().catch(() => {
+                      setMessage('配音已生成，请点击播放器开始试听');
+                    });
+                  }}
+                />
+              </div>
+            )}
             <div className="shot-list">
               {shots.map((shot) => (
                 <div className="shot" key={shot.id}>
@@ -2251,21 +2299,60 @@ function App() {
                     标题第一行
                     <input
                       value={titleLine1}
-                      maxLength={9}
                       onChange={(event) => { setTitleLine1(event.target.value); setTitleConfirmed(false); }}
-                      placeholder="1-9字，制造悬念"
+                      placeholder="标题第一行，完整表达"
                     />
                   </label>
                   <label>
                     标题第二行
                     <input
                       value={titleLine2}
-                      maxLength={9}
                       onChange={(event) => { setTitleLine2(event.target.value); setTitleConfirmed(false); }}
-                      placeholder="1-9字，揭示反差"
+                      placeholder="标题第二行，完整表达"
                     />
                   </label>
                 </div>
+                {titleCandidates.length > 0 && (
+                  <div className="title-candidates">
+                    <div className="title-candidates-heading">
+                      <strong>AI 标题候选</strong>
+                      <small>系统不评分，点击选择后可继续编辑</small>
+                    </div>
+                    <div className="title-candidate-grid">
+                      {titleCandidates.map((candidate, index) => {
+                        const selected = (
+                          titleLine1 === candidate.line1
+                          && titleLine2 === candidate.line2
+                        );
+                        return (
+                          <button
+                            type="button"
+                            className={selected ? 'title-candidate selected' : 'title-candidate'}
+                            key={`${candidate.line1}-${candidate.line2}-${index}`}
+                            onClick={() => {
+                              setTitleLine1(candidate.line1 || '');
+                              setTitleLine2(candidate.line2 || '');
+                              setTitleConfirmed(false);
+                              setMessage(`已选择候选 ${index + 1}，可以编辑后确认`);
+                            }}
+                          >
+                            <span className="title-candidate-index">{index + 1}</span>
+                            <span className="title-candidate-copy">
+                              <b>{candidate.line1}</b>
+                              <b>{candidate.line2}</b>
+                            </span>
+                            {candidate.style && <small>{candidate.style}</small>}
+                            {candidate.evidence_quote && (
+                              <small className="title-candidate-evidence">
+                                依据：{candidate.evidence_quote}
+                              </small>
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
                 <div className="actions">
                   <button
                     className="primary"

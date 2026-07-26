@@ -11,6 +11,8 @@ API_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(API_ROOT))
 
 from services.text_service import (  # noqa: E402
+    BOOK_SCRIPT_STORY_SEEDS,
+    FAMILIAR_DEFAULT_AI_SCRIPT_PEOPLE,
     GUOZHIJILIANG_PEOPLE,
     GUOZHIJILIANG_STORY_SEEDS,
     MIN_GUOZHIJILIANG_SCRIPT_CHARS,
@@ -19,6 +21,7 @@ from services.text_service import (  # noqa: E402
     REWRITE_COMPRESSION_WARNING_RATIO,
     RECENT_GUOZHIJILIANG_OPENINGS,
     RECENT_GUOZHIJILIANG_PEOPLE,
+    RECENT_BOOK_SCRIPT_PEOPLE,
     SENSITIVE_AI_SCRIPT_PEOPLE,
     RewriteGenerationError,
     apply_rewrite_fact_coverage_quality,
@@ -33,6 +36,7 @@ from services.text_service import (  # noqa: E402
     compare_scripts,
     cover_title_rejection_reasons,
     cover_title_needs_rewrite,
+    discover_book_script_seed,
     ensure_original_opening,
     ensure_rewrite_book_promotion,
     extract_leading_title,
@@ -41,6 +45,7 @@ from services.text_service import (  # noqa: E402
     extract_opening_hook,
     fallback_rewrite_fact_brief,
     generate_publish_assistant,
+    generate_guozhijiliang_script,
     generate_viral_title,
     generate_shots,
     guozhijiliang_opening_needs_rewrite,
@@ -53,8 +58,10 @@ from services.text_service import (  # noqa: E402
     parse_title_candidates,
     request_minimax_rewrite_fact_coverage,
     request_minimax_rewrite_analysis,
+    request_online_person_selection,
     rewrite_script,
     rewrite_script_with_minimax,
+    search_person_sources,
 )
 
 
@@ -217,7 +224,7 @@ class ShotTagGenerationTests(unittest.TestCase):
         priorities = [card["priority"] for card in brief["material_cards"]]
 
         self.assertIn("must", priorities)
-        self.assertIn("mergeable", priorities)
+        self.assertIn("support", priorities)
 
     def test_source_analysis_retries_an_underdense_fact_brief(self) -> None:
         class FakeResponse:
@@ -293,6 +300,22 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertEqual(0, brief["minimum_material_length"])
         self.assertEqual(1, brief["minimum_section_count"])
         self.assertTrue(brief["fact_coverage_passed"])
+
+    def test_material_card_priority_is_initialized_without_section_plan_priority(self) -> None:
+        brief = normalize_rewrite_fact_brief({
+            "protagonists": ["测试人物"],
+            "material_cards": [{
+                "id": 1,
+                "time": "某年",
+                "person": "测试人物",
+                "fact": "完成关键任务",
+            }],
+            "section_plan": [{"task": "完整讲述", "cards": [1]}],
+        })
+
+        self.assertEqual("must", brief["material_cards"][0]["priority"])
+        self.assertEqual("support", brief["material_cards"][0]["expansion_level"])
+        self.assertNotIn("priority", brief["section_plan"][0])
 
     def test_many_structured_cards_cannot_all_default_to_must(self) -> None:
         cards = [
@@ -486,33 +509,37 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertFalse(coverage["emotional_quality_passed"])
         self.assertFalse(result["rewrite_comparison"]["passed"])
 
-    def test_mergeable_cards_may_be_merged_but_not_deleted(self) -> None:
+    def test_support_cards_may_be_omitted_when_they_do_not_serve_the_core(self) -> None:
         fact_brief = {
             "material_cards": [
                 {"id": 1, "priority": "must", "fact": "主人公完成核心任务"},
-                {"id": 2, "priority": "mergeable", "fact": "一段重复履历"},
+                {"id": 2, "priority": "support", "fact": "一段辅助履历"},
+                {"id": 3, "priority": "discardable", "fact": "一段重复履历"},
             ],
         }
 
         coverage = normalize_rewrite_fact_coverage({
             "covered_cards": [1],
             "partial_cards": [],
-            "missing_cards": [{"card": 2, "missing": "成稿省略了重复履历"}],
+            "missing_cards": [
+                {"card": 2, "missing": "成稿省略了辅助履历"},
+                {"card": 3, "missing": "成稿省略了重复履历"},
+            ],
             "timeline_order_passed": True,
             "out_of_order_cards": [],
         }, fact_brief)
 
-        self.assertFalse(coverage["fact_coverage_passed"])
-        self.assertEqual(2, coverage["expected_fact_cards"])
-        self.assertEqual(2, coverage["missing_fact_cards"][0]["card"])
+        self.assertTrue(coverage["fact_coverage_passed"])
+        self.assertEqual(1, coverage["expected_fact_cards"])
+        self.assertEqual([], coverage["missing_fact_cards"])
 
-    def test_extra_content_does_not_affect_fact_coverage(self) -> None:
+    def test_unsupported_new_facts_fail_reverse_grounding(self) -> None:
         coverage = normalize_rewrite_fact_coverage({
             "covered_cards": [1],
             "partial_cards": [],
             "missing_cards": [],
             "factual_grounding_passed": False,
-            "fabricated_facts": ["虚构了一段获奖经历"],
+            "unsupported_claims": [{"claim": "虚构了一段获奖经历", "reason": "资料卡无依据"}],
             "timeline_order_passed": True,
             "out_of_order_cards": [],
         }, {"material_cards": [{"id": 1, "priority": "must", "fact": "完成核心任务"}]})
@@ -524,9 +551,9 @@ class ShotTagGenerationTests(unittest.TestCase):
             },
         }, coverage)
 
-        self.assertNotIn("factual_grounding_passed", coverage)
-        self.assertNotIn("fabricated_facts", coverage)
-        self.assertTrue(result["rewrite_comparison"]["passed"])
+        self.assertFalse(coverage["factual_grounding_passed"])
+        self.assertEqual("虚构了一段获奖经历", coverage["unsupported_claims"][0]["claim"])
+        self.assertFalse(result["rewrite_comparison"]["passed"])
 
     def test_fact_audit_receives_exact_protected_opening(self) -> None:
         captured_payload = {}
@@ -567,7 +594,8 @@ class ShotTagGenerationTests(unittest.TestCase):
             audit_prompt,
         )
         self.assertIn("检查完整成稿，包括 protected_opening", audit_prompt)
-        self.assertIn("逐张审核全部资料卡", audit_prompt)
+        self.assertIn("逐张审核 must 卡", audit_prompt)
+        self.assertIn("反向检查成稿中的每个事实性陈述", audit_prompt)
         self.assertTrue(coverage["timeline_order_passed"])
 
     def test_length_ratio_does_not_reject_a_fact_complete_draft(self) -> None:
@@ -679,6 +707,164 @@ class ShotTagGenerationTests(unittest.TestCase):
         RECENT_GUOZHIJILIANG_PEOPLE.clear()
 
         self.assertEqual(len(selected), len(set(selected)))
+        self.assertFalse(set(selected) & FAMILIAR_DEFAULT_AI_SCRIPT_PEOPLE["国之脊梁"])
+
+    def test_ai_script_defaults_to_underknown_people_for_each_book(self) -> None:
+        RECENT_GUOZHIJILIANG_PEOPLE.clear()
+        for recent in RECENT_BOOK_SCRIPT_PEOPLE.values():
+            recent.clear()
+
+        for book_title in ("女性人物传记", "历史深处的民国"):
+            underknown_count = (
+                len(BOOK_SCRIPT_STORY_SEEDS[book_title])
+                - len(FAMILIAR_DEFAULT_AI_SCRIPT_PEOPLE[book_title])
+            )
+            selected = [
+                choose_book_script_seed(book_title)[0]
+                for _ in range(underknown_count)
+            ]
+            self.assertEqual(underknown_count, len(set(selected)))
+            self.assertFalse(set(selected) & FAMILIAR_DEFAULT_AI_SCRIPT_PEOPLE[book_title])
+
+        RECENT_GUOZHIJILIANG_PEOPLE.clear()
+        for recent in RECENT_BOOK_SCRIPT_PEOPLE.values():
+            recent.clear()
+
+    def test_ai_script_person_search_uses_live_web_results(self) -> None:
+        search_page = """
+        <ul><li class="res-list">
+          <h3 class="res-title"><a href="/link" data-mdurl="https://example.edu.cn/wang-yinglai">
+            被遗忘的生物化学家<em>王应睐</em>
+          </a></h3>
+          <span class="res-list-summary">王应睐组织人工合成牛胰岛素研究，长期推动中国生物化学发展。</span>
+        </li></ul>"""
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return search_page.encode("utf-8")
+
+        with patch(
+            "services.text_service.urllib.request.urlopen",
+            return_value=FakeResponse(),
+        ) as urlopen:
+            results = search_person_sources("国之脊梁")
+
+        self.assertEqual("被遗忘的生物化学家王应睐", results[0]["title"])
+        self.assertIn("so.com/s", urlopen.call_args.args[0].full_url)
+
+    def test_online_person_selection_must_be_supported_by_search_results(self) -> None:
+        search_results = [{
+            "title": "王应睐与中国生物化学",
+            "url": "https://example.edu.cn/wang-yinglai",
+            "summary": "王应睐组织人工合成牛胰岛素研究。",
+        }]
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "choices": [{
+                        "message": {
+                            "content": json.dumps({
+                                "person": "王应睐",
+                                "event_angle": "组织人工合成牛胰岛素研究",
+                                "evidence_indices": [1],
+                            }, ensure_ascii=False)
+                        }
+                    }]
+                }, ensure_ascii=False).encode("utf-8")
+
+        with patch(
+            "services.text_service.urllib.request.urlopen",
+            return_value=FakeResponse(),
+        ):
+            selected = request_online_person_selection(
+                "国之脊梁",
+                search_results,
+                "test-key",
+                ["汪猷"],
+            )
+
+        self.assertEqual("王应睐", selected["person"])
+        self.assertEqual(
+            ["https://example.edu.cn/wang-yinglai"],
+            selected["source_urls"],
+        )
+
+    def test_ai_script_discovers_a_person_online_when_name_is_blank(self) -> None:
+        first_paragraph = "飞机出事前，他把装有关键资料的文件紧紧护在怀里。"
+        script = "\n".join(
+            [first_paragraph]
+            + [
+                f"这是第{index}段经过核实的人物经历，包含具体行动、现实处境、关键选择与实际结果，足以形成一个完整画面。"
+                for index in range(2, 24)
+            ]
+        )
+        response_body = {
+            "choices": [{
+                "message": {
+                    "content": json.dumps({
+                        "title": "无名之光",
+                        "person": "王应睐",
+                        "event_angle": "组织人工合成牛胰岛素研究",
+                        "script": script,
+                    }, ensure_ascii=False)
+                }
+            }]
+        }
+        captured_prompts = []
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps(response_body, ensure_ascii=False).encode("utf-8")
+
+        def fake_urlopen(request, **_kwargs):
+            payload = json.loads(request.data.decode("utf-8"))
+            captured_prompts.append(payload["messages"][1]["content"])
+            return FakeResponse()
+
+        discovery = {
+            "person": "王应睐",
+            "event_angle": "组织人工合成牛胰岛素研究",
+            "research_notes": "- 中国科学院资料：王应睐组织相关科研工作。（https://example.cn/source）",
+            "source_urls": ["https://example.cn/source"],
+        }
+        with patch.dict("os.environ", {"MINIMAX_API_KEY": "test-key"}), patch(
+            "services.text_service.discover_book_script_seed",
+            return_value=discovery,
+        ) as discover, patch(
+            "services.text_service.remember_ai_script_person",
+        ), patch(
+            "services.text_service.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            result = generate_guozhijiliang_script(
+                promotion_book_title="国之脊梁"
+            )
+
+        discover.assert_called_once()
+        self.assertEqual("王应睐", result["person"])
+        self.assertEqual("online_search", result["person_selection"])
+        self.assertEqual(["https://example.cn/source"], result["research_sources"])
+        self.assertIn("本次联网检索资料", captured_prompts[0])
+        self.assertIn("https://example.cn/source", captured_prompts[0])
 
     def test_guozhijiliang_prompt_discourages_reused_opening_templates(self) -> None:
         RECENT_GUOZHIJILIANG_OPENINGS.clear()
@@ -711,8 +897,10 @@ class ShotTagGenerationTests(unittest.TestCase):
             "历史深处的民国", "宋教仁", "议会政治刚露出希望时遇刺"
         )
 
-        self.assertIn(female_person, {"杨绛", "陆小曼", "张爱玲", "林徽因", "三毛"})
-        self.assertIn(history_person, {"李鸿章", "袁世凯", "孙中山", "宋教仁", "蔡锷", "黄兴", "张作霖", "张学良"})
+        self.assertIn(female_person, {person for person, _ in BOOK_SCRIPT_STORY_SEEDS["女性人物传记"]})
+        self.assertIn(history_person, {person for person, _ in BOOK_SCRIPT_STORY_SEEDS["历史深处的民国"]})
+        self.assertNotIn(female_person, FAMILIAR_DEFAULT_AI_SCRIPT_PEOPLE["女性人物传记"])
+        self.assertNotIn(history_person, FAMILIAR_DEFAULT_AI_SCRIPT_PEOPLE["历史深处的民国"])
         self.assertIn("爱情、婚姻、家庭、事业、自由", female_prompt)
         self.assertIn("《女性人物传记》", female_prompt)
         self.assertIn("晚清至民国关键人物", history_prompt)
@@ -776,11 +964,17 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertFalse(cover_title_needs_rewrite("丈夫被关监狱", "她四处奔走营救", script))
         self.assertFalse(cover_title_needs_rewrite("普通老先生", "护住公文包", "老人护住了公文包。"))
 
-    def test_cover_title_rejects_vague_dialogue_and_generic_emotion(self) -> None:
+    def test_cover_title_allows_generic_emotion_as_an_angle(self) -> None:
         script = "妻子告诉他自己回不来了，让他别再等。听完以后，他一直低着头。"
 
         self.assertTrue(cover_title_needs_rewrite("她说回不来别等了", "他不敢抬头", script))
-        self.assertTrue(cover_title_needs_rewrite("等了整整四十年", "他流下眼泪", script))
+        reasons = cover_title_rejection_reasons(
+            "等了整整四十年",
+            "他流下眼泪",
+            "他等了整整四十年，终于见面时流下眼泪。",
+            "他等了整整四十年，终于见面时流下眼泪",
+        )
+        self.assertNotIn("包含空洞总结或泛情绪反应", reasons)
 
     def test_cover_title_accepts_evidence_backed_core_fact_without_forced_suspense(self) -> None:
         script = "他是地下党员，在台湾潜伏42年，为了等妻子一生没有再娶。"
@@ -790,7 +984,7 @@ class ShotTagGenerationTests(unittest.TestCase):
 
         self.assertEqual([], reasons)
 
-    def test_generate_viral_title_fails_instead_of_using_fallback(self) -> None:
+    def test_generate_viral_title_accepts_legacy_single_object(self) -> None:
         class FakeResponse:
             def __enter__(self):
                 return self
@@ -817,9 +1011,8 @@ class ShotTagGenerationTests(unittest.TestCase):
         ):
             title = generate_viral_title(script)
 
-        self.assertEqual("", title["line1"])
-        self.assertEqual("", title["line2"])
-        self.assertIn("error", title)
+        self.assertEqual(1, len(title["candidates"]))
+        self.assertEqual("女儿病危那天", title["candidates"][0]["line1"])
 
     def test_generate_viral_title_accepts_json_array_candidates(self) -> None:
         class FakeResponse:
@@ -847,11 +1040,13 @@ class ShotTagGenerationTests(unittest.TestCase):
         ):
             title = generate_viral_title("她捐出1000万，自己却穿15块钱胶鞋。")
 
-        self.assertEqual("她捐出千万", title["line1"])
-        self.assertEqual("却穿15块鞋", title["line2"])
-        self.assertEqual("反差型", title["style"])
+        self.assertEqual(2, len(title["candidates"]))
+        self.assertEqual("她捐出千万", title["candidates"][0]["line1"])
+        self.assertEqual("却穿15块鞋", title["candidates"][0]["line2"])
+        self.assertEqual("伟大一生", title["candidates"][1]["line1"])
+        self.assertNotIn("score", title["candidates"][0])
 
-    def test_generate_viral_title_skips_fake_contrast_candidate(self) -> None:
+    def test_generate_viral_title_returns_all_candidates_without_word_bank_warnings(self) -> None:
         class FakeResponse:
             def __enter__(self):
                 return self
@@ -878,28 +1073,115 @@ class ShotTagGenerationTests(unittest.TestCase):
         ):
             title = generate_viral_title(script)
 
-        self.assertEqual("丈夫被关监狱", title["line1"])
-        self.assertEqual("她四处奔走营救", title["line2"])
+        self.assertEqual(2, len(title["candidates"]))
+        self.assertEqual("她没先带娃回国", title["candidates"][0]["line2"])
+        self.assertNotIn("warnings", title["candidates"][0])
+        self.assertEqual("她四处奔走营救", title["candidates"][1]["line2"])
+
+    def test_generate_viral_title_keeps_complete_long_lines(self) -> None:
+        long_line1 = "他在最困难的时候仍然选择回到祖国继续研究"
+        long_line2 = "这项选择后来改变了整个工程的命运"
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "choices": [{
+                        "message": {
+                            "content": json.dumps([{
+                                "first_line": long_line1,
+                                "second_line": long_line2,
+                                "style": "事实型",
+                                "evidence_quote": "他在最困难的时候仍然选择回到祖国继续研究，这项选择后来改变了整个工程的命运",
+                            }], ensure_ascii=False)
+                        }
+                    }]
+                }, ensure_ascii=False).encode("utf-8")
+
+        with patch.dict("os.environ", {"MINIMAX_API_KEY": "test"}), patch(
+            "services.text_service.urllib.request.urlopen",
+            return_value=FakeResponse(),
+        ):
+            result = generate_viral_title(
+                "他在最困难的时候仍然选择回到祖国继续研究，这项选择后来改变了整个工程的命运。"
+            )
+
+        self.assertEqual(long_line1, result["candidates"][0]["line1"])
+        self.assertEqual(long_line2, result["candidates"][0]["line2"])
 
     def test_parse_title_candidates_reads_json_array(self) -> None:
         candidates = parse_title_candidates('[{"first_line":"美国扣下箱子","second_line":"到底怕什么","style":"悬念型"}]')
 
         self.assertEqual("美国扣下箱子", candidates[0]["first_line"])
 
-    def test_cover_title_prompt_balances_core_fact_and_local_conflict_without_templates(self) -> None:
+    def test_parse_title_candidates_accepts_fenced_wrapped_object(self) -> None:
+        content = """Here are the candidates:
+```json
+{"candidates":[{"first_line":"她捐出1000万","second_line":"自己只穿15元胶鞋","style":"反差型"}]}
+```"""
+
+        candidates = parse_title_candidates(content)
+
+        self.assertEqual(1, len(candidates))
+        self.assertEqual("她捐出1000万", candidates[0]["first_line"])
+
+    def test_parse_title_candidates_accepts_single_candidate_object(self) -> None:
+        candidates = parse_title_candidates(
+            '{"first_line":"守了整整30年","second_line":"他从未离开岗位","style":"事实型"}'
+        )
+
+        self.assertEqual("他从未离开岗位", candidates[0]["second_line"])
+
+    def test_generate_viral_title_retries_after_malformed_json(self) -> None:
+        class FakeResponse:
+            def __init__(self, content: str):
+                self.content = content
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "choices": [{"message": {"content": self.content}}]
+                }, ensure_ascii=False).encode("utf-8")
+
+        valid = json.dumps([{
+            "first_line": "她捐出1000万",
+            "second_line": "自己只穿15元胶鞋",
+            "style": "反差型",
+            "evidence_quote": "她捐出1000万，自己却穿15元胶鞋",
+        }], ensure_ascii=False)
+        with patch.dict("os.environ", {"MINIMAX_API_KEY": "test"}), patch(
+            "services.text_service.urllib.request.urlopen",
+            side_effect=[FakeResponse("这次没有按格式输出"), FakeResponse(valid)],
+        ) as mocked_urlopen:
+            result = generate_viral_title("她捐出1000万，自己却穿15元胶鞋。")
+
+        self.assertEqual(2, mocked_urlopen.call_count)
+        self.assertEqual("她捐出1000万", result["candidates"][0]["line1"])
+
+    def test_cover_title_prompt_is_click_driven_without_word_bank_constraints(self) -> None:
         import inspect
         from services import text_service
 
         source = inspect.getsource(text_service.generate_viral_title)
-        self.assertIn("局部瞬间并不天然优于全文核心事实", source)
-        self.assertIn("可以写有具体身份、数字、任务或结果的事实概括标题", source)
-        self.assertIn("一次生成12组不同角度的候选", source)
-        self.assertIn("允许输出事实型概括标题", source)
+        self.assertIn("提高点击率和停留率", source)
+        self.assertIn("不使用任何标题词库、禁词表、优先词表或固定模板", source)
+        self.assertIn("任何词、语气和句式都可以使用", source)
+        self.assertIn("一次生成12组不同角度、不同句式的候选", source)
+        self.assertIn("不设字数上限", source)
+        self.assertNotIn("cover_title_score(", source)
+        self.assertNotIn("cover_title_rejection_reasons(", source)
+        self.assertNotIn("style 只能是", source)
         self.assertIn("evidence_quote", source)
-        self.assertNotIn("好的结构示例", source)
-        self.assertNotIn("高停留词优先", source)
-        self.assertNotIn("第一行：父亲去世那天", source)
-        self.assertNotIn("她说回不来别等了", source)
 
     def test_rewrite_prompt_only_keeps_book_promotion_when_source_has_it(self) -> None:
         plain_prompt = build_rewrite_prompt("他拒绝高薪，回到祖国继续研究。", "纪实故事型", 1)
@@ -963,7 +1245,8 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertIn("整理一份中性事实底稿", prompt)
         self.assertIn("资料卡不是摘要", prompt)
         self.assertIn('"priority": "must"', prompt)
-        self.assertIn('"priority": "mergeable"', prompt)
+        self.assertIn('"priority": "support"', prompt)
+        self.assertIn('"priority": "discardable"', prompt)
         self.assertIn("不要为了凑数量拆卡", prompt)
         self.assertIn("按真实时间排序", prompt)
         self.assertIn("只记录原文明示的事实", prompt)
@@ -1008,8 +1291,9 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertNotIn("原文正文里的独特句子只能由系统侧核验", prompt)
         self.assertIn("请只依据事实资料卡，独立创作", prompt)
         self.assertNotIn("<raw_script>", prompt)
-        self.assertIn("按 material_cards 的 id 从小到大", prompt)
-        self.assertIn("所有资料卡都必须保留事实方向", prompt)
+        self.assertIn("事件的实际先后和因果不得写反", prompt)
+        self.assertIn("support 卡只在服务核心命题时保留", prompt)
+        self.assertIn("discardable 卡允许删除", prompt)
 
     def test_rewrite_prompt_uses_project_creative_guidelines_and_keeps_dynamic_opening(self) -> None:
         source = "用户框选的固定开头。后面的原文需要进入第二阶段核对。"
@@ -1025,6 +1309,14 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertIn("事实资料卡是唯一写作依据", prompt)
         self.assertIn("用户框选的固定开头。", prompt)
         self.assertIn("固定开头必须一字不改", prompt)
+        self.assertIn("真实爆点与完播", prompt)
+        self.assertIn("固定开头与紧接的前两段共同完成留人", prompt)
+        self.assertIn("至少两个阶段性问题", prompt)
+        self.assertIn("专业贡献必须翻译成普通人能理解的实际变化", prompt)
+        self.assertIn("具体年份使用阿拉伯数字", prompt)
+        self.assertIn("年龄、数量、金额、比例、序号和自然量词不作格式限制", prompt)
+        self.assertIn("时间回到", prompt)
+        self.assertIn("时间拨回到", prompt)
         self.assertNotIn("【在这里粘贴原文】", prompt)
 
     def test_rewrite_prompt_stays_compact(self) -> None:
@@ -1053,8 +1345,9 @@ class ShotTagGenerationTests(unittest.TestCase):
             },
         )
 
-        self.assertIn("卡片 id 仅代表原文出现顺序，不代表真实时间", prompt)
-        self.assertIn("不得照抄卡片编号顺序", prompt)
+        self.assertIn("卡片 id 仅代表原文出现顺序", prompt)
+        self.assertIn("恢复真实发生顺序", prompt)
+        self.assertIn("允许预告有依据的结果", prompt)
 
     def test_short_rewrite_does_not_receive_a_length_correction(self) -> None:
         previous = {
@@ -1128,13 +1421,133 @@ class ShotTagGenerationTests(unittest.TestCase):
 
         self.assertEqual(2, rewrite.call_count)
         self.assertEqual("差异得分为91的候选稿", result["rewritten_script"])
-        self.assertEqual("关键选择", result["rewrite_narrative_strategy"]["strategy"])
-        self.assertIn("本稿叙事策略：核心冲突", prompts[0])
-        self.assertIn("本稿叙事策略：关键选择", prompts[1])
+        self.assertEqual("选择代价", result["rewrite_narrative_strategy"]["strategy"])
+        self.assertIn("本稿叙事策略：冲突悬念", prompts[0])
+        self.assertIn("本稿叙事策略：选择代价", prompts[1])
         self.assertEqual(2, len({
             prompt.split("本稿表达指纹：", 1)[1].split("。", 1)[0]
             for prompt in prompts
         }))
+
+    def test_attraction_score_selects_better_candidate_after_quality_gates(self) -> None:
+        responses = [
+            {
+                "rewritten_script": "差异更高但吸引力较弱的候选稿",
+                "rewrite_comparison": {
+                    "passed": True,
+                    "non_length_quality_passed": True,
+                    "length_passed": True,
+                    "narrative_difference": 96,
+                    "overall_difference": 96,
+                    "continuous_reuse": 1,
+                    "source_phrase_reuse": 1,
+                },
+            },
+            {
+                "rewritten_script": "有真实冲突和递进悬念的候选稿",
+                "rewrite_comparison": {
+                    "passed": True,
+                    "non_length_quality_passed": True,
+                    "length_passed": True,
+                    "narrative_difference": 86,
+                    "overall_difference": 86,
+                    "continuous_reuse": 2,
+                    "source_phrase_reuse": 2,
+                },
+            },
+        ]
+        audits = [
+            {
+                "fact_coverage_passed": True,
+                "timeline_order_passed": True,
+                "emotional_quality_passed": True,
+                "attraction_score": 58,
+            },
+            {
+                "fact_coverage_passed": True,
+                "timeline_order_passed": True,
+                "emotional_quality_passed": True,
+                "attraction_score": 88,
+            },
+        ]
+
+        with patch(
+            "services.text_service.request_minimax_rewrite_analysis",
+            return_value={"facts": ["事实"]},
+        ), patch(
+            "services.text_service.request_minimax_rewrite",
+            side_effect=responses,
+        ), patch(
+            "services.text_service.request_minimax_rewrite_fact_coverage",
+            side_effect=audits,
+        ):
+            result = rewrite_script_with_minimax("原文事实。后续事实。", "纪实故事型", "test-key")
+
+        self.assertEqual("有真实冲突和递进悬念的候选稿", result["rewritten_script"])
+        self.assertEqual(88, result["rewrite_comparison"]["attraction_score"])
+
+    def test_low_attraction_feedback_is_sent_to_the_next_candidate(self) -> None:
+        prompts = []
+        responses = [
+            {
+                "rewritten_script": "第一篇较平的候选稿",
+                "rewrite_comparison": {
+                    "passed": True,
+                    "non_length_quality_passed": True,
+                    "overall_difference": 85,
+                    "continuous_reuse": 2,
+                    "source_phrase_reuse": 2,
+                },
+            },
+            {
+                "rewritten_script": "第二篇有递进的候选稿",
+                "rewrite_comparison": {
+                    "passed": True,
+                    "non_length_quality_passed": True,
+                    "overall_difference": 85,
+                    "continuous_reuse": 2,
+                    "source_phrase_reuse": 2,
+                },
+            },
+        ]
+        audits = [
+            {
+                "fact_coverage_passed": True,
+                "factual_grounding_passed": True,
+                "timeline_order_passed": True,
+                "emotional_quality_passed": True,
+                "attraction_score": 52,
+                "attraction_issues": ["前段没有具体冲突", "答案释放过早"],
+            },
+            {
+                "fact_coverage_passed": True,
+                "factual_grounding_passed": True,
+                "timeline_order_passed": True,
+                "emotional_quality_passed": True,
+                "attraction_score": 82,
+                "attraction_issues": [],
+            },
+        ]
+
+        def fake_rewrite(prompt, *_args, **_kwargs):
+            prompts.append(prompt)
+            return responses[len(prompts) - 1]
+
+        with patch(
+            "services.text_service.request_minimax_rewrite_analysis",
+            return_value={"facts": ["事实"]},
+        ), patch(
+            "services.text_service.request_minimax_rewrite",
+            side_effect=fake_rewrite,
+        ), patch(
+            "services.text_service.request_minimax_rewrite_fact_coverage",
+            side_effect=audits,
+        ):
+            result = rewrite_script_with_minimax("原文事实。后续事实。", "纪实故事型", "test-key")
+
+        self.assertIn("本轮必须提升吸引力", prompts[1])
+        self.assertIn("前段没有具体冲突", prompts[1])
+        self.assertEqual("第二篇有递进的候选稿", result["rewritten_script"])
 
     def test_length_ratio_does_not_outweigh_rewrite_difference(self) -> None:
         responses = [
@@ -1453,8 +1866,8 @@ class ShotTagGenerationTests(unittest.TestCase):
 
         self.assertIn("后续正文必须自然承接固定开头", prompt)
         self.assertIn("不沿着原文逐句换词", prompt)
-        self.assertIn("默认按真实时间顺叙", prompt)
-        self.assertIn("之后始终顺叙", prompt)
+        self.assertIn("事件实际发生的先后关系不得写反", prompt)
+        self.assertIn("信息揭晓顺序可以重组", prompt)
         self.assertIn("不让段落数量、段落长短和信息位置与原文一一对应", prompt)
 
     def test_rewrite_retry_requires_timeline_correction(self) -> None:
@@ -1480,7 +1893,8 @@ class ShotTagGenerationTests(unittest.TestCase):
 
         self.assertIn("本轮必须修正时间线", prompt)
         self.assertIn("素材卡4提前到素材卡2之前", prompt)
-        self.assertIn("严格按编号从小到大推进", prompt)
+        self.assertIn("可以先预告资料卡已有的真实结果", prompt)
+        self.assertIn("不得把后发生的行动写成先发生", prompt)
 
     def test_rewrite_prompt_does_not_turn_emotional_arc_into_a_hard_plan(self) -> None:
         prompt = build_rewrite_prompt(
@@ -1554,6 +1968,45 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertIn("keyword_overlap", comparison)
         self.assertIn("source_phrase_reuse", comparison)
 
+    def test_rewrite_comparison_rejects_chinese_years_and_stiff_time_transitions(self) -> None:
+        comparison = compare_scripts(
+            "他在实验室工作多年，后来完成任务。",
+            "时间拨回到一九八零年，他三十岁，带着壹佰元进入实验室。",
+        )
+
+        self.assertFalse(comparison["rewrite_format_passed"])
+        self.assertFalse(comparison["passed"])
+        self.assertIn("时间拨回到一九八零年", comparison["rewrite_format_issues"])
+        self.assertIn("一九八零", comparison["rewrite_format_issues"])
+        self.assertNotIn("三十", comparison["rewrite_format_issues"])
+        self.assertNotIn("壹佰", comparison["rewrite_format_issues"])
+
+        direct_return = compare_scripts(
+            "他后来进入实验室。",
+            "时间回到1980年，他进入实验室。",
+        )
+        self.assertFalse(direct_return["rewrite_format_passed"])
+        self.assertIn("时间回到1980年", direct_return["rewrite_format_issues"])
+
+        natural_numbers = compare_scripts(
+            "原文事实。",
+            "1980年，他三十岁，带着壹佰元和一封信进入实验室。",
+        )
+        self.assertTrue(natural_numbers["rewrite_format_passed"])
+
+    def test_rewrite_format_rules_do_not_modify_protected_opening_or_quote(self) -> None:
+        opening = "时间拨回到一九八零年。"
+        quote = "我等了三十年。"
+        comparison = compare_scripts(
+            f"{opening}{quote}原文继续。",
+            f"{opening}{quote}1981年，他直接进入新的工作阶段。",
+            protected_opening=opening,
+            protected_passages=[quote],
+        )
+
+        self.assertTrue(comparison["rewrite_format_passed"])
+        self.assertEqual([], comparison["rewrite_format_issues"])
+
     def test_rewrite_comparison_excludes_verified_direct_quotes(self) -> None:
         quote = "我一定要回到祖国。"
         source = f"他说：{quote}随后整理行李准备出发。"
@@ -1594,7 +2047,7 @@ class ShotTagGenerationTests(unittest.TestCase):
             "最终那台设备顺利启动。"
         )
         rewritten = (
-            "她告别亲友来到医院。院长将一份名单递给她。\n\n"
+            "她告别亲友来到医院。院长将1份名单递给她。\n\n"
             "此后她留在病房值守。几年间她帮助了很多病人。\n\n"
             "最终这项救治圆满结束。"
         )

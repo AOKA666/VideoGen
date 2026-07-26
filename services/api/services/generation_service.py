@@ -658,7 +658,7 @@ def compose_uploaded_cover(source_path: Path, cover_path: Path, line1: str, line
         line_heights = [box[3] - box[1] for box in line_boxes]
         total_height = sum(line_heights) + line_gap
         widest_line = max(box[2] - box[0] for box in line_boxes)
-        if (widest_line <= max_text_width and total_height <= title_area_height) or font_size <= 64:
+        if (widest_line <= max_text_width and total_height <= title_area_height) or font_size <= 12:
             break
         font_size -= 4
 

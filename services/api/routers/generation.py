@@ -540,17 +540,16 @@ def generate_title(project_id: str):
         raise HTTPException(502, f"Title generation failed: {result['error']}")
 
     now = datetime.now().isoformat(timespec="seconds")
-    project["title_line1"] = result["line1"]
-    project["title_line2"] = result["line2"]
-    project["title_full"] = result["full_title"]
+    candidates = result.get("candidates") or []
+    if not candidates:
+        raise HTTPException(502, "Title generation returned no candidates")
+    project["title_candidates"] = candidates
     project["updated_at"] = now
     save_db(db)
 
     return {
         "status": "success",
-        "line1": result["line1"],
-        "line2": result["line2"],
-        "full_title": result["full_title"],
+        "candidates": candidates,
     }
 
 
@@ -593,8 +592,6 @@ def generate_cover(project_id: str, file: UploadFile = File(...)):
     title_line2 = str(project.get("title_line2") or "").strip()
     if not title_line1 or not title_line2:
         raise HTTPException(400, "Please confirm the two-line title before generating the cover")
-    if len(title_line1) > 9 or len(title_line2) > 9:
-        raise HTTPException(400, "Each title line must not exceed 9 characters")
     if not str(file.content_type or "").startswith("image/"):
         raise HTTPException(400, "Please upload an image file")
 
