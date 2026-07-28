@@ -866,6 +866,73 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertIn("本次联网检索资料", captured_prompts[0])
         self.assertIn("https://example.cn/source", captured_prompts[0])
 
+    def test_ai_script_retries_read_timeout_with_configurable_timeout(self) -> None:
+        response_body = {
+            "choices": [{
+                "message": {
+                    "content": json.dumps({
+                        "title": "测试标题",
+                        "person": "测试人物",
+                        "event_angle": "测试事件",
+                        "script": "生成成功",
+                    }, ensure_ascii=False)
+                }
+            }]
+        }
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps(response_body, ensure_ascii=False).encode("utf-8")
+
+        with patch.dict("os.environ", {
+            "MINIMAX_API_KEY": "test-key",
+            "MINIMAX_AI_SCRIPT_TIMEOUT_SECONDS": "345",
+        }), patch(
+            "services.text_service.search_person_sources",
+            return_value=[],
+        ), patch(
+            "services.text_service.guozhijiliang_script_stats",
+            return_value={"chars": 1200, "paragraphs": 22},
+        ), patch(
+            "services.text_service.guozhijiliang_opening_needs_rewrite",
+            return_value=False,
+        ), patch(
+            "services.text_service.remember_ai_script_person",
+        ), patch(
+            "services.text_service.urllib.request.urlopen",
+            side_effect=[TimeoutError("The read operation timed out"), FakeResponse()],
+        ) as mocked_urlopen:
+            result = generate_guozhijiliang_script("测试人物", "测试事件")
+
+        self.assertEqual("生成成功", result["script"])
+        self.assertEqual(2, mocked_urlopen.call_count)
+        self.assertEqual([345, 345], [
+            call.kwargs["timeout"] for call in mocked_urlopen.call_args_list
+        ])
+
+    def test_ai_script_reports_timeout_after_retry_limit(self) -> None:
+        with patch.dict("os.environ", {
+            "MINIMAX_API_KEY": "test-key",
+            "MINIMAX_AI_SCRIPT_TIMEOUT_SECONDS": "31",
+        }), patch(
+            "services.text_service.search_person_sources",
+            return_value=[],
+        ), patch(
+            "services.text_service.urllib.request.urlopen",
+            side_effect=TimeoutError("The read operation timed out"),
+        ) as mocked_urlopen:
+            with self.assertRaises(RuntimeError) as raised:
+                generate_guozhijiliang_script("测试人物", "测试事件")
+
+        self.assertEqual(2, mocked_urlopen.call_count)
+        self.assertIn("2 requests (31s timeout each)", str(raised.exception))
+
     def test_guozhijiliang_prompt_discourages_reused_opening_templates(self) -> None:
         RECENT_GUOZHIJILIANG_OPENINGS.clear()
         prompt = build_guozhijiliang_script_prompt_v2("茅以升", "亲手建成钱塘江大桥，又在战火逼近时含泪参与炸桥")

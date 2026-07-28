@@ -39,6 +39,7 @@ MAX_REWRITE_ATTEMPTS = 2
 MIN_REWRITE_ATTRACTION_SCORE = 70
 MAX_REWRITE_ANALYSIS_ATTEMPTS = 2
 MAX_REWRITE_ANALYSIS_REQUEST_ATTEMPTS = 2
+MAX_AI_SCRIPT_REQUEST_ATTEMPTS = 2
 REWRITE_COMPRESSION_WARNING_RATIO = 0
 SUPPORTED_PROMOTION_BOOK_TITLES = ("女性人物传记", "历史深处的民国", "国之脊梁")
 SENSITIVE_AI_SCRIPT_PEOPLE = ("孙中山", "孙文", "中山先生", "周恩来", "周总理")
@@ -3062,6 +3063,10 @@ def generate_guozhijiliang_script(
     script = ""
     stats = {"chars": 0, "paragraphs": 0}
     retry_note = ""
+    request_timeout = max(
+        30,
+        min(600, int(os.getenv("MINIMAX_AI_SCRIPT_TIMEOUT_SECONDS", "300"))),
+    )
     for attempt in range(3):
         prompt = build_book_script_prompt(
             bare_book_title, selected_person, selected_angle
@@ -3086,12 +3091,34 @@ def generate_guozhijiliang_script(
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(req, timeout=120) as response:
-                body = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            error_body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"MiniMax API {exc.code}: {error_body}") from exc
+        body: dict | None = None
+        for request_attempt in range(1, MAX_AI_SCRIPT_REQUEST_ATTEMPTS + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=request_timeout) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as exc:
+                error_body = exc.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"MiniMax API {exc.code}: {error_body}") from exc
+            except (TimeoutError, urllib.error.URLError) as exc:
+                is_timeout = isinstance(exc, TimeoutError) or isinstance(
+                    getattr(exc, "reason", None), TimeoutError
+                )
+                if not is_timeout:
+                    raise
+                if request_attempt >= MAX_AI_SCRIPT_REQUEST_ATTEMPTS:
+                    raise RuntimeError(
+                        "MiniMax AI script generation timed out after "
+                        f"{MAX_AI_SCRIPT_REQUEST_ATTEMPTS} requests "
+                        f"({request_timeout}s timeout each)"
+                    ) from exc
+                LOGGER.warning(
+                    "MiniMax AI script request timed out; retrying (%s/%s)",
+                    request_attempt,
+                    MAX_AI_SCRIPT_REQUEST_ATTEMPTS,
+                )
+        if body is None:
+            raise RuntimeError("MiniMax AI script generation returned no response")
 
         content = body["choices"][0]["message"]["content"]
         if isinstance(content, list):
