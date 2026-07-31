@@ -9,44 +9,54 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from services.store import PROJECTS_DIR, load_db, project_dir, save_db
-from services.text_service import SUPPORTED_PROMOTION_BOOK_TITLES, RewriteGenerationError, RewriteQualityError, compare_scripts, extract_opening_hook, generate_guozhijiliang_script, infer_title, merge_short_script_paragraphs, rewrite_script
+from services.history_workflow_service import STEP_LABELS, generate_history_step, revise_history_step
+from services.text_service import RewriteGenerationError, RewriteQualityError, compare_scripts, extract_opening_hook, generate_guozhijiliang_script, infer_title, merge_short_script_paragraphs, rewrite_script
 from services.web_image_pipeline import DONE_STATUSES, recover_interrupted_searches
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 DEFAULT_PROMOTION_BOOK_TITLE = "国之脊梁"
+DEFAULT_PROMOTION_BOOK_TITLES = ("女性人物传记", "历史深处的民国", "国之脊梁")
 
 
 def normalize_promotion_book_title(value: object) -> str:
     title = str(value or "").strip().strip("《》").strip()
     if not title:
         raise HTTPException(400, "Promotion book title must not be empty")
-    matched = next(
-        (item for item in SUPPORTED_PROMOTION_BOOK_TITLES if item.casefold() == title.casefold()),
-        None,
-    )
-    if matched is None:
-        supported = "、".join(f"《{item}》" for item in SUPPORTED_PROMOTION_BOOK_TITLES)
-        raise HTTPException(400, f"Unsupported promotion book. Choose one of: {supported}")
-    return matched
+    if len(title) > 80:
+        raise HTTPException(400, "Promotion book title must not exceed 80 characters")
+    return title
 
 
 def promotion_book_titles(db: dict) -> list[str]:
-    return list(SUPPORTED_PROMOTION_BOOK_TITLES)
+    titles = []
+    seen = set()
+    for value in db.get("promotion_books", []):
+        title = str(value or "").strip().strip("《》").strip()
+        key = title.casefold()
+        if title and key not in seen:
+            seen.add(key)
+            titles.append(title)
+    return titles
 
 
 def register_promotion_book_title(db: dict, value: object) -> tuple[str, bool]:
     title = normalize_promotion_book_title(value)
-    return title, False
+    titles = promotion_book_titles(db)
+    existing = next((item for item in titles if item.casefold() == title.casefold()), None)
+    if existing:
+        return existing, False
+    db["promotion_books"] = [*titles, title]
+    return title, True
 
 
 class ProjectCreate(BaseModel):
     name: str | None = None
     raw_script: str
-    content_type: str = "国之脊梁"
-    script_style: str = "纪实故事型"
+    content_type: str = "历史向视频"
+    script_style: str = "历史口播"
     voice_style: str = "沉稳男声"
     video_ratio: str = "9:16"
-    promotion_book_title: str = DEFAULT_PROMOTION_BOOK_TITLE
+    promotion_book_title: str | None = None
 
 
 class ScriptUpdate(BaseModel):
@@ -78,6 +88,14 @@ class PromotionBookCreate(BaseModel):
     title: str
 
 
+class HistoryChatPayload(BaseModel):
+    message: str
+
+
+class HistoryBookPayload(BaseModel):
+    title: str
+
+
 @router.get("")
 def list_projects():
     db = load_db(copy_data=False)
@@ -88,6 +106,13 @@ def list_projects():
     projects = []
     for project in db["projects"]:
         item = dict(project)
+        workflow = project.get("history_workflow") or {}
+        if workflow:
+            item["history_workflow"] = {
+                "active_step": workflow.get("active_step", 0),
+                "status": workflow.get("status", ""),
+                "updated_at": workflow.get("updated_at", ""),
+            }
         item["shot_count"] = shot_counts.get(str(project.get("id")), 0)
         item["archived"] = bool(project.get("archived", False))
         item["has_export"] = (
@@ -102,12 +127,17 @@ def create_project(payload: ProjectCreate):
     db = load_db()
     now = datetime.now().isoformat(timespec="seconds")
     project_id = str(uuid4())
-    promotion_book_title = normalize_promotion_book_title(payload.promotion_book_title)
+    available_books = promotion_book_titles(db)
+    promotion_book_title = normalize_promotion_book_title(
+        payload.promotion_book_title
+        or (available_books[0] if available_books else DEFAULT_PROMOTION_BOOK_TITLE)
+    )
     project = {
         "id": project_id,
         "name": payload.name or infer_title(payload.raw_script),
         "raw_script": payload.raw_script,
         "rewritten_script": "",
+        "history_workflow": {},
         "content_type": payload.content_type,
         "script_style": payload.script_style,
         "voice_style": payload.voice_style,
@@ -144,15 +174,39 @@ def generate_ai_script(payload: AiScriptPayload | None = None):
 
 @router.get("/promotion-books")
 def list_promotion_books():
-    db = load_db(copy_data=False)
+    db = load_db()
+    if not db.get("promotion_books_catalog_initialized"):
+        existing = promotion_book_titles(db)
+        for title in DEFAULT_PROMOTION_BOOK_TITLES:
+            if not any(item.casefold() == title.casefold() for item in existing):
+                existing.append(title)
+        db["promotion_books"] = existing
+        db["promotion_books_catalog_initialized"] = True
+        save_db(db)
     return {"books": [f"《{title}》" for title in promotion_book_titles(db)]}
 
 
 @router.post("/promotion-books")
 def create_promotion_book(payload: PromotionBookCreate):
-    db = load_db(copy_data=False)
+    db = load_db()
     title, _ = register_promotion_book_title(db, payload.title)
+    save_db(db)
     return {"title": f"《{title}》", "books": [f"《{item}》" for item in promotion_book_titles(db)]}
+
+
+@router.delete("/promotion-books/{title}")
+def delete_promotion_book(title: str):
+    db = load_db()
+    normalized = normalize_promotion_book_title(title)
+    books = promotion_book_titles(db)
+    remaining = [item for item in books if item.casefold() != normalized.casefold()]
+    if len(remaining) == len(books):
+        raise HTTPException(404, "Promotion book not found")
+    if not remaining:
+        raise HTTPException(409, "At least one promotion book must remain")
+    db["promotion_books"] = remaining
+    save_db(db)
+    return {"status": "deleted", "books": [f"《{item}》" for item in remaining]}
 
 
 @router.get("/{project_id}")
@@ -272,6 +326,147 @@ def rewrite(project_id: str, payload: RewritePayload | None = None):
     project["updated_at"] = datetime.now().isoformat(timespec="seconds")
     save_db(db)
     return result
+
+
+@router.post("/{project_id}/history-workflow/steps/{step}")
+def run_history_workflow_step(project_id: str, step: int):
+    if step not in STEP_LABELS:
+        raise HTTPException(400, "History workflow step must be between 1 and 3")
+    db = load_db()
+    project = next((p for p in db["projects"] if p["id"] == project_id), None)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    workflow = dict(project.get("history_workflow") or {})
+    outputs = dict(workflow.get("outputs") or {})
+    messages = dict(workflow.get("messages") or {})
+    active_step = int(workflow.get("active_step") or 0)
+    if step > 1 and (active_step != step - 1 or not outputs.get(str(step - 1))):
+        raise HTTPException(409, f"请先完成并确认 step{step - 1}")
+    if step == 1:
+        outputs = {}
+        messages = {}
+        workflow = {}
+    try:
+        output = generate_history_step(
+            step,
+            project.get("raw_script", ""),
+            outputs,
+            messages,
+            project.get("promotion_book_title") or DEFAULT_PROMOTION_BOOK_TITLE,
+        )
+    except Exception as exc:
+        raise HTTPException(502, f"历史创作 step{step} 生成失败：{exc}") from exc
+    now = datetime.now().isoformat(timespec="seconds")
+    outputs[str(step)] = output
+    messages[str(step)] = []
+    workflow.update({
+        "active_step": step,
+        "status": "awaiting_confirmation",
+        "outputs": outputs,
+        "messages": messages,
+        "updated_at": now,
+    })
+    project["history_workflow"] = workflow
+    if step >= 2:
+        project["rewritten_script"] = output
+        project["status"] = "script_ready"
+    project["updated_at"] = now
+    save_db(db)
+    return {"status": "success", "workflow": workflow, "output": output}
+
+
+@router.post("/{project_id}/history-workflow/chat")
+def chat_history_workflow(project_id: str, payload: HistoryChatPayload):
+    message = payload.message.strip()
+    if not message:
+        raise HTTPException(400, "聊天内容不能为空")
+    db = load_db()
+    project = next((p for p in db["projects"] if p["id"] == project_id), None)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    workflow = dict(project.get("history_workflow") or {})
+    step = int(workflow.get("active_step") or 0)
+    outputs = dict(workflow.get("outputs") or {})
+    current_output = str(outputs.get(str(step)) or "").strip()
+    if step not in STEP_LABELS or not current_output:
+        raise HTTPException(409, "请先点击“改写”执行 step1")
+    messages = dict(workflow.get("messages") or {})
+    step_messages = list(messages.get(str(step)) or [])
+    try:
+        assistant_reply = revise_history_step(
+            step,
+            project.get("raw_script", ""),
+            current_output,
+            message,
+            step_messages,
+            project.get("promotion_book_title") or DEFAULT_PROMOTION_BOOK_TITLE,
+        )
+    except Exception as exc:
+        raise HTTPException(502, f"AI 修改失败：{exc}") from exc
+    step_messages.extend([
+        {"role": "user", "content": message},
+        {"role": "assistant", "content": assistant_reply},
+    ])
+    messages[str(step)] = step_messages
+    now = datetime.now().isoformat(timespec="seconds")
+    workflow.update({
+        "outputs": outputs,
+        "messages": messages,
+        "status": "awaiting_confirmation",
+        "updated_at": now,
+    })
+    project["history_workflow"] = workflow
+    project["updated_at"] = now
+    save_db(db)
+    return {
+        "status": "success",
+        "workflow": workflow,
+        "output": current_output,
+        "assistant_message": assistant_reply,
+    }
+
+
+@router.post("/{project_id}/history-workflow/book")
+def select_history_workflow_book(project_id: str, payload: HistoryBookPayload):
+    db = load_db()
+    project = next((p for p in db["projects"] if p["id"] == project_id), None)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    title, _ = register_promotion_book_title(db, payload.title)
+    now = datetime.now().isoformat(timespec="seconds")
+    project["promotion_book_title"] = title
+    project["history_workflow"] = {}
+    project["rewritten_script"] = ""
+    project["status"] = "created"
+    project["updated_at"] = now
+    save_db(db)
+    return {
+        "status": "success",
+        "title": f"《{title}》",
+        "workflow": {},
+        "books": [f"《{item}》" for item in promotion_book_titles(db)],
+    }
+
+
+@router.post("/{project_id}/history-workflow/finalize")
+def finalize_history_workflow(project_id: str):
+    db = load_db()
+    project = next((p for p in db["projects"] if p["id"] == project_id), None)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    workflow = dict(project.get("history_workflow") or {})
+    outputs = dict(workflow.get("outputs") or {})
+    final_script = str(outputs.get("3") or "").strip()
+    if int(workflow.get("active_step") or 0) != 3 or not final_script:
+        raise HTTPException(409, "请先完成 step3")
+    now = datetime.now().isoformat(timespec="seconds")
+    workflow.update({"status": "completed", "updated_at": now})
+    project["history_workflow"] = workflow
+    project["rewritten_script"] = final_script
+    project["status"] = "script_ready"
+    project["updated_at"] = now
+    save_db(db)
+    return {"status": "success", "workflow": workflow, "rewritten_script": final_script}
 
 
 @router.post("/{project_id}/merge-script-paragraphs")

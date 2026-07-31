@@ -1,27 +1,13 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Archive, Check, Copy, Crop, Download, Eraser, Film, FolderOpen, ImagePlus, Library, Mic, Music, RefreshCw, Save, Scissors, Search, Tags, Trash2, Wand2 } from 'lucide-react';
+import { Archive, Check, ChevronLeft, ChevronRight, Copy, Crop, Download, Eraser, Film, FolderOpen, ImagePlus, Library, MessageSquare, Mic, Music, RefreshCw, Save, Scissors, Search, Send, Tags, Trash2, Wand2 } from 'lucide-react';
 import './styles.css';
 
 const API = import.meta.env.VITE_API_URL ?? (import.meta.env.DEV ? 'http://127.0.0.1:8000' : '');
 const ASSET_PAGE_SIZE = 60;
 const DEFAULT_PROMOTION_BOOK = '《国之脊梁》';
-const PROMOTION_BOOKS = ['《女性人物传记》', '《历史深处的民国》', '《国之脊梁》'];
-const PROMOTION_BOOK_STORAGE_KEY = 'videogen.promotionBookTitle';
-const PROMOTION_BOOK_AI_HINTS = {
-  '《女性人物传记》': {
-    person: '留空则选择一位经历不易的真实女性',
-    angle: '如：在婚姻、事业与自我之间作出的选择',
-  },
-  '《历史深处的民国》': {
-    person: '留空则选择一位晚清或民国关键人物',
-    angle: '如：一个改变个人命运与时代走向的决定',
-  },
-  '《国之脊梁》': {
-    person: '留空则选择一位隐姓埋名的国家脊梁',
-    angle: '如：生命最后一天仍在整理绝密资料',
-  },
-};
+const SIDEBAR_COLLAPSED_STORAGE_KEY = 'videogen.sidebarCollapsed';
+const ADD_PROMOTION_BOOK_OPTION = '__add_promotion_book__';
 const MAX_VOICE_VOLUME_PERCENT = 200;
 const VOICE_OPTIONS = [
   { value: 'zh_male_m191_uranus_bigtts', label: '男声 · 沉稳叙事' },
@@ -30,12 +16,6 @@ const VOICE_OPTIONS = [
   { value: 'zh_female_vv_uranus_bigtts', label: '女声 · 清晰自然' },
   { value: 'S_6Sd6jOE42', label: '王立群' },
 ];
-
-function formatPromotionBookTitle(value) {
-  const title = String(value || '').trim().replace(/^《|》$/g, '').trim();
-  const formatted = title ? `《${title}》` : DEFAULT_PROMOTION_BOOK;
-  return PROMOTION_BOOKS.includes(formatted) ? formatted : DEFAULT_PROMOTION_BOOK;
-}
 
 async function request(path, options = {}) {
   const res = await fetch(`${API}${path}`, options);
@@ -100,6 +80,11 @@ function scriptCharacterCount(value) {
   return Array.from(stripScriptParagraphNumbers(value).replace(/\s+/g, '')).length;
 }
 
+function formatPromotionBookTitle(value) {
+  const title = String(value || '').trim().replace(/^《|》$/g, '').trim();
+  return title ? `《${title}》` : DEFAULT_PROMOTION_BOOK;
+}
+
 function formatBatchImagePrompts(prompts) {
   const normalized = prompts.map((prompt) => String(prompt || '').trim()).filter(Boolean);
   const visualMarker = '画面需求：';
@@ -160,9 +145,13 @@ function splitScriptParagraphs(value) {
 
 function projectStage(project) {
   const status = project?.status || 'created';
+  const historyStep = Number(project?.history_workflow?.active_step || 0);
+  const historyStatus = project?.history_workflow?.status || '';
   if (project?.has_export || project?.export_url || project?.draft_url || project?.last_export_at) return { key: 'done', label: '已完成' };
   if (['generating_shots', 'searching_images'].includes(status)) return { key: 'active', label: '处理中' };
-  if (status === 'created') return { key: 'todo', label: '等待二创' };
+  if (historyStatus === 'completed') return { key: 'todo', label: '历史文案已定稿' };
+  if (historyStep) return { key: 'active', label: `Step ${historyStep} 待确认` };
+  if (status === 'created') return { key: 'todo', label: '等待历史创作' };
   if (status === 'script_ready') return { key: 'todo', label: '文案已完成' };
   if (status === 'shots_ready') return { key: 'todo', label: project?.voice_url ? '等待标题封面' : '等待配音' };
   if (status === 'search_failed') return { key: 'todo', label: '图片处理失败' };
@@ -290,20 +279,15 @@ function App() {
   const [rewrittenScriptEditor, setRewrittenScriptEditor] = useState('');
   const [editingParagraphIndex, setEditingParagraphIndex] = useState(-1);
   const [paragraphDraft, setParagraphDraft] = useState('');
-  const [aiScriptPerson, setAiScriptPerson] = useState('');
-  const [aiScriptAngle, setAiScriptAngle] = useState('');
+  const [historyChatInput, setHistoryChatInput] = useState('');
+  const [promotionBooks, setPromotionBooks] = useState([DEFAULT_PROMOTION_BOOK]);
+  const [historyBookTitle, setHistoryBookTitle] = useState(DEFAULT_PROMOTION_BOOK);
   const [processingImage, setProcessingImage] = useState('');
   const [grayscaleProcessingIds, setGrayscaleProcessingIds] = useState(new Set());
   const [generatingShotIds, setGeneratingShotIds] = useState(new Set());
   const [recognizingShotIds, setRecognizingShotIds] = useState(new Set());
   const [imagePromptEditors, setImagePromptEditors] = useState({});
   const [materialSourceStrategy, setMaterialSourceStrategy] = useState('library_first');
-  const [openingPreserveChars, setOpeningPreserveChars] = useState(0);
-  const [appendBookPromotion, setAppendBookPromotion] = useState(false);
-  const [promotionBookTitle, setPromotionBookTitle] = useState(
-    () => formatPromotionBookTitle(window.localStorage.getItem(PROMOTION_BOOK_STORAGE_KEY)),
-  );
-  const [promotionBooks, setPromotionBooks] = useState(PROMOTION_BOOKS);
   const [voiceType, setVoiceType] = useState(VOICE_OPTIONS[0].value);
   const [speechRate, setSpeechRate] = useState(0);
   const [voicePreviewUrl, setVoicePreviewUrl] = useState('');
@@ -330,6 +314,9 @@ function App() {
   const [assetTypeFilter, setAssetTypeFilter] = useState('all');
   const [projectSearch, setProjectSearch] = useState('');
   const [projectFilter, setProjectFilter] = useState('current');
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(
+    () => window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === 'true',
+  );
   const folderFallbackRef = useRef(null);
   const uploadInputRef = useRef(null);
   const coverInputRef = useRef(null);
@@ -343,22 +330,20 @@ function App() {
   const playVoicePreviewAfterLoadRef = useRef(false);
   const playGeneratedVoiceAfterLoadRef = useRef(false);
   const lastProjectStatusRef = useRef('');
-  const rawScriptRef = useRef(null);
   const rewrittenScriptDirtyRef = useRef(false);
   const paragraphSaveVersionRef = useRef(0);
   const paragraphSaveQueueRef = useRef(Promise.resolve());
   const deletingParagraphRef = useRef(false);
-
-  useEffect(() => {
-    const value = promotionBookTitle.trim() || DEFAULT_PROMOTION_BOOK;
-    window.localStorage.setItem(PROMOTION_BOOK_STORAGE_KEY, value);
-  }, [promotionBookTitle]);
 
   const activeLibrary = validLibrary(library) ? library : null;
   const rewrittenParagraphs = useMemo(
     () => splitScriptParagraphs(rewrittenScriptEditor),
     [rewrittenScriptEditor],
   );
+  const historyWorkflow = project?.history_workflow || {};
+  const historyActiveStep = Number(historyWorkflow.active_step || 0);
+  const historyOutput = String(historyWorkflow.outputs?.[String(historyActiveStep)] || '');
+  const historyMessages = historyWorkflow.messages?.[String(historyActiveStep)] || [];
   const selectedAssets = useMemo(() => {
     const map = new Map();
     assets.forEach((asset) => map.set(asset.id, asset));
@@ -461,13 +446,14 @@ function App() {
     setAssets(assetList.assets);
     setLibrary(validLibrary(libraryData.library) ? libraryData.library : null);
     setMusicLibrary(musicData.music || []);
-    setPromotionBooks(promotionBookData.books?.length ? promotionBookData.books : PROMOTION_BOOKS);
+    setPromotionBooks(promotionBookData.books?.length ? promotionBookData.books : [DEFAULT_PROMOTION_BOOK]);
     if (projectData) {
       setProject(projectData.project);
       setShots(projectData.shots);
       setGeneratedAssets(projectData.generated_assets || []);
       setWebImageDiagnostics(projectData.web_image_diagnostics || []);
       setProjectId(id);
+      setHistoryBookTitle(formatPromotionBookTitle(projectData.project.promotion_book_title));
     } else {
       setProject(null);
       setShots([]);
@@ -516,10 +502,6 @@ function App() {
   useEffect(() => {
     if (!project) return;
     setProjectNameDraft(project.name || '');
-    setAppendBookPromotion(Boolean(project.append_book_promotion));
-    setPromotionBookTitle(formatPromotionBookTitle(
-      project.promotion_book_title || window.localStorage.getItem(PROMOTION_BOOK_STORAGE_KEY),
-    ));
     setTitleLine1(project.title_line1 || '');
     setTitleLine2(project.title_line2 || '');
     setTitleCandidates(project.title_candidates || []);
@@ -531,6 +513,7 @@ function App() {
     setBackgroundMusicStart(Number(project.background_music_start_sec || 0));
     setBackgroundMusicVolume(Math.round(Number(project.background_music_volume ?? 0.2) * 100));
     setVoiceVolume(Math.round(Number(project.voice_volume ?? 1) * 100));
+    setHistoryBookTitle(formatPromotionBookTitle(project.promotion_book_title));
   }, [
     project?.id,
     project?.name,
@@ -581,12 +564,6 @@ function App() {
     setEditingParagraphIndex(-1);
     setParagraphDraft('');
   }, [project?.id, project?.rewritten_script]);
-
-  useEffect(() => {
-    const savedChars = Number(project?.opening_preserve_chars || 0);
-    const ruleMatch = String(project?.opening_preserve_rule || '').match(/^chars_(\d+)$/);
-    setOpeningPreserveChars(savedChars || Number(ruleMatch?.[1] || 0));
-  }, [project?.id]);
 
   useEffect(() => {
     const player = musicPreviewRef.current;
@@ -684,7 +661,6 @@ function App() {
     const form = new FormData(ev.currentTarget);
     const payload = Object.fromEntries(form.entries());
     payload.raw_script = rawScriptDraft;
-    payload.promotion_book_title = promotionBookTitle;
     const data = await run('创建项目', () => request('/api/projects', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -692,55 +668,157 @@ function App() {
     }));
     if (data?.project_id) {
       setRawScriptDraft('');
-      setAiScriptPerson('');
-      setAiScriptAngle('');
       await refreshAll(data.project_id);
       setTab('script');
     }
   }
 
-  async function generateAiRawScript() {
-    const data = await run('AI 写文案', () => request('/api/projects/generate-ai-script', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        person_name: aiScriptPerson,
-        event_angle: aiScriptAngle,
-        promotion_book_title: promotionBookTitle,
-      }),
-    }));
-    if (data?.script) {
-      setRawScriptDraft(data.script);
-      const sourceCount = Array.isArray(data.research_sources) ? data.research_sources.length : 0;
-      const selectionLabel = data.person_selection === 'online_search'
-        ? `联网发现${sourceCount ? ` · ${sourceCount} 条资料` : ''}`
-        : data.person_selection === 'local_fallback'
-          ? '联网搜索失败，已使用本地兜底'
-          : sourceCount
-            ? `联网核实 · ${sourceCount} 条资料`
-            : '按指定人物生成';
-      setMessage(data.person
-        ? `AI 文案已生成（${selectionLabel}）：${data.person}`
-        : `AI 文案已生成（${selectionLabel}）`);
-    }
-  }
-
   async function rewrite() {
-    rewrittenScriptDirtyRef.current = false;
-    const data = await run('二创文案', () => request(`/api/projects/${projectId}/rewrite`, {
+    if (historyActiveStep && !window.confirm('重新开始会清空当前三步创作进度，确认继续吗？')) return;
+    setHistoryChatInput('');
+    const data = await run('历史创作 Step 1', () => request(`/api/projects/${projectId}/history-workflow/steps/1`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        ...(openingPreserveChars
-          ? { opening_preserve_chars: openingPreserveChars }
-          : { opening_preserve_rule: 'auto' }),
-        append_book_promotion: appendBookPromotion,
-        promotion_book_title: promotionBookTitle.trim() || DEFAULT_PROMOTION_BOOK,
-      }),
     }));
     if (data) {
       await refreshAll(projectId);
-      if (data.rewrite_warning) setMessage(data.rewrite_warning);
+      setMessage('Step 1 策略分析已生成，可在右侧聊天修改，满意后再确认进入 Step 2');
+    }
+  }
+
+  async function selectHistoryBook(nextTitle, { skipConfirmation = false } = {}) {
+    const formatted = formatPromotionBookTitle(nextTitle);
+    if (formatted === historyBookTitle) return true;
+    if (
+      historyActiveStep
+      && !skipConfirmation
+      && !window.confirm('切换带书会清空当前三步创作进度，确认继续吗？')
+    ) return false;
+    const data = await run('切换带书', () => request(`/api/projects/${projectId}/history-workflow/book`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: formatted }),
+    }));
+    if (!data) return false;
+    setHistoryBookTitle(data.title || formatted);
+    setPromotionBooks(data.books?.length ? data.books : promotionBooks);
+    setHistoryChatInput('');
+    await refreshAll(projectId);
+    setMessage(`已选择 ${data.title || formatted}，请从 Step 1 重新开始`);
+    return true;
+  }
+
+  async function addPromotionBookFromSelect() {
+    const title = window.prompt('请输入要添加的书名：')?.trim();
+    if (!title) return;
+    if (historyActiveStep && !window.confirm('添加并选择新书会清空当前三步创作进度，确认继续吗？')) return;
+    const data = await run('添加书籍', async () => {
+      const created = await request('/api/projects/promotion-books', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title }),
+      });
+      const selected = await request(`/api/projects/${projectId}/history-workflow/book`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: created.title }),
+      });
+      return { ...selected, books: created.books };
+    });
+    if (!data) return;
+    setPromotionBooks(data.books || []);
+    setHistoryBookTitle(data.title);
+    setHistoryChatInput('');
+    await refreshAll(projectId);
+    setMessage(`已添加并选择 ${data.title}，请执行 Step 1`);
+  }
+
+  function handleHistoryBookSelect(value) {
+    if (value === ADD_PROMOTION_BOOK_OPTION) {
+      addPromotionBookFromSelect();
+      return;
+    }
+    selectHistoryBook(value);
+  }
+
+  async function deletePromotionBook() {
+    if (promotionBooks.length <= 1) {
+      setMessage('至少需要保留一本带货书籍');
+      return;
+    }
+    if (!window.confirm(`确认从下拉列表删除 ${historyBookTitle} 吗？`)) return;
+    const bareTitle = historyBookTitle.replace(/^《|》$/g, '');
+    const data = await run('删除书籍', async () => {
+      const deleted = await request(`/api/projects/promotion-books/${encodeURIComponent(bareTitle)}`, {
+        method: 'DELETE',
+      });
+      const fallback = deleted.books[0];
+      const selected = await request(`/api/projects/${projectId}/history-workflow/book`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: fallback }),
+      });
+      return { ...selected, books: deleted.books };
+    });
+    if (!data) return;
+    setPromotionBooks(data.books);
+    setHistoryBookTitle(data.title);
+    setHistoryChatInput('');
+    await refreshAll(projectId);
+    setMessage(`已删除书籍，当前改为 ${data.title}，请重新执行 Step 1`);
+  }
+
+  async function runNextHistoryStep() {
+    if (![1, 2].includes(historyActiveStep)) return;
+    const nextStep = historyActiveStep + 1;
+    setHistoryChatInput('');
+    const data = await run(`历史创作 Step ${nextStep}`, () => request(
+      `/api/projects/${projectId}/history-workflow/steps/${nextStep}`,
+      { method: 'POST' },
+    ));
+    if (data) {
+      await refreshAll(projectId);
+      setMessage(
+        nextStep === 2
+          ? 'Step 2 正文已生成，可继续聊天修改，满意后再确认进入 Step 3'
+          : 'Step 3 终审定稿已生成，可继续聊天修改，满意后确认定稿',
+      );
+    }
+  }
+
+  async function sendHistoryChat(event) {
+    event?.preventDefault();
+    const chatMessage = historyChatInput.trim();
+    if (!chatMessage || !historyActiveStep) return;
+    const data = await run('AI 修改', () => request(`/api/projects/${projectId}/history-workflow/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: chatMessage }),
+    }));
+    if (data) {
+      setHistoryChatInput('');
+      await refreshAll(projectId);
+      setMessage(`Step ${historyActiveStep} 的回答已记录，进入下一步时会作为创作要求`);
+    }
+  }
+
+  async function finalizeHistoryWorkflow() {
+    const data = await run('确认定稿', () => request(
+      `/api/projects/${projectId}/history-workflow/finalize`,
+      { method: 'POST' },
+    ));
+    if (data) {
+      await refreshAll(projectId);
+      setMessage('历史口播稿已定稿，可以保存或生成分镜');
+    }
+  }
+
+  async function copyHistoryOutput() {
+    if (!historyOutput.trim()) return;
+    try {
+      await writeClipboardText(historyOutput);
+      setMessage(`当前阶段结果已复制，共 ${scriptCharacterCount(historyOutput)} 字`);
+    } catch (err) {
+      setMessage(`复制失败：${err.message}`);
     }
   }
 
@@ -753,24 +831,6 @@ function App() {
     setParagraphDraft('');
     rewrittenScriptDirtyRef.current = false;
     await persistParagraphs(paragraphs, '文案已保存');
-  }
-
-  async function copyRewrittenScript() {
-    const paragraphs = [...rewrittenParagraphs];
-    if (editingParagraphIndex >= 0 && paragraphs[editingParagraphIndex] !== undefined) {
-      paragraphs[editingParagraphIndex] = paragraphDraft.trim();
-    }
-    const script = paragraphs.join('\n\n').trim();
-    if (!script) {
-      setMessage('暂无二创文案可复制');
-      return;
-    }
-    try {
-      await writeClipboardText(script);
-      setMessage(`二创文案已复制，共 ${scriptCharacterCount(script)} 字`);
-    } catch (err) {
-      setMessage(`复制二创文案失败：${err.message}`);
-    }
   }
 
   async function copyAllImagePrompts() {
@@ -1684,18 +1744,37 @@ function App() {
     return '正在处理分镜图片...';
   })();
 
+  function toggleSidebar() {
+    setSidebarCollapsed((current) => {
+      const next = !current;
+      window.localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, String(next));
+      if (next) setProjectMenuOpen(false);
+      return next;
+    });
+  }
+
   return (
-    <div className="app">
-      <aside className="sidebar">
-        <div className="brand"><Film size={22} /> 草稿生成器</div>
+    <div className={sidebarCollapsed ? 'app sidebar-collapsed' : 'app'}>
+      <aside className={sidebarCollapsed ? 'sidebar collapsed' : 'sidebar'}>
+        <button
+          type="button"
+          className="sidebar-toggle"
+          title={sidebarCollapsed ? '展开导航栏' : '折叠导航栏'}
+          aria-label={sidebarCollapsed ? '展开导航栏' : '折叠导航栏'}
+          aria-expanded={!sidebarCollapsed}
+          onClick={toggleSidebar}
+        >
+          {sidebarCollapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
+        </button>
+        <div className="brand"><Film size={22} /><span className="brand-label">草稿生成器</span></div>
         <nav>
-          <button className={tab === 'create' ? 'active' : ''} onClick={() => setTab('create')}><Scissors size={18} /> 项目</button>
-          <button className={tab === 'assets' ? 'active' : ''} onClick={() => setTab('assets')}><Library size={18} /> 素材库</button>
-          <button className={tab === 'script' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('script')}><Wand2 size={18} /> 文案</button>
-          <button className={tab === 'storyboard' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('storyboard')}><Archive size={18} /> 分镜</button>
-          <button className={tab === 'match' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('match')}><Search size={18} /> 匹配</button>
-          <button className={tab === 'cover' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('cover')}><Music size={18} /> 标题封面与配乐</button>
-          <button className={tab === 'export' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('export')}><Download size={18} /> 导出</button>
+          <button title="项目" className={tab === 'create' ? 'active' : ''} onClick={() => setTab('create')}><Scissors size={18} /><span>项目</span></button>
+          <button title="素材库" className={tab === 'assets' ? 'active' : ''} onClick={() => setTab('assets')}><Library size={18} /><span>素材库</span></button>
+          <button title="文案" className={tab === 'script' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('script')}><Wand2 size={18} /><span>文案</span></button>
+          <button title="分镜" className={tab === 'storyboard' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('storyboard')}><Archive size={18} /><span>分镜</span></button>
+          <button title="配音" className={tab === 'match' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('match')}><Mic size={18} /><span>配音</span></button>
+          <button title="标题" className={tab === 'cover' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('cover')}><Music size={18} /><span>标题</span></button>
+          <button title="导出" className={tab === 'export' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('export')}><Download size={18} /><span>导出</span></button>
         </nav>
         <div className="project-picker">
           <ProjectSelect
@@ -1750,32 +1829,20 @@ function App() {
           <section className="band project-workspace">
             <form onSubmit={createProject} className="create-project-layout">
               <div className="panel create-options-panel">
-                <h2>创建项目</h2>
+                <h2>创建历史向视频</h2>
                 <label>项目名称<input name="name" placeholder="可留空，系统自动取标题" /></label>
-                <label className="promotion-book-setting">
-                  带货书籍设置
-                  <div className="promotion-book-picker">
-                    <select
-                      value={promotionBookTitle}
-                      onChange={(event) => setPromotionBookTitle(event.target.value)}
-                      aria-label="选择带货书籍"
-                    >
-                      {promotionBooks.map((title) => (
-                        <option key={title} value={title}>{title}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <small>选择对应书籍并开启“结尾带书”后，系统会按该书的专属规则在二创文案末尾续写带书内容。</small>
-                </label>
-                <div className="ai-script-options">
-                  <label>人物名称（可选）<input value={aiScriptPerson} onChange={(event) => setAiScriptPerson(event.target.value)} placeholder={(PROMOTION_BOOK_AI_HINTS[promotionBookTitle] || PROMOTION_BOOK_AI_HINTS[DEFAULT_PROMOTION_BOOK]).person} /></label>
-                  <label>核心事件或角度（可选）<input value={aiScriptAngle} onChange={(event) => setAiScriptAngle(event.target.value)} placeholder={(PROMOTION_BOOK_AI_HINTS[promotionBookTitle] || PROMOTION_BOOK_AI_HINTS[DEFAULT_PROMOTION_BOOK]).angle} /></label>
+                <div className="history-create-guide">
+                  <strong>三步历史创作流程</strong>
+                  <div><span>1</span><p><b>策略分析</b>提炼爆款逻辑、切入视角和开场方案</p></div>
+                  <div><span>2</span><p><b>正文创作</b>按确认后的策略生成历史口播正文</p></div>
+                  <div><span>3</span><p><b>终审定稿</b>校验史实、原创度和口语流畅度</p></div>
+                  <small>每一步都可以与 AI 聊天修改，确认后才会进入下一步。</small>
                 </div>
               </div>
 
               <div className="panel create-script-panel">
                 <div className="script-title script-panel-heading">
-                  <h2>视频文案</h2>
+                  <h2>历史参考文案</h2>
                   <span className="script-character-count">{scriptCharacterCount(rawScriptDraft)} 字</span>
                 </div>
                 <textarea
@@ -1784,14 +1851,11 @@ function App() {
                   required
                   value={rawScriptDraft}
                   onChange={(event) => setRawScriptDraft(event.target.value)}
-                  placeholder="粘贴历史人物或纪实解说文案，也可以点击“AI 写文案”自动生成"
-                  aria-label="视频文案"
+                  placeholder="粘贴需要重构的历史人物、历史事件或纪实解说参考文案"
+                  aria-label="历史参考文案"
                 />
                 <div className="script-create-actions">
-                  <button type="button" onClick={generateAiRawScript} disabled={busy}>
-                    <Wand2 size={18} /> AI 写文案
-                  </button>
-                  <button className="primary" disabled={!rawScriptDraft.trim()}><Save size={18} /> 创建并进入文案</button>
+                  <button className="primary" disabled={!rawScriptDraft.trim()}><Save size={18} /> 创建并进入三步创作</button>
                 </div>
               </div>
             </form>
@@ -1886,36 +1950,18 @@ function App() {
         )}
 
         {tab === 'script' && project && (
-          <section className="band two-col script-grid">
+          <section className="band history-script-grid">
             <div className="panel">
               <div className="script-title script-panel-heading">
-                <h2>原始文案</h2>
+                <h2>历史参考文案</h2>
                 <span className="script-character-count">{scriptCharacterCount(project.raw_script)} 字</span>
               </div>
               <textarea
-                ref={rawScriptRef}
                 className="script-editor-surface raw-script-textarea"
                 readOnly
                 value={project.raw_script}
                 rows="18"
-                onSelect={(event) => {
-                  const start = event.currentTarget.selectionStart;
-                  const end = event.currentTarget.selectionEnd;
-                  if (start === 0 && end > 0) {
-                    setOpeningPreserveChars(end);
-                    setMessage(`已选择原始文案开头 ${end} 字，生成二创时将保持不变`);
-                  } else if (start > 0 && end > start) {
-                    setMessage('开头保护范围必须从原始文案第一个字开始选择');
-                  }
-                }}
               />
-              <div className="opening-selection-hint">
-                <span>{openingPreserveChars ? `已选中开头 ${openingPreserveChars} 字保持不变` : '请从第一个字开始拖选需要保持不变的开头；未选择时使用智能前三秒'}</span>
-                {openingPreserveChars > 0 && <button type="button" onClick={() => {
-                  setOpeningPreserveChars(0);
-                  rawScriptRef.current?.setSelectionRange(0, 0);
-                }}>清除选区</button>}
-              </div>
               <div className="script-panel-footer">
               <label className="source-strategy">
                 素材来源策略
@@ -1951,134 +1997,147 @@ function App() {
                   </>
                 )}
               </div>
-              <small className="raw-script-hint">跳过二创，使用原始文案直接拆分镜头</small>
+              <small className="raw-script-hint">也可以跳过历史创作，直接使用参考文案生成分镜</small>
               </div>
             </div>
-            <div className="panel">
-              <div className="row rewrite-toolbar">
-                <div className="script-title">
-                  <h2>二创口播稿</h2>
-                  <span className="script-character-count">{scriptCharacterCount(rewrittenScriptEditor)} 字</span>
+            <div className="panel history-output-panel">
+              <div className="history-workflow-heading">
+                <div>
+                  <h2>历史创作工作台</h2>
+                  <small>{historyActiveStep ? `当前 Step ${historyActiveStep}` : '点击“改写”启动 Step 1'}</small>
                 </div>
-                <div className="actions">
-                  <select
-                    className="promotion-book-inline-select"
-                    value={promotionBookTitle}
-                    onChange={(event) => setPromotionBookTitle(event.target.value)}
-                    aria-label="选择结尾带书书籍"
-                    title="选择结尾要推荐的书籍"
-                  >
-                    {promotionBooks.map((title) => (
-                      <option key={title} value={title}>{title}</option>
-                    ))}
-                  </select>
-                  <button
-                    type="button"
-                    className={appendBookPromotion ? 'book-promotion-toggle active' : 'book-promotion-toggle'}
-                    aria-pressed={appendBookPromotion}
-                    title={`在二创文案末尾带出 ${promotionBookTitle.trim() || DEFAULT_PROMOTION_BOOK}`}
-                    onClick={() => setAppendBookPromotion((current) => !current)}
-                  >
-                    <Tags size={15} /> 结尾带书
-                  </button>
-                  <button
-                    type="button"
-                    className="rewrite-compact-button"
-                    disabled={!rewrittenParagraphs.length}
-                    title="复制不含段落序号的完整二创文案"
-                    onClick={copyRewrittenScript}
-                  >
-                    <Copy size={15} /> 一键复制二创文案
-                  </button>
-                  <button className="rewrite-compact-button" onClick={rewrite}><RefreshCw size={15} /> 改写</button>
-                </div>
+                <button type="button" onClick={copyHistoryOutput} disabled={!historyOutput}>
+                  <Copy size={15} /> 复制
+                </button>
               </div>
-              <div className="script-editor-surface rewrite-paragraph-list" aria-label="二创文案段落编辑器">
-                {rewrittenParagraphs.length ? rewrittenParagraphs.map((paragraph, index) => (
-                  <div
-                    className={editingParagraphIndex === index ? 'rewrite-paragraph-card editing' : 'rewrite-paragraph-card'}
-                    key={`${index}-${paragraph.slice(0, 18)}`}
-                    onClick={() => beginParagraphEdit(index)}
-                    onMouseLeave={() => finishParagraphEdit(index)}
-                  >
-                    <span className="rewrite-paragraph-number">[{index + 1}]</span>
-                    {editingParagraphIndex === index ? (
-                      <textarea
-                        autoFocus
-                        className="rewrite-paragraph-editor"
-                        value={paragraphDraft}
-                        onClick={(event) => event.stopPropagation()}
-                        onChange={(event) => {
-                          rewrittenScriptDirtyRef.current = true;
-                          setParagraphDraft(event.target.value);
-                        }}
-                      />
-                    ) : (
-                      <div className="rewrite-paragraph-content">{paragraph}</div>
-                    )}
+              <div className="history-book-control">
+                <label>
+                  本次视频带书
+                  <div className="history-book-select-row">
+                    <select
+                      value={historyBookTitle}
+                      onChange={(event) => handleHistoryBookSelect(event.target.value)}
+                      disabled={busy}
+                      aria-label="选择本次视频推广书籍"
+                    >
+                      {promotionBooks.map((title) => (
+                        <option key={title} value={title}>{title}</option>
+                      ))}
+                      <option value={ADD_PROMOTION_BOOK_OPTION}>＋ 新增图书…</option>
+                    </select>
                     <button
                       type="button"
-                      className="rewrite-paragraph-delete"
-                      title={`删除第 ${index + 1} 段`}
-                      aria-label={`删除第 ${index + 1} 段`}
-                      onClick={(event) => deleteScriptParagraph(event, index)}
+                      className="danger icon-only"
+                      onClick={deletePromotionBook}
+                      disabled={busy || promotionBooks.length <= 1}
+                      title="删除当前书籍"
+                      aria-label={`删除 ${historyBookTitle}`}
                     >
-                      <Trash2 size={15} />
+                      <Trash2 size={16} />
                     </button>
                   </div>
-                )) : (
-                  <div className="rewrite-paragraph-empty">暂无二创文案，请先点击“改写”。</div>
-                )}
+                </label>
+                <small>Step 1、Step 2、Step 3 都会固定围绕 {historyBookTitle} 生成；切换书籍会重置进度。</small>
               </div>
-              {project.rewrite_comparison && (
-                <small className="raw-script-hint rewrite-comparison">
-                  综合差异：{project.rewrite_comparison.narrative_difference ?? project.rewrite_comparison.overall_difference ?? '-'}%
-                  {' · '}入选策略：{project.rewrite_narrative_strategy?.strategy || '-'}
-                  {' · '}篇幅比例：{project.rewrite_comparison.length_ratio ?? '-'}%
-                  {' · '}事实卡覆盖：{project.rewrite_comparison.covered_fact_cards?.length ?? '-'}
-                  /{project.rewrite_comparison.expected_fact_cards ?? '-'}
-                </small>
-              )}
-              {project.rewrite_warning && <p className="rewrite-warning">{project.rewrite_warning}</p>}
-              {project.rewrite_analysis_warning && <p className="rewrite-warning">{project.rewrite_analysis_warning}</p>}
-              <div className="script-panel-footer">
-              <label className="source-strategy">
-                素材来源策略
-                <select value={materialSourceStrategy} onChange={(event) => setMaterialSourceStrategy(event.target.value)}>
-                  <option value="library_first">优先素材库，缺失时联网搜索</option>
-                  <option value="library_only">仅使用素材库</option>
-                  <option value="web_only">仅联网搜索</option>
-                  <option value="ai_only">仅使用 AI 生成</option>
-                  <option value="prompt_only">仅生成 AI 图片提示词</option>
-                </select>
-              </label>
-              <div className="actions">
-                <button onClick={saveScript}><Save size={18} /> 保存</button>
-                {['ai_only', 'prompt_only'].includes(materialSourceStrategy) ? (
-                  <button
-                    className="primary"
-                    title={materialSourceStrategy === 'prompt_only'
-                      ? '生成分镜和图片提示词，不生成画面'
-                      : '生成分镜，并为每个镜头生成 AI 图片'}
-                    onClick={() => generateShots()}
+              <div className="history-stepper" aria-label="历史创作进度">
+                {[
+                  [1, '策略分析'],
+                  [2, '正文创作'],
+                  [3, '终审定稿'],
+                ].map(([step, label]) => (
+                  <div
+                    key={step}
+                    className={`${historyActiveStep === step ? 'active' : ''} ${historyActiveStep > step || historyWorkflow.status === 'completed' ? 'done' : ''}`}
                   >
-                    <Wand2 size={18} /> {materialSourceStrategy === 'prompt_only' ? '生成分镜提示词' : 'AI 生成分镜'}
-                  </button>
+                    <span>{historyActiveStep > step || historyWorkflow.status === 'completed' ? <Check size={14} /> : step}</span>
+                    <strong>{label}</strong>
+                  </div>
+                ))}
+              </div>
+              <div className="history-stage-output" aria-live="polite">
+                {historyOutput ? (
+                  <div>{historyOutput}</div>
                 ) : (
-                  <>
-                    <button className="primary" onClick={() => generateShots('so')}><Archive size={18} /> 生成分镜</button>
-                    <button
-                      className="tencent-storyboard"
-                      title="生成分镜并使用腾讯云联网图像搜索"
-                      onClick={() => generateShots('tencent')}
-                    >
-                      <Search size={18} /> 生成分镜
-                    </button>
-                  </>
+                  <div className="history-empty-state">
+                    <Wand2 size={30} />
+                    <strong>从历史策略分析开始</strong>
+                    <span>系统会严格停在每一步，只有你确认后才会继续。</span>
+                  </div>
                 )}
               </div>
-              <small className="raw-script-hint script-footer-placeholder" aria-hidden="true">占位提示</small>
+              <div className="history-workflow-actions">
+                <button type="button" onClick={rewrite} disabled={busy}>
+                  <RefreshCw size={16} /> {historyActiveStep ? '重新开始' : '改写'}
+                </button>
+                {historyActiveStep > 0 && historyActiveStep < 3 && (
+                  <button type="button" className="primary" onClick={runNextHistoryStep} disabled={busy}>
+                    <Check size={16} /> 确认回答并进入 Step {historyActiveStep + 1}
+                  </button>
+                )}
+                {historyActiveStep === 3 && historyWorkflow.status !== 'completed' && (
+                  <button type="button" className="primary" onClick={finalizeHistoryWorkflow} disabled={busy}>
+                    <Check size={16} /> 确认定稿
+                  </button>
+                )}
+                {historyWorkflow.status === 'completed' && (
+                  <span className="history-completed"><Check size={15} /> 已定稿</span>
+                )}
               </div>
+            </div>
+            <div className="panel history-chat-panel">
+              <div className="history-chat-heading">
+                <MessageSquare size={19} />
+                <div>
+                  <h2>AI 阶段问答助手</h2>
+                  <small>{historyActiveStep ? `回答 Step ${historyActiveStep} 末尾的问题，意见将在下一步落实` : '生成任一步结果后即可回答'}</small>
+                </div>
+              </div>
+              <div className="history-chat-messages">
+                {historyMessages.length ? historyMessages.map((item, index) => (
+                  <div className={`history-chat-message ${item.role}`} key={`${index}-${item.role}`}>
+                    <span>{item.role === 'user' ? '你' : 'AI'}</span>
+                    <p>{item.content}</p>
+                  </div>
+                )) : (
+                  <div className="history-chat-placeholder">
+                    请回答左侧当前阶段最后提出的问题。例如：选择第二个开场；节奏满意，但希望设问更深入。
+                  </div>
+                )}
+              </div>
+              <form className="history-chat-form" onSubmit={sendHistoryChat}>
+                <textarea
+                  value={historyChatInput}
+                  disabled={!historyActiveStep || busy}
+                  onChange={(event) => setHistoryChatInput(event.target.value)}
+                  placeholder={historyActiveStep ? '输入你对当前阶段问题的回答…' : '请先点击“改写”执行 Step 1'}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' && !event.shiftKey) {
+                      event.preventDefault();
+                      sendHistoryChat(event);
+                    }
+                  }}
+                />
+                <button type="submit" className="primary" disabled={!historyChatInput.trim() || !historyActiveStep || busy}>
+                  <Send size={17} /> 发送回答
+                </button>
+              </form>
+              {historyWorkflow.status === 'completed' && (
+                <div className="history-final-actions">
+                  <label className="source-strategy">
+                    素材来源策略
+                    <select value={materialSourceStrategy} onChange={(event) => setMaterialSourceStrategy(event.target.value)}>
+                      <option value="library_first">优先素材库，缺失时联网搜索</option>
+                      <option value="library_only">仅使用素材库</option>
+                      <option value="web_only">仅联网搜索</option>
+                      <option value="ai_only">仅使用 AI 生成</option>
+                      <option value="prompt_only">仅生成 AI 图片提示词</option>
+                    </select>
+                  </label>
+                  <button type="button" className="primary" onClick={() => generateShots()}>
+                    <Archive size={17} /> 生成分镜
+                  </button>
+                </div>
+              )}
             </div>
           </section>
         )}
