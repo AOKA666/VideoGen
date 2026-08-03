@@ -27,156 +27,16 @@ from services.store import public_url
 
 
 STORYBOARD_SEEDREAM_MODEL = "doubao-seedream-4-0-250828"
-STORYBOARD_IMAGE_SIZE = "1024x1024"
+STORYBOARD_IMAGE_SIZE = "1440x2560"
 
-
-FEMALE_PERSON_HINTS = {
-    "黄令仪", "王承书", "屠呦呦", "林巧稚", "吴健雄", "何泽慧", "叶叔华",
-}
-MALE_PERSON_HINTS = {
-    "钱学森", "邓稼先", "于敏", "黄旭华", "郭永怀", "袁隆平", "王淦昌",
-    "赵忠尧", "汤飞凡", "顾维钧", "王伟",
-}
-PERSON_APPEARANCE_HINTS = {
-    "黄令仪": "八十岁左右的中国女性科学家，短灰发，清瘦脸型，戴细框眼镜，穿深色朴素外套，神情专注坚毅",
-    "王承书": "中老年中国女性科学家，短发整洁，清瘦脸型，穿朴素年代感外套，神情沉静坚定",
-    "屠呦呦": "老年中国女性科学家，短灰发，面容清瘦，穿朴素深色外套，气质沉稳",
-    "钱学森": "中老年中国男性科学家，短发整齐，清瘦脸型，穿深色中山装或朴素西装，神情严谨",
-    "邓稼先": "中年中国男性科学家，短发，方圆脸型，穿朴素年代感外套，神情沉稳专注",
-    "黄旭华": "老年中国男性工程师，短灰发，清瘦脸型，戴眼镜，穿朴素深色外套，神情坚毅",
-    "赵忠尧": "中年中国男性科学家，短发，清瘦脸型，穿朴素长衫或年代感外套，神情坚毅",
-}
-ALL_PERSON_HINTS = FEMALE_PERSON_HINTS | MALE_PERSON_HINTS | set(PERSON_APPEARANCE_HINTS)
-COMMON_CHINESE_SURNAMES = set(
-    "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜"
-    "戚谢邹喻柏水窦章云苏潘葛奚范彭郎鲁韦昌马苗凤花方俞任袁柳鲍史唐费"
-    "廉岑薛雷贺倪汤滕殷罗毕郝邬安常乐于傅皮卞齐康伍余元顾孟平黄和穆"
-    "萧尹姚邵汪祁毛禹狄米贝明臧计伏成戴谈宋茅庞熊纪舒屈项祝董梁杜阮"
-    "蓝闵席季麻强贾路娄危江童颜郭梅盛林刁钟徐邱骆高夏蔡田樊胡凌霍虞"
-    "万支柯昝管卢莫经房裘缪干解应宗丁宣邓郁单杭洪包诸左石崔吉龚程嵇"
-    "邢滑裴陆荣翁荀羊甄曲家封芮羿储靳汲邴糜松井段富巫乌焦巴弓牧隗山"
-    "谷车侯宓蓬全郗班仰秋仲伊宫宁仇栾暴甘厉戎祖武符刘景詹束龙叶幸司"
-    "黎乔苍双闻莘党翟谭贡劳逄姬申扶堵冉宰郦雍郤璩桑桂濮牛寿通边扈燕"
-    "冀郏浦尚农温别庄晏柴瞿阎连习容向古易廖庾终暨居衡步都耿满弘匡国"
-    "文寇广禄阙东欧沃利蔚越夔隆师巩聂晁勾敖融冷訾辛阚那简饶空曾毋沙"
-    "养鞠须丰巢关蒯相查后荆红游竺权逯盖益桓公"
+SONG_COURT_STYLE_PROMPT = (
+    "9:16竖屏，新国风宋式水墨工笔，古绢泛黄宣纸底色，"
+    "传统国画白描线条，淡墨晕染肌理，低饱和赭石暖金配色，"
+    "柔和均匀殿内柔光，无强烈明暗对比，人物为中国古风，"
+    "线条细腻流畅，古朴木质立柱，画面庄重肃穆，构图居中均衡，"
+    "纯手绘国画质感，无厚涂油画笔触，无CG塑料感，"
+    "画面全程无任何文字、字幕、水印、logo，干净留白古画氛围感；"
 )
-
-
-def infer_shot_person_gender(shot: dict) -> str:
-    declared = str(shot.get("person_gender") or "").strip().lower()
-    aliases = {
-        "female": "female", "女": "female", "女性": "female",
-        "male": "male", "男": "male", "男性": "male",
-        "mixed": "mixed", "混合": "mixed", "男女": "mixed",
-        "none": "none", "无人": "none", "无人物": "none",
-        "unknown": "unknown", "未知": "unknown",
-    }
-    if aliases.get(declared) in {"female", "male", "mixed", "none"}:
-        return aliases[declared]
-
-    visual_parts = [
-        shot.get("visual_need"),
-        *(shot.get("object_tags") or []),
-        *(shot.get("required_object") or []),
-        *(shot.get("keywords") or []),
-    ]
-    contexts = [
-        " ".join(str(part or "") for part in visual_parts),
-        str(shot.get("voice_text") or ""),
-    ]
-    for context in contexts:
-        female = any(name in context for name in FEMALE_PERSON_HINTS) or bool(re.search(
-            r"女科学家|女工程师|女军人|女医生|女士|女性|老妇人|老奶奶|母亲|妈妈|妻子|女儿|她(?!们)",
-            context,
-        ))
-        male = any(name in context for name in MALE_PERSON_HINTS) or bool(re.search(
-            r"男科学家|男工程师|男军人|男医生|男士|男性|老先生|老爷爷|父亲|爸爸|丈夫|儿子|他(?!们)",
-            context,
-        ))
-        if female and male:
-            return "mixed"
-        if female:
-            return "female"
-        if male:
-            return "male"
-    return "unknown"
-
-
-def person_gender_instruction(shot: dict) -> str:
-    gender = infer_shot_person_gender(shot)
-    instructions = {
-        "female": (
-            "人物性别硬约束：主要人物必须是女性，保持女性面部、体态和身份特征；"
-            "严禁把该人物画成男性。"
-        ),
-        "male": (
-            "人物性别硬约束：主要人物必须是男性，保持男性面部、体态和身份特征；"
-            "严禁把该人物画成女性。"
-        ),
-        "mixed": "人物性别硬约束：画面包含男性和女性，按画面描述保留各自正确性别，不得互换。",
-    }
-    return instructions.get(gender, "")
-
-
-def _shot_person_names(shot: dict) -> list[str]:
-    explicit = [str(name).strip() for name in (shot.get("person_names") or []) if str(name).strip()]
-    tagged_names = []
-    for item in [
-        *(shot.get("object_tags") or []),
-        *(shot.get("required_object") or []),
-    ]:
-        candidate = str(item or "").strip()
-        if (
-            2 <= len(candidate) <= 4
-            and candidate[0] in COMMON_CHINESE_SURNAMES
-            and re.fullmatch(r"[\u4e00-\u9fff]+", candidate)
-        ):
-            tagged_names.append(candidate)
-    context = " ".join([
-        str(shot.get("visual_need") or ""),
-        str(shot.get("voice_text") or ""),
-        *[str(item) for item in (shot.get("object_tags") or [])],
-        *[str(item) for item in (shot.get("required_object") or [])],
-    ])
-    inferred = [name for name in ALL_PERSON_HINTS if name in context]
-    return list(dict.fromkeys(explicit + tagged_names + inferred))
-
-
-def _anonymous_person_description(shot: dict, person_names: list[str]) -> str:
-    if infer_shot_person_gender(shot) == "none":
-        return ""
-
-    description = str(shot.get("person_description") or "").strip()
-    for name in person_names:
-        description = description.replace(name, "")
-    description = re.sub(r"\s+", " ", description).strip(" ，,。")
-    if description:
-        return description
-
-    mapped = [PERSON_APPEARANCE_HINTS[name] for name in person_names if name in PERSON_APPEARANCE_HINTS]
-    if mapped:
-        return "；".join(mapped)
-
-    gender = infer_shot_person_gender(shot)
-    age_context = f"{shot.get('visual_need') or ''} {shot.get('voice_text') or ''}"
-    age = "老年" if re.search(r"八十|九十|老年|年迈|白发|灰发", age_context) else "中年"
-    descriptions = {
-        "female": f"{age}中国女性，五官自然，发型朴素，穿符合时代背景的简洁服装，神情真实",
-        "male": f"{age}中国男性，五官自然，短发整齐，穿符合时代背景的简洁服装，神情真实",
-        "mixed": "不同性别的中国人物，年龄和服装符合画面时代背景，五官自然，神情真实",
-    }
-    return descriptions.get(gender, "")
-
-
-def _remove_person_names(text: str, person_names: list[str]) -> str:
-    cleaned = str(text or "")
-    for name in sorted(person_names, key=len, reverse=True):
-        cleaned = cleaned.replace(name, "")
-    cleaned = re.sub(r"([，、]\s*){2,}", "，", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned.strip(" ，,、。")
-
 
 def generate_svg_placeholder(path: Path, shot: dict) -> str:
     prompt = build_image_prompt(shot)
@@ -205,25 +65,10 @@ def generate_svg_placeholder(path: Path, shot: dict) -> str:
 
 
 def build_image_prompt(shot: dict) -> str:
-    person_names = _shot_person_names(shot)
-    raw_visual_need = str(shot.get("visual_need") or "").strip()
-    if raw_visual_need == "待AI生成画面描述":
-        voice_text = str(shot.get("voice_text") or "").strip()
-        raw_visual_need = f"根据这段旁白呈现具体的历史纪实场景：{voice_text[:120]}"
-    visual_need = _remove_person_names(
-        raw_visual_need or "历史纪实画面",
-        person_names,
-    )
-    person_description = _anonymous_person_description(shot, person_names)
-    gender_instruction = person_gender_instruction(shot)
-    return (
-        "真实历史纪实影像风格，档案老照片质感，旧色调；"
-        f"画面需求：{visual_need or '历史纪实人物场景'}。"
-        f"{f'人物外貌：{person_description}。' if person_description else ''}"
-        f"{gender_instruction}"
-        "不要出现真实人物姓名，不要求复刻任何特定真人的精确面孔。"
-        "不要生成文字、水印、Logo，不要夸张奇幻，不要过度美化。"
-    )
+    visual_need = str(shot.get("visual_need") or "").strip()
+    if not visual_need or visual_need == "待AI生成画面描述":
+        raise ValueError("DeepSeek did not return an image prompt for this shot")
+    return f"{SONG_COURT_STYLE_PROMPT}具体画面：{visual_need}"
 
 
 def ark_endpoint() -> str:
@@ -388,12 +233,10 @@ def generate_doubao_image(
     if not api_key:
         raise RuntimeError("ARK_API_KEY is not configured")
 
-    person_gender = infer_shot_person_gender(shot)
     prompt = str(prompt_override or "").strip() or build_image_prompt(shot)
     payload = {
         "model": ark_image_model(),
         "prompt": prompt,
-        "negative_prompt": "文字，水印，logo，畸形手指，低清晰度，过曝，过度卡通，现代广告感",
         "size": storyboard_image_size(),
         "response_format": "url",
         "watermark": False,
@@ -430,7 +273,6 @@ def generate_doubao_image(
         "remote_url": image_url,
         "image_size": payload["size"],
         "seed": body.get("seed"),
-        "person_gender": person_gender,
     }
 
 
@@ -537,12 +379,12 @@ def generate_seedream_cover(
 
 
 def _find_chinese_font(size: int) -> ImageFont.FreeTypeFont:
-    """Find a suitable Chinese font, prioritizing 文源圆体, falling back to default."""
+    """Find the Gongfan Nufang cover-title font, falling back safely."""
     project_root = Path(__file__).resolve().parent.parent.parent.parent
     candidates = [
+        os.getenv("VIDEOGEN_TITLE_FONT_FILE", "").strip(),
+        project_root / "assets" / "龚帆怒放体.ttf",
         os.getenv("VIDEOGEN_FONT_FILE", "").strip(),
-        project_root / "WenYuanRoundedSCVF.ttf",  # 文源圆体 (bundled)
-        Path("C:/Windows/Fonts/WenYuanRoundedSCVF.ttf"),  # 文源圆体 (system)
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "C:/Windows/Fonts/msyhbd.ttc",   # Microsoft YaHei Bold
@@ -563,6 +405,195 @@ def _find_chinese_font(size: int) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default()
 
 
+COVER_TITLE_CENTER_Y_RATIO = 409 / 1920
+
+
+def _cover_title_start_y(canvas_height: int, total_text_height: int) -> int:
+    """Mirror the former lower title center (y=1511) across a 1920px canvas center."""
+    title_center_y = round(canvas_height * COVER_TITLE_CENTER_Y_RATIO)
+    return max(0, title_center_y - total_text_height // 2)
+
+
+def cover_title_layout(
+    line1: str,
+    line2: str,
+    canvas_width: int = 1080,
+    canvas_height: int = 1920,
+) -> dict:
+    """Return the shared title geometry used by covers and exported video."""
+    scale = canvas_width / 1080
+    font_size = max(12, round(124 * scale))
+    stroke_width = max(2, round(8 * scale))
+    line_gap = max(8, round(30 * scale))
+    max_text_width = canvas_width - max(24, round(80 * scale))
+    measure = ImageDraw.Draw(Image.new("L", (1, 1)))
+
+    while True:
+        font = _find_chinese_font(font_size)
+        try:
+            font.set_variation_by_name("Heavy")
+        except (AttributeError, OSError):
+            pass
+        boxes = [
+            measure.textbbox((0, 0), line, font=font, stroke_width=stroke_width)
+            for line in (line1, line2)
+        ]
+        heights = [box[3] - box[1] for box in boxes]
+        widest_line = max((box[2] - box[0] for box in boxes), default=0)
+        if widest_line <= max_text_width or font_size <= 12:
+            break
+        font_size = max(12, font_size - max(1, round(4 * scale)))
+
+    total_height = sum(heights) + (line_gap if line1 and line2 else 0)
+    return {
+        "font": font,
+        "font_size": font_size,
+        "stroke_width": stroke_width,
+        "line_gap": line_gap,
+        "boxes": boxes,
+        "heights": heights,
+        "start_y": _cover_title_start_y(canvas_height, total_height),
+        "underline_width": max(3, round(font_size / 18)),
+        "underline_gap": max(3, round(font_size / 16)),
+    }
+
+
+def normalize_cover_title_positions(value: dict | None = None) -> dict:
+    """Return safe, normalized positions and sizes for both editable title lines."""
+    source = value if isinstance(value, dict) else {}
+    defaults = {
+        "line1": {"x": 0.5, "y": 0.18, "font_size": 124},
+        "line2": {"x": 0.5, "y": 0.25, "font_size": 124},
+    }
+    normalized: dict[str, dict[str, float | int]] = {}
+    for key, fallback in defaults.items():
+        line = source.get(key) if isinstance(source.get(key), dict) else {}
+        try:
+            x = float(line.get("x", fallback["x"]))
+            y = float(line.get("y", fallback["y"]))
+            font_size = int(round(float(line.get("font_size", fallback["font_size"]))))
+        except (TypeError, ValueError):
+            x, y, font_size = fallback["x"], fallback["y"], fallback["font_size"]
+        normalized[key] = {
+            "x": max(0.03, min(0.97, x)),
+            "y": max(0.03, min(0.97, y)),
+            "font_size": max(32, min(260, font_size)),
+        }
+    return normalized
+
+
+def _draw_editable_cover_title(
+    draw: ImageDraw.ImageDraw,
+    width: int,
+    height: int,
+    line1: str,
+    line2: str,
+    title_positions: dict,
+) -> None:
+    scale = width / 1080
+    measure = ImageDraw.Draw(Image.new("L", (1, 1)))
+    for index, (key, line) in enumerate((("line1", line1), ("line2", line2))):
+        if not line:
+            continue
+        position = title_positions[key]
+        font_size = max(12, round(int(position["font_size"]) * scale))
+        font = _find_chinese_font(font_size)
+        stroke_width = max(2, round(font_size / 15.5))
+        box = measure.textbbox((0, 0), line, font=font, stroke_width=stroke_width)
+        center_x = float(position["x"]) * width
+        center_y = float(position["y"]) * height
+        x = round(center_x - (box[0] + box[2]) / 2)
+        y = round(center_y - (box[1] + box[3]) / 2)
+        fill = (255, 255, 255) if index == 0 else (255, 220, 0)
+        draw.text(
+            (x, y),
+            line,
+            font=font,
+            fill=fill,
+            stroke_width=stroke_width,
+            stroke_fill=(0, 0, 0),
+        )
+        if index == 1:
+            underline_y = y + box[3] + max(3, round(font_size / 16))
+            underline_width = max(3, round(font_size / 18))
+            draw.line(
+                (x + box[0], underline_y, x + box[2], underline_y),
+                fill=(0, 0, 0),
+                width=underline_width + stroke_width * 2,
+            )
+            draw.line(
+                (x + box[0], underline_y, x + box[2], underline_y),
+                fill=fill,
+                width=underline_width,
+            )
+
+
+def _draw_cover_title(
+    draw: ImageDraw.ImageDraw,
+    width: int,
+    height: int,
+    line1: str,
+    line2: str,
+    title_positions: dict | None = None,
+) -> None:
+    if title_positions is not None:
+        _draw_editable_cover_title(
+            draw,
+            width,
+            height,
+            line1,
+            line2,
+            normalize_cover_title_positions(title_positions),
+        )
+        return
+    layout = cover_title_layout(line1, line2, width, height)
+    font = layout["font"]
+    stroke_width = layout["stroke_width"]
+    y = layout["start_y"]
+    lines = (line1, line2)
+    for index, (line, box, line_height) in enumerate(zip(lines, layout["boxes"], layout["heights"])):
+        if not line:
+            continue
+        line_width = box[2] - box[0]
+        x = (width - line_width) // 2 - box[0]
+        fill = (255, 255, 255) if index == 0 else (255, 220, 0)
+        draw.text(
+            (x, y),
+            line,
+            font=font,
+            fill=fill,
+            stroke_width=stroke_width,
+            stroke_fill=(0, 0, 0),
+        )
+        if index == 1:
+            underline_y = y + box[3] + layout["underline_gap"]
+            draw.line(
+                (x + box[0], underline_y, x + box[2], underline_y),
+                fill=(0, 0, 0),
+                width=layout["underline_width"] + stroke_width * 2,
+            )
+            draw.line(
+                (x + box[0], underline_y, x + box[2], underline_y),
+                fill=fill,
+                width=layout["underline_width"],
+            )
+        y += line_height + (layout["line_gap"] if index == 0 and line2 else 0)
+
+
+def render_title_overlay(
+    path: Path,
+    line1: str,
+    line2: str,
+    width: int = 1080,
+    height: int = 1920,
+) -> None:
+    """Render the shared cover/video title style to a transparent PNG."""
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    _draw_cover_title(ImageDraw.Draw(overlay), width, height, line1, line2)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    overlay.save(path, format="PNG", optimize=True)
+
+
 def overlay_title_on_cover(cover_path: Path, line1: str, line2: str) -> None:
     """Overlay two-line title text centered on the cover image."""
     with Image.open(cover_path) as img:
@@ -573,35 +604,7 @@ def overlay_title_on_cover(cover_path: Path, line1: str, line2: str) -> None:
         overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
 
-        font_size = max(60, width // 14)
-        font = _find_chinese_font(font_size)
-
-        # Calculate text positions - centered horizontally, positioned in upper-center area
-        line1_bbox = draw.textbbox((0, 0), line1, font=font)
-        line2_bbox = draw.textbbox((0, 0), line2, font=font)
-        line1_w = line1_bbox[2] - line1_bbox[0]
-        line2_w = line2_bbox[2] - line2_bbox[0]
-        line_h = line1_bbox[3] - line1_bbox[1]
-
-        line_spacing = font_size // 3
-        total_text_h = line_h * 2 + line_spacing
-        start_y = int(height * 0.35) - total_text_h // 2
-
-        line1_x = (width - line1_w) // 2
-        line2_x = (width - line2_w) // 2
-        line1_y = start_y
-        line2_y = start_y + line_h + line_spacing
-
-        # Draw black stroke (outline) then yellow fill for each line
-        stroke_width = max(4, font_size // 15)
-        for text, x, y in [(line1, line1_x, line1_y), (line2, line2_x, line2_y)]:
-            # Draw stroke in 8 directions
-            for dx in range(-stroke_width, stroke_width + 1):
-                for dy in range(-stroke_width, stroke_width + 1):
-                    if dx * dx + dy * dy <= stroke_width * stroke_width:
-                        draw.text((x + dx, y + dy), text, font=font, fill=(0, 0, 0, 255))
-            # Draw main text in bright yellow
-            draw.text((x, y), text, font=font, fill=(255, 220, 0, 255))
+        _draw_cover_title(draw, width, height, line1, line2)
 
         result = Image.alpha_composite(img, overlay)
         # Convert back to RGB for PNG save (preserve format)
@@ -609,75 +612,35 @@ def overlay_title_on_cover(cover_path: Path, line1: str, line2: str) -> None:
         result.save(cover_path, format="PNG", optimize=True)
 
 
-def compose_uploaded_cover(source_path: Path, cover_path: Path, line1: str, line2: str) -> None:
-    """Compose a cover inside a centered 1080x1440 content area."""
+def compose_uploaded_cover(
+    source_path: Path,
+    cover_path: Path,
+    line1: str,
+    line2: str,
+    title_positions: dict | None = None,
+) -> None:
+    """Compose a full 9:16 cover without cropping the uploaded image."""
     canvas_width, canvas_height = 1080, 1920
-    content_top = (canvas_height - 1440) // 2
-    content_bottom = content_top + 1440
-    portrait_size = 960
-    portrait_x = (canvas_width - portrait_size) // 2
-    portrait_y = content_top + 72
-    corner_radius = 56
 
     with Image.open(source_path) as source:
         source = ImageOps.exif_transpose(source).convert("RGB")
-        portrait = ImageOps.fit(
+        fitted_cover = ImageOps.contain(
             source,
-            (portrait_size, portrait_size),
+            (canvas_width, canvas_height),
             method=Image.Resampling.LANCZOS,
-            centering=(0.5, 0.5),
         )
 
     canvas = Image.new("RGB", (canvas_width, canvas_height), (0, 0, 0))
-    portrait_mask = Image.new("L", (portrait_size, portrait_size), 0)
-    ImageDraw.Draw(portrait_mask).rounded_rectangle(
-        (0, 0, portrait_size - 1, portrait_size - 1),
-        radius=corner_radius,
-        fill=255,
+    canvas.paste(
+        fitted_cover,
+        (
+            (canvas_width - fitted_cover.width) // 2,
+            (canvas_height - fitted_cover.height) // 2,
+        ),
     )
-    canvas.paste(portrait, (portrait_x, portrait_y), portrait_mask)
     draw = ImageDraw.Draw(canvas)
 
-    stroke_width = 8
-    line_gap = 30
-    title_area_top = portrait_y + portrait_size + 70
-    title_area_height = content_bottom - title_area_top
-    max_text_width = canvas_width - 80
-
-    font_size = 104
-    while True:
-        font = _find_chinese_font(font_size)
-        try:
-            font.set_variation_by_name("Heavy")
-        except (AttributeError, OSError):
-            pass
-        line_boxes = [
-            draw.textbbox((0, 0), line, font=font, stroke_width=stroke_width)
-            for line in (line1, line2)
-        ]
-        line_heights = [box[3] - box[1] for box in line_boxes]
-        total_height = sum(line_heights) + line_gap
-        widest_line = max(box[2] - box[0] for box in line_boxes)
-        if (widest_line <= max_text_width and total_height <= title_area_height) or font_size <= 12:
-            break
-        font_size -= 4
-
-    line_heights = [box[3] - box[1] for box in line_boxes]
-    total_height = sum(line_heights) + line_gap
-    y = title_area_top + max(0, (title_area_height - total_height) // 2)
-
-    for line, box, line_height in zip((line1, line2), line_boxes, line_heights):
-        line_width = box[2] - box[0]
-        x = (canvas_width - line_width) // 2 - box[0]
-        draw.text(
-            (x, y),
-            line,
-            font=font,
-            fill=(255, 220, 0),
-            stroke_width=stroke_width,
-            stroke_fill=(0, 0, 0),
-        )
-        y += line_height + line_gap
+    _draw_cover_title(draw, canvas_width, canvas_height, line1, line2, title_positions)
 
     cover_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(cover_path, format="PNG", optimize=True)

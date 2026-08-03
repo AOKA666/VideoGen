@@ -56,7 +56,7 @@ def _asset_source(path: Path) -> str:
         return "ai_generated"
     if path.name.lower().startswith("manual_"):
         return "manual_upload"
-    return "web_search"
+    return "legacy_import"
 
 
 def _recover_orphaned_generated_assets(data: dict[str, Any]) -> bool:
@@ -120,7 +120,7 @@ def _recover_orphaned_generated_assets(data: dict[str, Any]) -> bool:
                 "shot_id": shot["id"],
                 "asset_id": asset_id,
                 "asset_source": source,
-                "match_score": 100 if source != "web_search" else 80,
+                "match_score": 100,
                 "match_reason": "Recovered from the project image directory",
                 "created_at": now,
             })

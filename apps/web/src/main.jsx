@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Archive, Check, ChevronLeft, ChevronRight, Copy, Crop, Download, Eraser, Film, FolderOpen, ImagePlus, Library, MessageSquare, Mic, Music, RefreshCw, Save, Scissors, Search, Send, Tags, Trash2, Wand2 } from 'lucide-react';
+import { Archive, Check, ChevronLeft, ChevronRight, Copy, Download, Eraser, Film, FolderOpen, ImagePlus, Library, MessageSquare, Mic, Music, RefreshCw, Save, Scissors, Send, Tags, Trash2, Wand2 } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import './styles.css';
 
 const API = import.meta.env.VITE_API_URL ?? (import.meta.env.DEV ? 'http://127.0.0.1:8000' : '');
@@ -8,7 +10,16 @@ const ASSET_PAGE_SIZE = 60;
 const DEFAULT_PROMOTION_BOOK = '《国之脊梁》';
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'videogen.sidebarCollapsed';
 const ADD_PROMOTION_BOOK_OPTION = '__add_promotion_book__';
+const HISTORY_MODEL_LABELS = {
+  minimax: 'MiniMax',
+  deepseek: 'DeepSeek',
+  openai: 'OpenAI',
+};
 const MAX_VOICE_VOLUME_PERCENT = 200;
+const DEFAULT_COVER_TITLE_POSITIONS = {
+  line1: { x: 0.5, y: 0.18, font_size: 124 },
+  line2: { x: 0.5, y: 0.25, font_size: 124 },
+};
 const VOICE_OPTIONS = [
   { value: 'zh_male_m191_uranus_bigtts', label: '男声 · 沉稳叙事' },
   { value: 'zh_male_dongfanghaoran_uranus_bigtts', label: '男声 · 东方浩然' },
@@ -85,26 +96,37 @@ function formatPromotionBookTitle(value) {
   return title ? `《${title}》` : DEFAULT_PROMOTION_BOOK;
 }
 
+function MarkdownContent({ children, className = '' }) {
+  return (
+    <div className={`markdown-content ${className}`.trim()}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a: ({ node: _node, ...props }) => (
+            <a {...props} target="_blank" rel="noreferrer noopener" />
+          ),
+        }}
+      >
+        {String(children || '')}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
 function formatBatchImagePrompts(prompts) {
   const normalized = prompts.map((prompt) => String(prompt || '').trim()).filter(Boolean);
-  const visualMarker = '画面需求：';
-  const safetyMarker = '不要出现真实人物姓名';
+  const visualMarker = '具体画面：';
   const parsed = normalized.map((prompt) => {
     const visualIndex = prompt.indexOf(visualMarker);
-    const safetyIndex = prompt.indexOf(safetyMarker, visualIndex + visualMarker.length);
-    if (visualIndex < 0 || safetyIndex < 0) return null;
+    if (visualIndex < 0) return null;
     return {
       sharedStyle: prompt.slice(0, visualIndex).trim(),
-      shotPrompt: prompt.slice(visualIndex + visualMarker.length, safetyIndex).trim(),
-      sharedSafety: prompt.slice(safetyIndex).trim(),
+      shotPrompt: prompt.slice(visualIndex + visualMarker.length).trim(),
     };
   });
   const hasSharedPromptParts = parsed.length > 0
     && parsed.every(Boolean)
-    && parsed.every((item) => (
-      item.sharedStyle === parsed[0].sharedStyle
-      && item.sharedSafety === parsed[0].sharedSafety
-    ));
+    && parsed.every((item) => item.sharedStyle === parsed[0].sharedStyle);
   if (!hasSharedPromptParts) {
     return normalized
       .map((prompt, index) => `${String(index + 1).padStart(2, '0')}. ${prompt}`)
@@ -118,7 +140,6 @@ function formatBatchImagePrompts(prompts) {
   return [
     '共同提示词：',
     parsed[0].sharedStyle,
-    parsed[0].sharedSafety,
     '',
     '各分镜独立提示词：',
     numberedShotPrompts,
@@ -148,13 +169,13 @@ function projectStage(project) {
   const historyStep = Number(project?.history_workflow?.active_step || 0);
   const historyStatus = project?.history_workflow?.status || '';
   if (project?.has_export || project?.export_url || project?.draft_url || project?.last_export_at) return { key: 'done', label: '已完成' };
-  if (['generating_shots', 'searching_images'].includes(status)) return { key: 'active', label: '处理中' };
+  if (['generating_shots', 'generating_images'].includes(status)) return { key: 'active', label: '处理中' };
   if (historyStatus === 'completed') return { key: 'todo', label: '历史文案已定稿' };
   if (historyStep) return { key: 'active', label: `Step ${historyStep} 待确认` };
   if (status === 'created') return { key: 'todo', label: '等待历史创作' };
   if (status === 'script_ready') return { key: 'todo', label: '文案已完成' };
   if (status === 'shots_ready') return { key: 'todo', label: project?.voice_url ? '等待标题封面' : '等待配音' };
-  if (status === 'search_failed') return { key: 'todo', label: '图片处理失败' };
+  if (status === 'shot_generation_failed') return { key: 'todo', label: '分镜生成失败' };
   if (project?.cover_url) return { key: 'todo', label: '可以导出' };
   return { key: 'todo', label: '待继续' };
 }
@@ -185,79 +206,105 @@ function assetImageUrl(asset) {
   return `${API}${asset.file_url}${version ? `?v=${encodeURIComponent(version)}` : ''}`;
 }
 
-function normalizedAssetCropRegion(asset, naturalSize = null) {
-  const crop = asset?.crop_region;
-  const width = Number(crop?.image_width || 0);
-  const height = Number(crop?.image_height || 0);
-  const size = Number(crop?.size || 0);
-  if (!width || !height || !size) return null;
-  if (naturalSize && (
-    Number(naturalSize.width || 0) !== width
-    || Number(naturalSize.height || 0) !== height
-  )) return null;
-  const safeSize = Math.max(1, Math.min(size, width, height));
-  const x = Math.max(0, Math.min(Number(crop.x || 0), width - safeSize));
-  const y = Math.max(0, Math.min(Number(crop.y || 0), height - safeSize));
-  return { x, y, size: safeSize, imageWidth: width, imageHeight: height };
+function normalizeCoverTitlePositions(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  return Object.fromEntries(Object.entries(DEFAULT_COVER_TITLE_POSITIONS).map(([key, fallback]) => {
+    const line = source[key] && typeof source[key] === 'object' ? source[key] : {};
+    return [key, {
+      x: Math.max(0.03, Math.min(0.97, Number(line.x ?? fallback.x) || fallback.x)),
+      y: Math.max(0.03, Math.min(0.97, Number(line.y ?? fallback.y) || fallback.y)),
+      font_size: Math.max(32, Math.min(260, Number(line.font_size ?? fallback.font_size) || fallback.font_size)),
+    }];
+  }));
 }
 
-function centeredAssetCropRegion(widthValue, heightValue) {
-  const imageWidth = Number(widthValue || 0);
-  const imageHeight = Number(heightValue || 0);
-  if (!imageWidth || !imageHeight) return null;
-  const size = Math.min(imageWidth, imageHeight);
-  return {
-    x: (imageWidth - size) / 2,
-    y: (imageHeight - size) / 2,
-    size,
-    imageWidth,
-    imageHeight,
-  };
-}
+function CoverTitleEditor({ imageUrl, line1, line2, positions, onChange }) {
+  const canvasRef = useRef(null);
+  const [canvasWidth, setCanvasWidth] = useState(405);
 
-function resolvedAssetCropRegion(asset, naturalSize = null) {
-  const imageWidth = Number(naturalSize?.width || asset?.width || 0);
-  const imageHeight = Number(naturalSize?.height || asset?.height || 0);
-  if (!imageWidth || !imageHeight) return null;
-  return normalizedAssetCropRegion(asset, { width: imageWidth, height: imageHeight })
-    || centeredAssetCropRegion(imageWidth, imageHeight);
-}
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return undefined;
+    const updateWidth = () => setCanvasWidth(canvas.getBoundingClientRect().width || 405);
+    updateWidth();
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(canvas);
+    return () => observer.disconnect();
+  }, []);
 
-function assetCropDisplayStyle(asset, naturalSize = null) {
-  const crop = resolvedAssetCropRegion(asset, naturalSize);
-  if (!crop) return undefined;
-  return {
-    position: 'absolute',
-    maxWidth: 'none',
-    maxHeight: 'none',
-    width: `${(crop.imageWidth / crop.size) * 100}%`,
-    height: `${(crop.imageHeight / crop.size) * 100}%`,
-    left: `${-(crop.x / crop.size) * 100}%`,
-    top: `${-(crop.y / crop.size) * 100}%`,
-    objectFit: 'contain',
-  };
-}
+  function beginInteraction(event, key, mode) {
+    event.preventDefault();
+    event.stopPropagation();
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const start = { ...positions[key] };
 
-function cropRegionFromRenderedImage(asset, imageElement) {
-  return resolvedAssetCropRegion(asset, {
-    width: imageElement?.naturalWidth,
-    height: imageElement?.naturalHeight,
-  });
-}
+    const handleMove = (moveEvent) => {
+      const dx = moveEvent.clientX - startX;
+      const dy = moveEvent.clientY - startY;
+      if (mode === 'resize') {
+        const delta = ((dx / rect.width) * 1080 + (dy / rect.height) * 1920) / 2;
+        onChange(key, {
+          ...start,
+          font_size: Math.max(32, Math.min(260, Math.round(start.font_size + delta))),
+        });
+        return;
+      }
+      onChange(key, {
+        ...start,
+        x: Math.max(0.03, Math.min(0.97, start.x + dx / rect.width)),
+        y: Math.max(0.03, Math.min(0.97, start.y + dy / rect.height)),
+      });
+    };
+    const handleUp = () => {
+      window.removeEventListener('pointermove', handleMove);
+      window.removeEventListener('pointerup', handleUp);
+    };
+    window.addEventListener('pointermove', handleMove);
+    window.addEventListener('pointerup', handleUp, { once: true });
+  }
 
-function assetWithVisibleCropRegion(asset, imageElement) {
-  const visibleCrop = cropRegionFromRenderedImage(asset, imageElement);
-  if (!visibleCrop) return asset;
-  return {
-    ...asset,
-    crop_region: {
-      x: visibleCrop.x,
-      y: visibleCrop.y,
-      size: visibleCrop.size,
-      image_width: visibleCrop.imageWidth,
-      image_height: visibleCrop.imageHeight,
-    },
-  };
+  return (
+    <div className="cover-title-editor" ref={canvasRef}>
+      <img src={imageUrl} alt="封面人物图片" draggable="false" />
+      {[
+        ['line1', line1, '第一行标题'],
+        ['line2', line2, '第二行标题'],
+      ].map(([key, text, label], index) => {
+        const position = positions[key];
+        const previewFontSize = Math.max(12, position.font_size * canvasWidth / 1080);
+        return (
+          <div
+            key={key}
+            className={`cover-title-box cover-title-box-${index + 1}`}
+            style={{
+              left: `${position.x * 100}%`,
+              top: `${position.y * 100}%`,
+              fontSize: `${previewFontSize}px`,
+              WebkitTextStrokeWidth: `${Math.max(1, previewFontSize / 15.5)}px`,
+            }}
+            role="button"
+            tabIndex="0"
+            aria-label={`拖动${label}，右下角可缩放`}
+            onPointerDown={(event) => beginInteraction(event, key, 'drag')}
+          >
+            <span>{text || label}</span>
+            {index === 1 && <i aria-hidden="true" />}
+            <button
+              type="button"
+              className="cover-title-resize-handle"
+              title={`调整${label}大小`}
+              aria-label={`调整${label}大小`}
+              onPointerDown={(event) => beginInteraction(event, key, 'resize')}
+            />
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 function App() {
@@ -268,7 +315,6 @@ function App() {
   const [shots, setShots] = useState([]);
   const [assets, setAssets] = useState([]);
   const [generatedAssets, setGeneratedAssets] = useState([]);
-  const [webImageDiagnostics, setWebImageDiagnostics] = useState([]);
   const [library, setLibrary] = useState(null);
   const [musicLibrary, setMusicLibrary] = useState([]);
   const [editingAsset, setEditingAsset] = useState(null);
@@ -287,7 +333,8 @@ function App() {
   const [generatingShotIds, setGeneratingShotIds] = useState(new Set());
   const [recognizingShotIds, setRecognizingShotIds] = useState(new Set());
   const [imagePromptEditors, setImagePromptEditors] = useState({});
-  const [materialSourceStrategy, setMaterialSourceStrategy] = useState('library_first');
+  const [materialSourceStrategy, setMaterialSourceStrategy] = useState('ai_only');
+  const [storyboardModelProvider, setStoryboardModelProvider] = useState('deepseek');
   const [voiceType, setVoiceType] = useState(VOICE_OPTIONS[0].value);
   const [speechRate, setSpeechRate] = useState(0);
   const [voicePreviewUrl, setVoicePreviewUrl] = useState('');
@@ -302,6 +349,8 @@ function App() {
   const [publishShortTitle, setPublishShortTitle] = useState('');
   const [publishDescription, setPublishDescription] = useState('');
   const [coverImage, setCoverImage] = useState(null);
+  const [coverImagePreviewUrl, setCoverImagePreviewUrl] = useState('');
+  const [coverTitlePositions, setCoverTitlePositions] = useState(DEFAULT_COVER_TITLE_POSITIONS);
   const [backgroundMusicId, setBackgroundMusicId] = useState('');
   const [backgroundMusicStart, setBackgroundMusicStart] = useState(0);
   const [backgroundMusicVolume, setBackgroundMusicVolume] = useState(20);
@@ -344,13 +393,15 @@ function App() {
   const historyActiveStep = Number(historyWorkflow.active_step || 0);
   const historyOutput = String(historyWorkflow.outputs?.[String(historyActiveStep)] || '');
   const historyMessages = historyWorkflow.messages?.[String(historyActiveStep)] || [];
+  const stepTwoComparison = historyWorkflow.step2_comparison || null;
+  const historyModelProvider = project?.history_model_provider || 'minimax';
   const selectedAssets = useMemo(() => {
     const map = new Map();
     assets.forEach((asset) => map.set(asset.id, asset));
     generatedAssets.forEach((asset) => map.set(asset.id, {
       ...asset,
       file_type: 'image',
-      file_name: asset.file_name || `AI 占位图 ${asset.image_size || ''}`.trim(),
+      file_name: asset.file_name || `AI 图片 ${asset.image_size || ''}`.trim(),
     }));
     return map;
   }, [assets, generatedAssets]);
@@ -358,8 +409,8 @@ function App() {
     ...generatedAssets.map((asset) => ({
       ...asset,
       file_type: 'image',
-      file_name: asset.file_name || `网络图片 ${asset.image_size || ''}`.trim(),
-      asset_source: asset.asset_source || 'web_search',
+      file_name: asset.file_name || `AI 图片 ${asset.image_size || ''}`.trim(),
+      asset_source: asset.asset_source || 'ai_generated',
     })),
     ...assets.map((asset) => ({ ...asset, asset_source: 'local' })),
   ], [assets, generatedAssets]);
@@ -370,7 +421,7 @@ function App() {
       list.push({
         ...asset,
         file_type: 'image',
-        file_name: asset.file_name || `网络图片 ${asset.image_size || ''}`.trim(),
+        file_name: asset.file_name || `AI 图片 ${asset.image_size || ''}`.trim(),
       });
       map.set(asset.shot_id, list);
     });
@@ -390,26 +441,16 @@ function App() {
     map.forEach((list) => list.sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || ''))));
     return map;
   }, [assets, generatedAssets, shots]);
-  const searchProgress = useMemo(() => {
-    const total = shots.length || project?.search_total || 0;
-    const success = shots.filter((shot) => ['web_downloaded', 'uploaded', 'ai_generated', 'matched', 'prompt_ready'].includes(shot.status)).length;
-    const failed = shots.filter((shot) => ['no_image', 'no_match', 'intent_failed'].includes(shot.status)).length;
+  const generationProgress = useMemo(() => {
+    const total = shots.length || project?.generation_total || 0;
+    const success = shots.filter((shot) => ['uploaded', 'ai_generated', 'matched', 'prompt_ready'].includes(shot.status)).length;
+    const failed = shots.filter((shot) => shot.status === 'no_image').length;
     const completed = shots.length
       ? success + failed
-      : Math.min(total, project?.search_completed || 0);
+      : Math.min(total, project?.generation_completed || 0);
     const percent = total ? Math.min(100, Math.round((completed / total) * 100)) : 0;
     return { total, completed, success, failed, percent };
   }, [project, shots]);
-  const diagnosticsByShot = useMemo(() => {
-    const map = new Map();
-    webImageDiagnostics.forEach((item) => {
-      const list = map.get(item.shot_id) || [];
-      list.push(item);
-      map.set(item.shot_id, list);
-    });
-    map.forEach((list) => list.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || ''))));
-    return map;
-  }, [webImageDiagnostics]);
   const filteredAssets = useMemo(
     () => assets.filter((asset) => assetTypeFilter === 'all' || asset.file_type === assetTypeFilter),
     [assets, assetTypeFilter],
@@ -451,14 +492,13 @@ function App() {
       setProject(projectData.project);
       setShots(projectData.shots);
       setGeneratedAssets(projectData.generated_assets || []);
-      setWebImageDiagnostics(projectData.web_image_diagnostics || []);
       setProjectId(id);
       setHistoryBookTitle(formatPromotionBookTitle(projectData.project.promotion_book_title));
+      setStoryboardModelProvider(projectData.project.storyboard_model_provider || 'deepseek');
     } else {
       setProject(null);
       setShots([]);
       setGeneratedAssets([]);
-      setWebImageDiagnostics([]);
       setProjectId('');
     }
   }
@@ -469,13 +509,35 @@ function App() {
     setProject(data.project);
     setShots(data.shots);
     setGeneratedAssets(data.generated_assets || []);
-    setWebImageDiagnostics(data.web_image_diagnostics || []);
+    setStoryboardModelProvider(data.project.storyboard_model_provider || 'deepseek');
   }
 
 
   useEffect(() => {
     refreshAll();
   }, []);
+
+  useEffect(() => {
+    if (!window.FontFace || !document.fonts) return undefined;
+    const coverFont = new FontFace('GongfanNufang', `url(${API}/api/projects/_fonts/cover-title)`);
+    let cancelled = false;
+    coverFont.load().then((loadedFont) => {
+      if (!cancelled) document.fonts.add(loadedFont);
+    }).catch(() => {
+      // The generated cover still uses the bundled backend font if preview loading fails.
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (coverImage) {
+      const objectUrl = URL.createObjectURL(coverImage);
+      setCoverImagePreviewUrl(objectUrl);
+      return () => URL.revokeObjectURL(objectUrl);
+    }
+    setCoverImagePreviewUrl(project?.cover_source_url ? `${API}${project.cover_source_url}` : '');
+    return undefined;
+  }, [coverImage, project?.cover_source_url]);
 
   useEffect(() => {
     const hasProcessingVideo = assets.some((asset) => (
@@ -509,6 +571,7 @@ function App() {
     setPublishShortTitle(project.publish_short_title || '');
     setPublishDescription(project.publish_description || '');
     setCoverImage(null);
+    setCoverTitlePositions(normalizeCoverTitlePositions(project.cover_title_positions));
     setBackgroundMusicId(project.background_music_id || '');
     setBackgroundMusicStart(Number(project.background_music_start_sec || 0));
     setBackgroundMusicVolume(Math.round(Number(project.background_music_volume ?? 0.2) * 100));
@@ -524,6 +587,8 @@ function App() {
     project?.publish_short_title,
     project?.publish_description,
     project?.cover_url,
+    project?.cover_source_url,
+    project?.cover_title_positions,
     project?.background_music_id,
     project?.background_music_start_sec,
     project?.background_music_volume,
@@ -603,8 +668,7 @@ function App() {
   }, [tab, activeLibrary?.id]);
 
   useEffect(() => {
-    const activeStatuses = ['pending_search', 'analyzing_intent', 'searching'];
-    if (!projectId || !shots.some((shot) => activeStatuses.includes(shot.status)) && !['generating_shots', 'searching_images'].includes(project?.status)) return undefined;
+    if (!projectId || !['generating_shots', 'generating_images'].includes(project?.status)) return undefined;
     const timer = window.setInterval(() => {
       refreshProject(projectId);
     }, 1500);
@@ -614,19 +678,17 @@ function App() {
   useEffect(() => {
     const previous = lastProjectStatusRef.current;
     const current = project?.status || '';
-    if (previous === 'searching_images' && current === 'search_failed') {
-      setMessage(project?.search_error ? `处理失败：${project.search_error}` : '分镜图片处理失败');
-    } else if (previous === 'searching_images' && current === 'search_stopped') {
-      setMessage('');
-    } else if (previous === 'searching_images' && current && current !== 'searching_images') {
-      if (searchProgress.total && searchProgress.completed < searchProgress.total) {
-        setMessage(`分镜图片处理结束，仍有 ${searchProgress.total - searchProgress.completed} 个分镜未完成`);
+    if (['generating_shots', 'generating_images'].includes(previous) && current === 'shot_generation_failed') {
+      setMessage(project?.generation_error ? `处理失败：${project.generation_error}` : '分镜生成失败');
+    } else if (['generating_shots', 'generating_images'].includes(previous) && current && !['generating_shots', 'generating_images'].includes(current)) {
+      if (generationProgress.total && generationProgress.completed < generationProgress.total) {
+        setMessage(`分镜处理结束，仍有 ${generationProgress.total - generationProgress.completed} 个分镜未完成`);
       } else {
         setMessage(project?.material_source_strategy === 'prompt_only' ? '分镜提示词生成完成' : '分镜图片处理完成');
       }
     }
     lastProjectStatusRef.current = current;
-  }, [project?.status, project?.search_error, searchProgress.completed, searchProgress.total]);
+  }, [project?.status, project?.generation_error, generationProgress.completed, generationProgress.total]);
 
   async function chooseLibraryFolder() {
     if ('showDirectoryPicker' in window) {
@@ -674,7 +736,7 @@ function App() {
   }
 
   async function rewrite() {
-    if (historyActiveStep && !window.confirm('重新开始会清空当前三步创作进度，确认继续吗？')) return;
+    if (historyActiveStep && !window.confirm('从 Step 1 重新生成会清空当前三步创作进度，确认继续吗？')) return;
     setHistoryChatInput('');
     const data = await run('历史创作 Step 1', () => request(`/api/projects/${projectId}/history-workflow/steps/1`, {
       method: 'POST',
@@ -705,6 +767,20 @@ function App() {
     await refreshAll(projectId);
     setMessage(`已选择 ${data.title || formatted}，请从 Step 1 重新开始`);
     return true;
+  }
+
+  async function selectHistoryModel(provider) {
+    const data = await run('切换创作模型', () => request(
+      `/api/projects/${projectId}/history-workflow/model`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider }),
+      },
+    ));
+    if (!data) return;
+    await refreshProject(projectId);
+    setMessage(`已切换为 ${HISTORY_MODEL_LABELS[provider] || provider}，后续生成和问答将使用该模型`);
   }
 
   async function addPromotionBookFromSelect() {
@@ -783,6 +859,24 @@ function App() {
           : 'Step 3 终审定稿已生成，可继续聊天修改，满意后确认定稿',
       );
     }
+  }
+
+  async function regenerateHistoryStep(step) {
+    const downstreamSteps = [1, 2, 3].filter((item) => (
+      item > step && Boolean(historyWorkflow.outputs?.[String(item)])
+    ));
+    const consequence = downstreamSteps.length
+      ? `，并清除 Step ${downstreamSteps.join('、Step ')} 的旧结果`
+      : '';
+    if (!window.confirm(`确认重新生成 Step ${step}${consequence}吗？`)) return;
+    setHistoryChatInput('');
+    const data = await run(`重新生成 Step ${step}`, () => request(
+      `/api/projects/${projectId}/history-workflow/steps/${step}`,
+      { method: 'POST' },
+    ));
+    if (!data) return;
+    await refreshAll(projectId);
+    setMessage(`Step ${step} 已重新生成${downstreamSteps.length ? '，后续步骤已清除' : ''}`);
   }
 
   async function sendHistoryChat(event) {
@@ -941,7 +1035,7 @@ function App() {
     await refreshAll(projectId);
   }
 
-  async function generateShots(imageSearchProvider = 'so') {
+  async function generateShots() {
     setTab('storyboard');
     setBusy(true);
     setMessage('生成分镜中...');
@@ -956,7 +1050,7 @@ function App() {
         body: JSON.stringify({ rewritten_script: paragraphs.join('\n\n') }),
       });
       await request(
-        `/api/projects/${projectId}/shots?image_search_provider=${imageSearchProvider}&material_source_strategy=${materialSourceStrategy}`,
+        `/api/projects/${projectId}/shots?material_source_strategy=${materialSourceStrategy}&storyboard_model_provider=${storyboardModelProvider}`,
         { method: 'POST' },
       );
       await refreshAll(projectId);
@@ -968,7 +1062,7 @@ function App() {
     }
   }
 
-  async function skipToStoryboard(imageSearchProvider = 'so') {
+  async function skipToStoryboard() {
     setTab('storyboard');
     setBusy(true);
     setMessage('使用原始文案生成分镜...');
@@ -979,7 +1073,7 @@ function App() {
         body: JSON.stringify({ rewritten_script: project.raw_script }),
       });
       await request(
-        `/api/projects/${projectId}/shots?image_search_provider=${imageSearchProvider}&material_source_strategy=${materialSourceStrategy}`,
+        `/api/projects/${projectId}/shots?material_source_strategy=${materialSourceStrategy}&storyboard_model_provider=${storyboardModelProvider}`,
         { method: 'POST' },
       );
       await refreshAll(projectId);
@@ -1104,34 +1198,6 @@ function App() {
     await refreshAll('');
   }
 
-  async function matchAssets() {
-    await run('联网下载图片', () => request(`/api/projects/${projectId}/match-assets`, { method: 'POST' }));
-    await refreshAll(projectId);
-    setTab('match');
-  }
-
-  async function stopImageSearch() {
-    if (!projectId) return;
-    setMessage('正在停止图片搜索...');
-    await request(`/api/projects/${projectId}/stop-image-search`, { method: 'POST' });
-    await refreshAll(projectId);
-  }
-
-  async function retryFailedShots(imageSearchProvider = 'so') {
-    const label = imageSearchProvider === 'tencent' ? '腾讯重新搜索失败分镜' : '重新搜索失败分镜';
-    const result = await run(label, () => request(
-      `/api/projects/${projectId}/retry-failed-shots?image_search_provider=${imageSearchProvider}`,
-      { method: 'POST' },
-    ));
-    if (!result) return;
-    if (result.retried_count === 0) {
-      setMessage('没有失败的分镜需要重新搜索');
-      return;
-    }
-    await refreshAll(projectId);
-    setMessage(`正在重新搜索 ${result.retried_count} 个失败分镜...`);
-  }
-
   async function openImagePromptEditor(shotId) {
     if (imagePromptEditors[shotId] !== undefined) return;
     const result = await run('读取图片提示词', () => request(
@@ -1183,15 +1249,6 @@ function App() {
     }
   }
 
-  async function retryImageSearch(shotId, imageSearchProvider = 'so') {
-    const label = imageSearchProvider === 'tencent' ? '腾讯重新搜索图片' : '重新搜索图片';
-    await run(label, () => request(
-      `/api/projects/${projectId}/shots/${shotId}/retry-image-search?image_search_provider=${imageSearchProvider}`,
-      { method: 'POST' },
-    ));
-    await refreshAll(projectId);
-  }
-
   async function setProjectArchived(item, archived) {
     const result = await run(archived ? '归档项目' : '恢复项目', () => request(`/api/projects/${item.id}/script`, {
       method: 'PATCH',
@@ -1219,19 +1276,19 @@ function App() {
     }
   }
 
-  async function reanalyzeShotImage(shotId) {
+  async function regenerateShotImagePrompt(shotId) {
     setRecognizingShotIds((current) => new Set(current).add(shotId));
-    setMessage('正在重新识别图片，可继续识别其他分镜');
+    setMessage('正在重新生成图片提示词，可继续处理其他分镜');
     try {
       const result = await request(
-        `/api/projects/${projectId}/shots/${shotId}/reanalyze-image`,
+        `/api/projects/${projectId}/shots/${shotId}/regenerate-image-prompt?storyboard_model_provider=${storyboardModelProvider}`,
         { method: 'POST' },
       );
       closeImagePromptEditor(shotId);
       setShots((current) => current.map((shot) => (shot.id === shotId ? result.shot : shot)));
-      setMessage(`镜头 ${result.shot.shot_index} 的图片信息已重新识别`);
+      setMessage(`镜头 ${result.shot.shot_index} 的 AI 图片提示词已重新生成`);
     } catch (err) {
-      setMessage(`重新识别失败：${err.message}`);
+      setMessage(`重新生成提示词失败：${err.message}`);
     } finally {
       setRecognizingShotIds((current) => {
         const next = new Set(current);
@@ -1254,14 +1311,13 @@ function App() {
     }));
     if (!result) return false;
     setShots((current) => current.map((shot) => (shot.id === shotId ? result.shot : shot)));
-    setMessage(`镜头 ${result.shot.shot_index} 文案已保存；如画面内容变化，请重新识别图片`);
+    setMessage(`镜头 ${result.shot.shot_index} 文案已保存；如画面内容变化，请重新生成图片提示词`);
     return true;
   }
 
   async function processGeneratedImage(assetId, operation, { silent = false } = {}) {
     const processingKey = `${assetId}:${operation}`;
     const label = {
-      'crop-square': '裁剪图片',
       grayscale: '转为黑白照片',
       'remove-watermark': 'Seedream 去水印',
     }[operation] || '处理图片';
@@ -1328,25 +1384,6 @@ function App() {
       : `一键黑白完成：${succeeded} 张分镜图片已转为黑白照片`);
   }
 
-  async function saveGeneratedImageDisplayRegion(asset, region) {
-    if (!asset?.project_id || !asset?.id || !region) return;
-    setProcessingImage(`${asset.id}:crop-square-region`);
-    try {
-      await run('保存图片显示区域', () => request(
-        `/api/projects/${asset.project_id}/generated-assets/${asset.id}/crop-square-region`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(region),
-        },
-      ));
-      setPreviewAsset(null);
-      await refreshAll(projectId);
-    } finally {
-      setProcessingImage('');
-    }
-  }
-
   async function uploadManualShotImage(shotId, file) {
     const data = new FormData();
     data.append('file', file, file.name);
@@ -1367,17 +1404,7 @@ function App() {
     await refreshAll(projectId);
   }
 
-  async function cropSelectedImages() {
-    const result = await run('一键裁剪', () => request(
-      `/api/projects/${projectId}/crop-selected-images`,
-      { method: 'POST' },
-    ));
-    if (!result) return;
-    setMessage(`一键裁剪完成：成功 ${result.cropped}，跳过 ${result.skipped}，失败 ${result.failed.length}`);
-    await refreshAll(projectId);
-  }
-
-  async function selectAsset(shotId, assetId, assetSource = 'web_search') {
+  async function selectAsset(shotId, assetId, assetSource = 'ai_generated') {
     const result = await run('指定素材', () => request(`/api/projects/${projectId}/shots/${shotId}/asset`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
@@ -1471,8 +1498,8 @@ function App() {
     await generateMusicVoiceAndSubtitles(result.music.id, 0);
   }
 
-  async function generateCover() {
-    if (!coverImage) {
+  async function generateCover(options = {}) {
+    if (!coverImage && !project?.cover_source_url) {
       setMessage('请先上传一张人物图片');
       return;
     }
@@ -1485,25 +1512,36 @@ function App() {
       if (!saved) return;
     }
     const data = new FormData();
-    data.append('file', coverImage, coverImage.name);
+    if (coverImage) data.append('file', coverImage, coverImage.name);
+    data.append('title_positions', JSON.stringify(coverTitlePositions));
     const result = await run('生成视频封面', () => request(`/api/projects/${projectId}/generate-cover`, {
       method: 'POST',
       body: data,
     }));
     if (!result) return;
     await refreshAll(projectId);
-    setMessage('9:16 视频封面生成完成');
+    if (!options.silent) setMessage('9:16 视频封面生成完成');
+    return true;
   }
 
-  function downloadCover() {
+  function updateCoverTitlePosition(key, value) {
+    setCoverTitlePositions((current) => normalizeCoverTitlePositions({
+      ...current,
+      [key]: value,
+    }));
+  }
+
+  async function downloadCover() {
     if (!project?.cover_url) return;
+    const updated = await generateCover({ silent: true });
+    if (!updated) return;
     const link = document.createElement('a');
-    link.href = `${API}/api/projects/${projectId}/download-cover`;
+    link.href = `${API}/api/projects/${projectId}/download-cover?v=${Date.now()}`;
     link.download = '视频封面.png';
     document.body.appendChild(link);
     link.click();
     link.remove();
-    setMessage('封面下载已开始');
+    setMessage('已应用当前标题位置和大小，封面下载已开始');
   }
 
   function updateVoiceVolume(value) {
@@ -1685,23 +1723,18 @@ function App() {
     setMessage('发布助手已生成，可以直接复制发布');
   }
 
-  async function exportPackage(output) {
+  async function exportPackage() {
     if (!project?.audio_url || !project?.voice_timeline_url) {
       const generated = await generateVoiceAndSubtitles();
       if (!generated) return;
     }
-    const label = output === 'mp4' ? '导出 MP4' : '导出剪映草稿';
-    const data = await run(label, () => request(
-      `/api/projects/${projectId}/export/assets?output=${output}`,
+    const data = await run('导出剪映草稿', () => request(
+      `/api/projects/${projectId}/export/assets`,
       { method: 'POST' },
     ));
     if (!data) return;
     setExportResult(data);
-    if (output === 'mp4') {
-      setMessage(`MP4 导出完成：${data.verification?.mp4?.passed ? '验证通过' : '验证失败'}`);
-    } else {
-      setMessage(`剪映草稿导出完成：${data.verification?.jianying?.draft_name || ''}`);
-    }
+    setMessage(`剪映草稿导出完成：${data.verification?.jianying?.draft_name || ''}`);
   }
 
   async function openExportFolder() {
@@ -1720,28 +1753,14 @@ function App() {
     if (data?.path) setMessage(`已打开剪映草稿文件夹：${data.path}`);
   }
 
-  const workflowBusy = busy || project?.status === 'searching_images';
+  const workflowBusy = busy || ['generating_shots', 'generating_images'].includes(project?.status);
   const workflowMessage = (() => {
-    if (project?.status === 'search_failed') {
-      return project.search_error ? `处理失败：${project.search_error}` : '分镜图片处理失败';
+    if (project?.status === 'shot_generation_failed') {
+      return project.generation_error ? `处理失败：${project.generation_error}` : '分镜生成失败';
     }
-    if (project?.status === 'search_stopped') return message || '就绪';
-    if (project?.status !== 'searching_images') return message || '就绪';
-    if (project.search_stage === 'generating_ai_images') {
-      return project.current_search_keyword || '正在使用 AI 生成分镜图片...';
-    }
-    if (project.search_stage === 'stopping') return '正在停止图片搜索...';
-    if (project.search_stage === 'analyzing_intent') {
-      return project.current_search_keyword || '正在分析分镜关键词...';
-    }
-    if (project.search_stage === 'intent_ready') {
-      return '关键词已生成，准备搜索图片...';
-    }
-    if (project.search_stage === 'downloading') {
-      const total = project.search_total || shots.length || 0;
-      return `正在搜索图片 ${project.search_completed || 0}/${total}`;
-    }
-    return '正在处理分镜图片...';
+    if (!['generating_shots', 'generating_images'].includes(project?.status)) return message || '就绪';
+    return project.current_generation_message
+      || (project.status === 'generating_shots' ? '正在生成分镜提示词...' : '正在使用 AI 生成分镜图片...');
   })();
 
   function toggleSidebar() {
@@ -1964,38 +1983,30 @@ function App() {
               />
               <div className="script-panel-footer">
               <label className="source-strategy">
-                素材来源策略
+                分镜生成方式
                 <select value={materialSourceStrategy} onChange={(event) => setMaterialSourceStrategy(event.target.value)}>
-                  <option value="library_first">优先素材库，缺失时联网搜索</option>
-                  <option value="library_only">仅使用素材库</option>
-                  <option value="web_only">仅联网搜索</option>
                   <option value="ai_only">仅使用 AI 生成</option>
                   <option value="prompt_only">仅生成 AI 图片提示词</option>
                 </select>
               </label>
+              <label className="source-strategy">
+                提示词模型
+                <select value={storyboardModelProvider} onChange={(event) => setStoryboardModelProvider(event.target.value)}>
+                  <option value="deepseek">DeepSeek</option>
+                  <option value="minimax">MiniMax</option>
+                  <option value="openai">OpenAI</option>
+                </select>
+              </label>
               <div className="actions raw-script-actions">
-                {['ai_only', 'prompt_only'].includes(materialSourceStrategy) ? (
-                  <button
-                    className="primary"
-                    title={materialSourceStrategy === 'prompt_only'
-                      ? '使用原始文案生成分镜和图片提示词，不生成画面'
-                      : '使用原始文案生成分镜，并为每个镜头生成 AI 图片'}
-                    onClick={() => skipToStoryboard()}
-                  >
-                    <Wand2 size={18} /> {materialSourceStrategy === 'prompt_only' ? '生成分镜提示词' : 'AI 生成分镜'}
-                  </button>
-                ) : (
-                  <>
-                    <button className="primary" onClick={() => skipToStoryboard('so')}><Archive size={18} /> 直接生成分镜</button>
-                    <button
-                      className="tencent-storyboard"
-                      title="使用原始文案生成分镜，并使用腾讯云联网图像搜索"
-                      onClick={() => skipToStoryboard('tencent')}
-                    >
-                      <Search size={18} /> 直接生成分镜
-                    </button>
-                  </>
-                )}
+                <button
+                  className="primary"
+                  title={materialSourceStrategy === 'prompt_only'
+                    ? '使用原始文案生成分镜和图片提示词，不生成画面'
+                    : '使用原始文案生成分镜，并为每个镜头生成 AI 图片'}
+                  onClick={skipToStoryboard}
+                >
+                  <Wand2 size={18} /> {materialSourceStrategy === 'prompt_only' ? '生成分镜提示词' : 'AI 生成分镜'}
+                </button>
               </div>
               <small className="raw-script-hint">也可以跳过历史创作，直接使用参考文案生成分镜</small>
               </div>
@@ -2037,7 +2048,22 @@ function App() {
                     </button>
                   </div>
                 </label>
-                <small>Step 1、Step 2、Step 3 都会固定围绕 {historyBookTitle} 生成；切换书籍会重置进度。</small>
+                <label>
+                  创作模型
+                  <select
+                    value={historyModelProvider}
+                    onChange={(event) => selectHistoryModel(event.target.value)}
+                    disabled={busy}
+                    aria-label="选择历史文案创作模型"
+                  >
+                    <option value="minimax">MiniMax</option>
+                    <option value="deepseek">DeepSeek</option>
+                    <option value="openai">OpenAI</option>
+                  </select>
+                </label>
+                <small>
+                  Step 1、Step 2、Step 3 和阶段问答都会使用所选模型；切换书籍会重置进度。
+                </small>
               </div>
               <div className="history-stepper" aria-label="历史创作进度">
                 {[
@@ -2051,12 +2077,24 @@ function App() {
                   >
                     <span>{historyActiveStep > step || historyWorkflow.status === 'completed' ? <Check size={14} /> : step}</span>
                     <strong>{label}</strong>
+                    {historyWorkflow.outputs?.[String(step)] && (
+                      <button
+                        type="button"
+                        className="history-step-regenerate"
+                        onClick={() => regenerateHistoryStep(step)}
+                        disabled={busy}
+                        title={`重新生成 Step ${step}`}
+                        aria-label={`重新生成 Step ${step} ${label}`}
+                      >
+                        <RefreshCw size={13} />
+                      </button>
+                    )}
                   </div>
                 ))}
               </div>
               <div className="history-stage-output" aria-live="polite">
                 {historyOutput ? (
-                  <div>{historyOutput}</div>
+                  <MarkdownContent>{historyOutput}</MarkdownContent>
                 ) : (
                   <div className="history-empty-state">
                     <Wand2 size={30} />
@@ -2065,10 +2103,60 @@ function App() {
                   </div>
                 )}
               </div>
+              {stepTwoComparison && (
+                <details className="history-draft-comparison" open={historyActiveStep === 2}>
+                  <summary>Step 2 首稿 / 优化稿对照</summary>
+                  <div className="history-draft-verdict">
+                    <strong>评审选择：{stepTwoComparison.winner === 'draft_2' ? '优化稿' : '首稿'}</strong>
+                    <span>{stepTwoComparison.reason || '未提供选择原因'}</span>
+                    <small>
+                      {stepTwoComparison.local_edit_applied
+                        ? `已执行 ${stepTwoComparison.required_edits?.length || 0} 项局部修改`
+                        : stepTwoComparison.local_edit_rejected
+                          ? '局部修改改动过大，已自动回退胜出稿'
+                          : '胜出稿未再修改'}
+                    </small>
+                  </div>
+                  <div className="history-draft-grid">
+                    {[
+                      ['首稿', stepTwoComparison.draft_1, stepTwoComparison.draft_1_metrics],
+                      ['优化稿', stepTwoComparison.draft_2, stepTwoComparison.draft_2_metrics],
+                    ].map(([label, draft, metrics]) => (
+                      <section key={label}>
+                        <h3>{label}</h3>
+                        <div className="history-draft-metrics">
+                          <span>字符数 <b>{metrics?.character_count ?? '—'}</b></span>
+                          <span>重复句比例 <b>{metrics ? `${(Number(metrics.repeated_sentence_ratio || 0) * 100).toFixed(1)}%` : '—'}</b></span>
+                          <span>书籍介绍 <b>{metrics?.book_introduction_length ?? '—'} 字</b></span>
+                        </div>
+                        <div className="history-draft-text"><MarkdownContent>{String(draft || '')}</MarkdownContent></div>
+                      </section>
+                    ))}
+                  </div>
+                  {!!stepTwoComparison.required_edits?.length && (
+                    <div className="history-required-edits">
+                      <strong>必要局部修改</strong>
+                      <ul>{stepTwoComparison.required_edits.map((item) => <li key={item}>{item}</li>)}</ul>
+                    </div>
+                  )}
+                </details>
+              )}
               <div className="history-workflow-actions">
-                <button type="button" onClick={rewrite} disabled={busy}>
-                  <RefreshCw size={16} /> {historyActiveStep ? '重新开始' : '改写'}
-                </button>
+                {!historyActiveStep ? (
+                  <button type="button" onClick={rewrite} disabled={busy}>
+                    <Wand2 size={16} /> 改写
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={rewrite}
+                    disabled={busy}
+                    title="清空当前三步创作进度并从 Step 1 重新生成"
+                    aria-label="从头重新生成二创文案"
+                  >
+                    <RefreshCw size={16} /> 重新生成
+                  </button>
+                )}
                 {historyActiveStep > 0 && historyActiveStep < 3 && (
                   <button type="button" className="primary" onClick={runNextHistoryStep} disabled={busy}>
                     <Check size={16} /> 确认回答并进入 Step {historyActiveStep + 1}
@@ -2096,7 +2184,7 @@ function App() {
                 {historyMessages.length ? historyMessages.map((item, index) => (
                   <div className={`history-chat-message ${item.role}`} key={`${index}-${item.role}`}>
                     <span>{item.role === 'user' ? '你' : 'AI'}</span>
-                    <p>{item.content}</p>
+                    <MarkdownContent className="history-chat-markdown">{item.content}</MarkdownContent>
                   </div>
                 )) : (
                   <div className="history-chat-placeholder">
@@ -2124,13 +2212,18 @@ function App() {
               {historyWorkflow.status === 'completed' && (
                 <div className="history-final-actions">
                   <label className="source-strategy">
-                    素材来源策略
+                    分镜生成方式
                     <select value={materialSourceStrategy} onChange={(event) => setMaterialSourceStrategy(event.target.value)}>
-                      <option value="library_first">优先素材库，缺失时联网搜索</option>
-                      <option value="library_only">仅使用素材库</option>
-                      <option value="web_only">仅联网搜索</option>
                       <option value="ai_only">仅使用 AI 生成</option>
                       <option value="prompt_only">仅生成 AI 图片提示词</option>
+                    </select>
+                  </label>
+                  <label className="source-strategy">
+                    提示词模型
+                    <select value={storyboardModelProvider} onChange={(event) => setStoryboardModelProvider(event.target.value)}>
+                      <option value="deepseek">DeepSeek</option>
+                      <option value="minimax">MiniMax</option>
+                      <option value="openai">OpenAI</option>
                     </select>
                   </label>
                   <button type="button" className="primary" onClick={() => generateShots()}>
@@ -2146,19 +2239,20 @@ function App() {
           <section className="band">
             <div className="storyboard-actions">
               <div className="storyboard-action-buttons">
+                <label className="storyboard-model-picker">
+                  提示词模型
+                  <select value={storyboardModelProvider} onChange={(event) => setStoryboardModelProvider(event.target.value)}>
+                    <option value="deepseek">DeepSeek</option>
+                    <option value="minimax">MiniMax</option>
+                    <option value="openai">OpenAI</option>
+                  </select>
+                </label>
                 <button
                   type="button"
                   disabled={!shots.some((shot) => String(shot.image_prompt || '').trim())}
                   onClick={copyAllImagePrompts}
                 >
                   <Copy size={18} /> 一键复制全部提示词
-                </button>
-                <button
-                  type="button"
-                  disabled={busy || !shots.some((shot) => shot.selected_asset_id)}
-                  onClick={cropSelectedImages}
-                >
-                  <Crop size={18} /> 一键裁剪选中图片
                 </button>
                 <button
                   type="button"
@@ -2180,26 +2274,10 @@ function App() {
                 >
                   <Archive size={18} /> 批量存入素材库并打标签
                 </button>
-                <button
-                  type="button"
-                  disabled={busy || !shots.some((shot) => ['no_image', 'no_match', 'intent_failed', 'search_stopped'].includes(shot.status))}
-                  onClick={() => retryFailedShots('so')}
-                >
-                  <RefreshCw size={18} /> 重新搜索失败分镜
-                </button>
-                <button
-                  type="button"
-                  className="tencent-storyboard"
-                  disabled={busy || !shots.some((shot) => ['no_image', 'no_match', 'intent_failed', 'search_stopped'].includes(shot.status))}
-                  title="使用腾讯云联网图像搜索重新搜索失败分镜"
-                  onClick={() => retryFailedShots('tencent')}
-                >
-                  <Search size={18} /> 重新搜索失败分镜
-                </button>
               </div>
               <small>优先保存已选图片；未选择时保存该镜头第一张，重复图片自动跳过。</small>
             </div>
-            <SearchProgress progress={searchProgress} project={project} onStop={stopImageSearch} />
+            <StoryboardProgress progress={generationProgress} project={project} />
             <div className="shot-list">
               {shots.map((shot) => (
                 <ShotCard
@@ -2207,9 +2285,7 @@ function App() {
                   shot={shot}
                   assets={generatedAssetsByShot.get(shot.id) || []}
                   selectedAssetId={shot.selected_asset_id}
-                  searchProgress={searchProgress}
                   project={project}
-                  diagnostics={diagnosticsByShot.get(shot.id) || []}
                   onSelect={(assetId, assetSource) => selectAsset(shot.id, assetId, assetSource)}
                   onPreview={setPreviewAsset}
                   imagePrompt={imagePromptEditors[shot.id]}
@@ -2218,15 +2294,12 @@ function App() {
                   onImagePromptChange={(prompt) => updateImagePrompt(shot.id, prompt)}
                   onCancelImagePrompt={() => closeImagePromptEditor(shot.id)}
                   onGenerate={(prompt) => generateImage(shot.id, prompt)}
-                  onRetry={() => retryImageSearch(shot.id, 'so')}
-                  onTencentRetry={() => retryImageSearch(shot.id, 'tencent')}
-                  onReanalyzeImage={() => reanalyzeShotImage(shot.id)}
+                  onReanalyzeImage={() => regenerateShotImagePrompt(shot.id)}
                   isRecognizingImage={recognizingShotIds.has(shot.id)}
                   onUpdateVoiceText={(text) => updateShotVoiceText(shot.id, text)}
                   processingImage={processingImage}
                   grayscaleProcessingIds={grayscaleProcessingIds}
                   generatingShotIds={generatingShotIds}
-                  onCrop={(assetId) => processGeneratedImage(assetId, 'crop-square')}
                   onRemoveWatermark={(assetId) => processGeneratedImage(assetId, 'remove-watermark')}
                   onGrayscale={(assetId) => processGeneratedImage(assetId, 'grayscale')}
                   onManualUpload={(file) => uploadManualShotImage(shot.id, file)}
@@ -2303,9 +2376,7 @@ function App() {
                     shot={shot}
                     assets={generatedAssetsByShot.get(shot.id) || []}
                     selectedAssetId={shot.selected_asset_id}
-                    searchProgress={searchProgress}
                     project={project}
-                    diagnostics={diagnosticsByShot.get(shot.id) || []}
                     onSelect={(assetId, assetSource) => selectAsset(shot.id, assetId, assetSource)}
                     onPreview={setPreviewAsset}
                     imagePrompt={imagePromptEditors[shot.id]}
@@ -2314,15 +2385,12 @@ function App() {
                     onImagePromptChange={(prompt) => updateImagePrompt(shot.id, prompt)}
                     onCancelImagePrompt={() => closeImagePromptEditor(shot.id)}
                     onGenerate={(prompt) => generateImage(shot.id, prompt)}
-                    onRetry={() => retryImageSearch(shot.id, 'so')}
-                    onTencentRetry={() => retryImageSearch(shot.id, 'tencent')}
-                    onReanalyzeImage={() => reanalyzeShotImage(shot.id)}
+                    onReanalyzeImage={() => regenerateShotImagePrompt(shot.id)}
                     isRecognizingImage={recognizingShotIds.has(shot.id)}
                     onUpdateVoiceText={(text) => updateShotVoiceText(shot.id, text)}
                     processingImage={processingImage}
                     grayscaleProcessingIds={grayscaleProcessingIds}
                     generatingShotIds={generatingShotIds}
-                    onCrop={(assetId) => processGeneratedImage(assetId, 'crop-square')}
                     onRemoveWatermark={(assetId) => processGeneratedImage(assetId, 'remove-watermark')}
                     onGrayscale={(assetId) => processGeneratedImage(assetId, 'grayscale')}
                     onManualUpload={(file) => uploadManualShotImage(shot.id, file)}
@@ -2331,7 +2399,7 @@ function App() {
                   <select value={shot.selected_asset_id || ''} onChange={(e) => {
                     const options = selectableAssets.filter((item) => !item.shot_id || item.shot_id === shot.id);
                     const selected = options.find((asset) => asset.id === e.target.value);
-                    selectAsset(shot.id, e.target.value, selected?.asset_source || 'web_search');
+                    selectAsset(shot.id, e.target.value, selected?.asset_source || 'ai_generated');
                   }}>
                     <option value="">手动选择素材</option>
                     {selectableAssets.filter((item) => !item.shot_id || item.shot_id === shot.id).map((asset) => <option key={asset.id} value={asset.id}>{asset.file_name}</option>)}
@@ -2348,7 +2416,7 @@ function App() {
               {/* Step 1: Title Generation */}
               <div>
                 <h2>标题封面与配乐</h2>
-                <p>生成两行标题和视频封面，并从音乐库选择背景音乐。配乐设置会在 MP4 和剪映草稿导出时自动应用。</p>
+                <p>生成两行标题和视频封面，并从音乐库选择背景音乐。配乐设置会在剪映草稿导出时自动应用。</p>
               </div>
 
               <div className="title-section">
@@ -2432,7 +2500,7 @@ function App() {
               {/* Step 2: Cover Generation (only after title is confirmed) */}
               <div className="cover-section">
                 <h3>第二步 · 生成封面</h3>
-                <p className="cover-layout-note">上传人物图片后，系统会将图片居中裁剪为 1:1 并添加圆角。图片顶部会预留安全间距，图片和两行标题会完整排在平台居中裁切的 3:4 区域内。</p>
+                <p className="cover-layout-note">封面保持完整的 9:16 竖屏画面，不做裁剪；标题使用龚帆怒放体。上传图片后，可在右侧分别拖动两行标题，拖动选框右下角可调整大小。</p>
                 <input
                   ref={coverInputRef}
                   className="hidden-input"
@@ -2451,8 +2519,8 @@ function App() {
                 <div className="actions">
                   <button
                     className="primary"
-                    disabled={busy || !titleLine1.trim() || !titleLine2.trim() || !coverImage}
-                    onClick={generateCover}
+                    disabled={busy || !titleLine1.trim() || !titleLine2.trim() || (!coverImage && !project.cover_source_url)}
+                    onClick={() => generateCover()}
                   >
                     <ImagePlus size={18} /> {project.cover_url ? '重新合成封面' : '生成 9:16 封面'}
                   </button>
@@ -2488,7 +2556,7 @@ function App() {
                   <button type="button" className="primary" disabled={busy} onClick={saveVoiceVolume}>
                     <Save size={18} /> 保存配音音量
                   </button>
-                  <small>播放后拖动滑块可实时试听 0%–200% 的音量变化；MP4 和剪映草稿会使用相同增益。</small>
+                  <small>播放后拖动滑块可实时试听 0%–200% 的音量变化；剪映草稿会使用相同增益。</small>
                 </div>
               )}
 
@@ -2602,25 +2670,21 @@ function App() {
               {project.cover_model && <small>封面处理：{project.cover_model}</small>}
             </div>
             <div className="cover-preview">
-              {project.cover_url ? (
+              {coverImagePreviewUrl ? (
                 <>
-                  <button
-                    type="button"
-                    className="cover-image-button"
-                    onClick={() => setPreviewAsset({
-                      file_url: project.cover_url,
-                      updated_at: project.cover_updated_at,
-                      file_name: '视频封面',
-                    })}
-                  >
-                    <img
-                      src={`${API}${project.cover_url}?v=${encodeURIComponent(project.cover_updated_at || '')}`}
-                      alt="视频封面"
-                    />
-                  </button>
-                  <button type="button" className="cover-download-button" onClick={downloadCover}>
-                    <Download size={18} /> 下载封面
-                  </button>
+                  <CoverTitleEditor
+                    imageUrl={coverImagePreviewUrl}
+                    line1={titleLine1}
+                    line2={titleLine2}
+                    positions={coverTitlePositions}
+                    onChange={updateCoverTitlePosition}
+                  />
+                  <small className="cover-editor-hint">拖动标题框调整位置，拖动右下角圆点调整字号</small>
+                  {project.cover_url && (
+                    <button type="button" className="cover-download-button" disabled={busy} onClick={downloadCover}>
+                      <Download size={18} /> 应用调整并下载封面
+                    </button>
+                  )}
                 </>
               ) : (
                 <div className="cover-placeholder">
@@ -2636,7 +2700,7 @@ function App() {
         {tab === 'export' && (
           <section className="band result">
             <h2>结果导出</h2>
-            <p>一次导出会同时生成 9:16 完整 MP4、按镜头编号的方形 PNG、配音字幕素材包和剪映草稿。方图居中显示，短字幕位于图片下方留白区。</p>
+            <p>导出内容包括按镜头编号的图片、配音字幕素材包和剪映草稿。</p>
             {project.audio_url && (
               <div className="export-voice-preview">
                 <audio
@@ -2660,8 +2724,7 @@ function App() {
               <button onClick={generateVoiceAndSubtitles}><Mic size={18} /> 重新生成配音字幕</button>
               <button onClick={() => setTab('cover')}><Music size={18} /> 标题封面与配乐</button>
               <button onClick={openExportFolder}><FolderOpen size={18} /> 打开导出文件夹</button>
-              <button className="primary" onClick={() => exportPackage('mp4')}><Film size={18} /> 导出 MP4</button>
-              <button className="primary" onClick={() => exportPackage('draft')}><Archive size={18} /> 导出剪映草稿</button>
+              <button className="primary" onClick={exportPackage}><Archive size={18} /> 导出剪映草稿</button>
             </div>
             <div className="publish-assistant">
               <div className="publish-assistant-head">
@@ -2696,7 +2759,7 @@ function App() {
             {exportResult && (
               <div className="export-result-card">
                 <div>
-                  <strong>{exportResult.output === 'mp4' ? 'MP4 导出完成' : '剪映草稿导出完成'}</strong>
+                  <strong>剪映草稿导出完成</strong>
                   {exportResult.zip_file_name && <span>{exportResult.zip_file_name}</span>}
                   <small>保存位置：{exportResult.export_folder}</small>
                   {exportResult.verification?.jianying?.draft_path && (
@@ -2704,11 +2767,6 @@ function App() {
                   )}
                 </div>
                 <div className="export-result-actions">
-                  {exportResult.video_url && (
-                    <button onClick={() => window.open(`${API}${exportResult.video_url}`, '_blank')}>
-                      <Film size={18} /> 播放或下载 MP4
-                    </button>
-                  )}
                   {exportResult.download_url && (
                     <button onClick={() => window.open(`${API}${exportResult.download_url}`, '_blank')}>
                       <Download size={18} /> 下载草稿 ZIP
@@ -2741,8 +2799,6 @@ function App() {
       {previewAsset && (
         <ImagePreview
           asset={previewAsset}
-          busy={Boolean(processingImage)}
-          onApplyCrop={saveGeneratedImageDisplayRegion}
           onClose={() => setPreviewAsset(null)}
         />
       )}
@@ -2877,7 +2933,7 @@ function AssetCard({ asset, selected, onSelect, onPreview, onEdit, onDelete, ima
         onClick={openPreview}
         onKeyDown={openPreview}
       >
-        {asset.file_type === 'image' ? <CropAwareAssetImage asset={asset} src={src} alt={asset.file_name} /> : (
+        {asset.file_type === 'image' ? <SafeImage src={src} alt={asset.file_name} /> : (
           asset.file_url
             ? <video src={src} poster={asset.thumbnail_url ? `${API}${asset.thumbnail_url}` : undefined} controls preload="metadata" />
             : <div className="video-processing-placeholder"><Film size={32} />{asset.processing_stage === 'failed' ? '处理失败' : '原视频已转为片段'}</div>
@@ -2901,24 +2957,6 @@ function AssetCard({ asset, selected, onSelect, onPreview, onEdit, onDelete, ima
         </div>
       )}
     </article>
-  );
-}
-
-function CropAwareAssetImage({ asset, src, alt }) {
-  const [naturalSize, setNaturalSize] = useState(null);
-  useEffect(() => {
-    setNaturalSize(null);
-  }, [src]);
-  return (
-    <SafeImage
-      src={src}
-      alt={alt}
-      style={assetCropDisplayStyle(asset, naturalSize)}
-      onLoad={(event) => setNaturalSize({
-        width: event.currentTarget.naturalWidth,
-        height: event.currentTarget.naturalHeight,
-      })}
-    />
   );
 }
 
@@ -2961,215 +2999,53 @@ function SpeechRateSelect({ value, onChange }) {
   );
 }
 
-function diagnosticSummary(diagnostics) {
-  const recent = (diagnostics || []).slice(0, 40);
-  if (!recent.length) return '';
-  const keywordRows = recent.filter((item) => item.type === 'keyword');
-  const sourceRows = recent.filter((item) => item.type === 'source');
-  const returned = sourceRows.reduce((sum, item) => sum + Number(item.returned || 0), 0);
-  const attempts = keywordRows.reduce((sum, item) => sum + Number(item.attempted_downloads || 0), 0);
-  const downloaded = keywordRows.reduce((sum, item) => sum + Number(item.downloaded || 0), 0);
-  const rejected = {};
-  keywordRows.forEach((row) => {
-    Object.entries(row.rejected || {}).forEach(([reason, count]) => {
-      rejected[reason] = (rejected[reason] || 0) + Number(count || 0);
-    });
-  });
-  const rejectText = Object.entries(rejected)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 2)
-    .map(([reason, count]) => `${reason}${count}`)
-    .join(' / ');
-  return `诊断：渠道返回 ${returned}，尝试下载 ${attempts}，成功 ${downloaded}${rejectText ? `，过滤 ${rejectText}` : ''}`;
-}
-
-function formatElapsed(seconds) {
-  const value = Math.max(0, Number(seconds) || 0);
-  const minutes = Math.floor(value / 60);
-  const rest = value % 60;
-  return minutes ? `${minutes}分${String(rest).padStart(2, '0')}秒` : `${rest}秒`;
-}
-
-function SearchProgress({ progress, project, onStop }) {
-  const [tick, setTick] = useState(0);
-  const stage = project?.search_stage || '';
-  const searching = project?.status === 'searching_images';
-  const stopping = searching && stage === 'stopping';
-  const stopped = project?.status === 'search_stopped';
-  const analyzingIntent = project?.status === 'searching_images' && stage === 'analyzing_intent';
-  const generatingAiImages = searching && stage === 'generating_ai_images';
+function StoryboardProgress({ progress, project }) {
+  const generating = ['generating_shots', 'generating_images'].includes(project?.status);
   const promptOnly = project?.material_source_strategy === 'prompt_only';
-  const startedAt = project?.intent_analysis_started_at ? new Date(project.intent_analysis_started_at).getTime() : 0;
-  const elapsed = startedAt ? Math.floor((Date.now() - startedAt) / 1000) : 0;
-  const keywordEstimate = project?.intent_keyword_estimate || (progress.total ? `${progress.total}` : '');
-  const batchInfo = project?.intent_batches_total
-    ? `批次 ${project.intent_batches_completed || 0}/${project.intent_batches_total}`
-    : `预计 ${keywordEstimate} 个关键词`;
-  const statusText = analyzingIntent
-    ? `${project?.current_search_keyword || `正在分析 ${progress.total || project?.search_total || '-'} 个分镜关键词`} · ${batchInfo} · 已运行 ${formatElapsed(elapsed)}`
-    : `正在处理镜头 ${project?.current_shot_index || '-'} ${project?.current_search_keyword ? `· ${project.current_search_keyword}` : ''}`;
-  const simpleProgressText = progress.total
-    ? `已完成 ${progress.completed}/${progress.total} · ${stage === 'downloading' ? '正在下载候选图' : analyzingIntent ? '正在生成关键词' : '处理中'}`
-    : '';
-  const helperText = analyzingIntent
-    ? 'GLM 正在按 10 个镜头一批生成关键词；每批完成后会立即保存，全部完成后自动进入逐镜头搜图。'
-    : '';
   const label = progress.total
     ? `${progress.completed} / ${progress.total} 个分镜${promptOnly ? '提示词' : '图片'}完成`
     : '等待生成分镜';
-
-  useEffect(() => {
-    if (!analyzingIntent) return undefined;
-    const timer = window.setInterval(() => setTick((value) => value + 1), 1000);
-    return () => window.clearInterval(timer);
-  }, [analyzingIntent]);
 
   return (
     <div className="progress-panel">
       <div className="progress-row">
         <strong>
           分镜{promptOnly ? '提示词' : '图片'}进度
-          <span className={project?.image_search_provider === 'tencent' && !generatingAiImages ? 'provider-badge tencent' : 'provider-badge'}>
-            {generatingAiImages ? 'AI 生成' : project?.image_search_provider === 'tencent' ? '腾讯云联网搜图' : '360 图片'}
-          </span>
+          <span className="provider-badge">{promptOnly ? 'AI 提示词' : 'Seedream AI 出图'}</span>
         </strong>
         <div className="progress-actions">
           <span>{label}</span>
           <span className="progress-count success">成功 {progress.success}</span>
           <span className="progress-count failed">失败 {progress.failed}</span>
-          {searching && !generatingAiImages && (
-            <button type="button" className="danger compact-button" disabled={stopping} onClick={onStop}>
-              <RefreshCw size={16} /> {stopping ? '停止中' : '停止搜索'}
-            </button>
-          )}
         </div>
       </div>
       <div className="progress-track">
         <div
           className={[
             'progress-fill',
-            searching ? 'active' : '',
-            analyzingIntent ? 'indeterminate' : '',
-            stopped ? 'stopped' : '',
+            generating ? 'active' : '',
           ].filter(Boolean).join(' ')}
-          style={{ width: `${analyzingIntent ? 18 + (tick % 5) * 3 : progress.percent}%` }}
+          style={{ width: `${progress.percent}%` }}
         />
       </div>
-      {project?.status === 'searching_images' && (
+      {generating && (
         <div className="progress-detail">
-          <small>{statusText}</small>
-          {simpleProgressText && <small>{simpleProgressText}</small>}
-          {helperText && <small>{helperText}</small>}
+          <small>{project?.current_generation_message || '正在生成分镜内容...'}</small>
+          {progress.total > 0 && <small>已完成 {progress.completed}/{progress.total}</small>}
         </div>
       )}
-      {project?.status === 'search_failed' && (
+      {project?.status === 'shot_generation_failed' && (
         <div className="progress-detail error">
-          <small>{project.current_search_keyword || '关键词分析失败'}</small>
-          <small>{project.search_error || 'GLM 没有返回有效结果，请稍后重试。'}</small>
-        </div>
-      )}
-      {project?.status === 'search_stopped' && (
-        <div className="progress-detail">
-          <small>图片搜索已停止</small>
-          <small>已完成的候选图会保留，未处理镜头可稍后重新搜索。</small>
+          <small>{project.generation_error || '分镜生成失败，请稍后重试。'}</small>
         </div>
       )}
     </div>
   );
 }
 
-function ImagePreview({ asset, busy = false, onApplyCrop, onClose }) {
+function ImagePreview({ asset, onClose }) {
   const src = assetImageUrl(asset);
   const canDownloadPng = Boolean(asset.project_id && asset.id && asset.file_type !== 'video');
-  const canCrop = canDownloadPng && typeof onApplyCrop === 'function';
-  const imageRef = useRef(null);
-  const dragRef = useRef(null);
-  const [imageBox, setImageBox] = useState(null);
-  const [naturalSize, setNaturalSize] = useState(null);
-  const [cropBox, setCropBox] = useState(null);
-
-  function readImageBox() {
-    const image = imageRef.current;
-    if (!image) return null;
-    const rect = image.getBoundingClientRect();
-    if (!rect.width || !rect.height) return null;
-    const nextImageBox = { width: rect.width, height: rect.height };
-    setImageBox(nextImageBox);
-    return nextImageBox;
-  }
-
-  function resetCropBox(nextImageBox = imageBox, fillsImage = false) {
-    if (!nextImageBox) return;
-    const side = Math.min(nextImageBox.width, nextImageBox.height);
-    setCropBox({
-      x: Math.round((nextImageBox.width - side) / 2),
-      y: Math.round((nextImageBox.height - side) / 2),
-      size: Math.round(side),
-      fillsImage,
-    });
-  }
-
-  function onImageLoad(event) {
-    const image = event.currentTarget;
-    const nextImageBox = readImageBox();
-    setNaturalSize({ width: image.naturalWidth, height: image.naturalHeight });
-    const crop = normalizedAssetCropRegion(asset, {
-      width: image.naturalWidth,
-      height: image.naturalHeight,
-    });
-    if (crop && nextImageBox) {
-      const scaleX = nextImageBox.width / crop.imageWidth;
-      const scaleY = nextImageBox.height / crop.imageHeight;
-      const displaySize = Math.min(crop.size * Math.min(scaleX, scaleY), nextImageBox.width, nextImageBox.height);
-      setCropBox({
-        x: Math.max(0, Math.min(crop.x * scaleX, nextImageBox.width - displaySize)),
-        y: Math.max(0, Math.min(crop.y * scaleY, nextImageBox.height - displaySize)),
-        size: displaySize,
-        fillsImage: image.naturalWidth === image.naturalHeight
-          && crop.x === 0
-          && crop.y === 0
-          && Math.abs(crop.size - image.naturalWidth) < 0.5,
-      });
-    } else {
-      resetCropBox(nextImageBox, image.naturalWidth === image.naturalHeight);
-    }
-  }
-
-  function moveCrop(clientX, clientY) {
-    const drag = dragRef.current;
-    if (!drag || !imageBox || !cropBox) return;
-    const nextX = Math.max(0, Math.min(drag.startCropX + clientX - drag.startClientX, imageBox.width - cropBox.size));
-    const nextY = Math.max(0, Math.min(drag.startCropY + clientY - drag.startClientY, imageBox.height - cropBox.size));
-    setCropBox((current) => current ? { ...current, x: nextX, y: nextY } : current);
-  }
-
-  function startDrag(event) {
-    if (!cropBox) return;
-    event.preventDefault();
-    event.currentTarget.setPointerCapture?.(event.pointerId);
-    dragRef.current = {
-      startClientX: event.clientX,
-      startClientY: event.clientY,
-      startCropX: cropBox.x,
-      startCropY: cropBox.y,
-    };
-  }
-
-  function finishDrag(event) {
-    event.currentTarget.releasePointerCapture?.(event.pointerId);
-    dragRef.current = null;
-  }
-
-  function applyCrop() {
-    if (busy || !canCrop || !cropBox || !imageBox || !naturalSize) return;
-    const scaleX = naturalSize.width / imageBox.width;
-    const scaleY = naturalSize.height / imageBox.height;
-    onApplyCrop(asset, {
-      x: cropBox.x * scaleX,
-      y: cropBox.y * scaleY,
-      size: cropBox.size * Math.min(scaleX, scaleY),
-    });
-  }
   function downloadPng() {
     const link = document.createElement('a');
     link.href = `${API}/api/projects/${asset.project_id}/generated-assets/${asset.id}/download-png`;
@@ -3184,22 +3060,6 @@ function ImagePreview({ asset, busy = false, onApplyCrop, onClose }) {
         <div className="image-preview-head">
           <strong>{asset.file_name || '图片预览'}</strong>
           <div className="image-preview-actions">
-            {canCrop && (
-              <button
-                type="button"
-                onClick={() => resetCropBox(
-                  readImageBox(),
-                  naturalSize?.width === naturalSize?.height,
-                )}
-              >
-                <Crop size={17} /> 重置裁剪框
-              </button>
-            )}
-            {canCrop && (
-              <button type="button" className="primary" onClick={applyCrop}>
-                <Crop size={17} /> {busy ? '保存中' : '应用显示区域'}
-              </button>
-            )}
             {canDownloadPng && (
               <button type="button" onClick={downloadPng}>
                 <Download size={17} /> 下载 PNG
@@ -3208,52 +3068,8 @@ function ImagePreview({ asset, busy = false, onApplyCrop, onClose }) {
             <button type="button" onClick={onClose}>关闭</button>
           </div>
         </div>
-        <div className="crop-preview-stage">
-          <img ref={imageRef} src={src} alt={asset.file_name || 'preview'} onLoad={onImageLoad} />
-          {canCrop && imageBox && cropBox && (
-            <div
-              className="crop-box"
-              role="slider"
-              aria-label="拖拽选择方形裁剪区域"
-              tabIndex={0}
-              style={cropBox.fillsImage ? {
-                inset: 0,
-                width: '100%',
-                height: '100%',
-              } : {
-                left: `${cropBox.x}px`,
-                top: `${cropBox.y}px`,
-                width: `${cropBox.size}px`,
-                height: `${cropBox.size}px`,
-              }}
-              onPointerDown={startDrag}
-              onPointerMove={(event) => moveCrop(event.clientX, event.clientY)}
-              onPointerUp={finishDrag}
-              onPointerCancel={finishDrag}
-              onKeyDown={(event) => {
-                if (!imageBox || !cropBox) return;
-                const step = event.shiftKey ? 20 : 5;
-                const delta = {
-                  ArrowLeft: [-step, 0],
-                  ArrowRight: [step, 0],
-                  ArrowUp: [0, -step],
-                  ArrowDown: [0, step],
-                }[event.key];
-                if (!delta) return;
-                event.preventDefault();
-                setCropBox((current) => {
-                  if (!current) return current;
-                  return {
-                    ...current,
-                    x: Math.max(0, Math.min(current.x + delta[0], imageBox.width - current.size)),
-                    y: Math.max(0, Math.min(current.y + delta[1], imageBox.height - current.size)),
-                  };
-                });
-              }}
-            >
-              <span />
-            </div>
-          )}
+        <div className="image-preview-stage">
+          <img src={src} alt={asset.file_name || 'preview'} />
         </div>
         {(asset.source_page || asset.remote_url) && (
           <a href={asset.source_page || asset.remote_url} target="_blank" rel="noreferrer">查看来源</a>
@@ -3267,7 +3083,7 @@ function TagFields({ form, update }) {
   return (
     <>
       <div className="grid">
-        <label>主体标签<input value={form.object} onChange={(e) => update('object', e.target.value)} placeholder="钱学森，火车，纪念碑" /></label>
+        <label>主体标签<input value={form.object} onChange={(e) => update('object', e.target.value)} placeholder="武将，战马，城门" /></label>
         <label>场景标签<input value={form.scene} onChange={(e) => update('scene', e.target.value)} placeholder="实验室，会议室，戈壁滩" /></label>
         <label>关键词<input value={form.keywords} onChange={(e) => update('keywords', e.target.value)} placeholder="归国科学家，留学回国" /></label>
       </div>
@@ -3432,9 +3248,7 @@ function ShotCard({
   shot,
   assets = [],
   selectedAssetId,
-  searchProgress,
   project,
-  diagnostics = [],
   onSelect,
   onPreview,
   imagePrompt,
@@ -3443,15 +3257,12 @@ function ShotCard({
   onImagePromptChange,
   onCancelImagePrompt,
   onGenerate,
-  onRetry,
-  onTencentRetry,
   onReanalyzeImage,
   isRecognizingImage,
   onUpdateVoiceText,
   processingImage,
   grayscaleProcessingIds,
   generatingShotIds,
-  onCrop,
   onRemoveWatermark,
   onGrayscale,
   onManualUpload,
@@ -3468,19 +3279,7 @@ function ShotCard({
     .sort((a, b) => (b.id === selectedAssetId ? 1 : 0) - (a.id === selectedAssetId ? 1 : 0))
     .slice(0, 2);
   const placeholders = Math.max(0, 2 - visibleAssets.length);
-  const canRetry = !['pending_search', 'analyzing_intent', 'searching'].includes(shot.status);
-  const isSearchingShot = shot.status === 'searching';
-  const isWaitingShot = ['pending_search', 'analyzing_intent'].includes(shot.status);
-  const progressText = searchProgress?.total
-    ? `${searchProgress.completed}/${searchProgress.total}`
-    : '';
-  const placeholderText = isSearchingShot ? '搜索中' : isWaitingShot ? '等待中' : '暂无图片';
-  const placeholderHint = isSearchingShot
-    ? `${progressText ? `进度 ${progressText}` : '正在拉取候选图'}${shot.current_search_keyword ? ` · ${shot.current_search_keyword}` : ''}`
-    : isWaitingShot
-      ? '等待关键词或前序镜头'
-      : '可重新搜索或生成占位图';
-  const diagnosticText = diagnosticSummary(diagnostics);
+  const canReanalyze = !isRecognizingImage && project?.status !== 'generating_shots';
   return (
     <article className={isRecognizingImage ? 'shot-card recognizing-image' : 'shot-card'}>
       <div className="shot-main">
@@ -3517,7 +3316,6 @@ function ShotCard({
         <p>主体标签：{((shot.material_intent?.objects?.length ? shot.material_intent.objects : shot.object_tags) || shot.required_object || []).join(' / ') || '—'}</p>
         <p>场景标签：{((shot.material_intent?.scenes?.length ? shot.material_intent.scenes : shot.scene_tags) || shot.required_scene || []).join(' / ') || '—'}</p>
         <p>关键词：{((shot.material_intent?.keywords?.length ? shot.material_intent.keywords : shot.keywords) || []).join(' / ') || '—'}</p>
-        <p>搜索关键词：{(shot.search_keywords || []).join(' / ') || shot.current_search_keyword || '—'}</p>
         {savedImagePrompt && (
           <div className="saved-image-prompt">
             <div>
@@ -3527,23 +3325,11 @@ function ShotCard({
             <p>{savedImagePrompt}</p>
           </div>
         )}
-        <button className="reanalyze-image-button" type="button" onClick={onReanalyzeImage} disabled={!canRetry || isRecognizingImage}>
-          <RefreshCw size={18} /> {isRecognizingImage ? '识别中…' : '重新识别图片'}
+        <button className="reanalyze-image-button" type="button" onClick={onReanalyzeImage} disabled={!canReanalyze}>
+          <RefreshCw size={18} /> {isRecognizingImage ? '生成中…' : '重新生成提示词'}
         </button>
-        {diagnosticText && <p className="shot-diagnostic">{diagnosticText}</p>}
       </div>
       <div className="shot-side">
-        <div className="shot-search-actions">
-          <button onClick={onRetry} disabled={!canRetry}><RefreshCw size={18} /> 重新搜索</button>
-          <button
-            className="tencent-storyboard"
-            title="使用腾讯云联网图像搜索重新搜索"
-            onClick={onTencentRetry}
-            disabled={!canRetry}
-          >
-            <Search size={18} /> 重新搜索
-          </button>
-        </div>
         <div className="shot-images">
           {imagePrompt !== undefined && !isGeneratingImage && (
             <div className="ai-prompt-editor">
@@ -3571,7 +3357,7 @@ function ShotCard({
             <div className="ai-generating-overlay">
               <Wand2 size={26} />
               <strong>AI 图片生成中</strong>
-              <small>Seedream 正在绘制 1:1 图片，请稍候</small>
+              <small>Seedream 正在绘制 9:16 竖屏图片，请稍候</small>
             </div>
           )}
           {visibleAssets.map((item) => (
@@ -3584,20 +3370,14 @@ function ShotCard({
                 role="button"
                 tabIndex={0}
                 onClick={(event) => {
-                  onSelect?.(item.id, item.asset_source || 'web_search');
-                  onPreview?.(assetWithVisibleCropRegion(
-                    item,
-                    event.currentTarget.querySelector('img'),
-                  ));
+                  onSelect?.(item.id, item.asset_source || 'ai_generated');
+                  onPreview?.(item);
                 }}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter' || event.key === ' ') {
                     event.preventDefault();
-                    onSelect?.(item.id, item.asset_source || 'web_search');
-                    onPreview?.(assetWithVisibleCropRegion(
-                      item,
-                      event.currentTarget.querySelector('img'),
-                    ));
+                    onSelect?.(item.id, item.asset_source || 'ai_generated');
+                    onPreview?.(item);
                   }
                 }}
                 title="选择并预览这张图"
@@ -3608,18 +3388,6 @@ function ShotCard({
                     <div className="image-tools">
                       {item.asset_source !== 'local' && (
                         <>
-                      <button
-                        type="button"
-                        title="居中裁剪为 1:1"
-                        aria-label="裁剪为 1:1"
-                        disabled={Boolean(processingImage) || grayscaleProcessingIds.has(item.id)}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          onCrop?.(item.id);
-                        }}
-                      >
-                        <Crop size={16} />
-                      </button>
                       <button
                         type="button"
                         title="一键转为黑白照片"
@@ -3646,23 +3414,6 @@ function ShotCard({
                       </button>
                         </>
                       )}
-                      <button
-                        type="button"
-                        className="baidu-image-button"
-                        title={`打开百度图片搜索：${(shot.search_keywords || [shot.current_search_keyword]).filter(Boolean)[0] || ''}`}
-                        aria-label="打开百度图片搜索"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          const keyword = (shot.search_keywords || [shot.current_search_keyword]).filter(Boolean)[0] || '';
-                          window.open(
-                            `https://image.baidu.com/search/index?tn=baiduimage&word=${encodeURIComponent(keyword)}`,
-                            '_blank',
-                            'noopener,noreferrer',
-                          );
-                        }}
-                      >
-                        <span className="baidu-mark">百</span>
-                      </button>
                     </div>
                   )}
                 />
@@ -3676,26 +3427,9 @@ function ShotCard({
             </div>
           ))}
           {Array.from({ length: placeholders }).map((_, index) => (
-            <div className={isSearchingShot ? 'search-placeholder active' : 'search-placeholder'} key={`placeholder-${index}`}>
-              <strong>{placeholderText}</strong>
-              <small>{placeholderHint}</small>
-              {!isSearchingShot && !isWaitingShot && (
-                <button
-                  type="button"
-                  className="placeholder-baidu-button"
-                  title="使用搜索关键词打开百度图片搜索"
-                  onClick={() => {
-                    const keyword = (shot.search_keywords || [shot.current_search_keyword]).filter(Boolean)[0] || '';
-                    window.open(
-                      `https://image.baidu.com/search/index?tn=baiduimage&word=${encodeURIComponent(keyword)}`,
-                      '_blank',
-                      'noopener,noreferrer',
-                    );
-                  }}
-                >
-                  <span className="baidu-mark">百</span> 百度搜图
-                </button>
-              )}
+            <div className="search-placeholder" key={`placeholder-${index}`}>
+              <strong>暂无 AI 图片</strong>
+              <small>可编辑提示词后调用 Seedream 生成</small>
             </div>
           ))}
         </div>
@@ -3705,10 +3439,10 @@ function ShotCard({
             onClick={onOpenImagePrompt}
             disabled={isGeneratingImage}
           >
-            <Wand2 size={18} /> {isGeneratingImage ? 'AI 生成中' : imagePrompt !== undefined ? '编辑提示词中' : 'AI 占位图'}
+            <Wand2 size={18} /> {isGeneratingImage ? 'AI 生成中' : imagePrompt !== undefined ? '编辑提示词中' : 'AI 出图'}
           </button>
           <button type="button" onClick={() => manualUploadRef.current?.click()}>
-            <ImagePlus size={18} /> 上传下载图片
+            <ImagePlus size={18} /> 手动上传图片
           </button>
           <button type="button" onClick={onLibraryUpload}>
             <Library size={18} /> 从素材库选择

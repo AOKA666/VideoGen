@@ -8,7 +8,7 @@ import shutil
 import zipfile
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException
 from PIL import Image, ImageOps
 
 from services.generation_service import (
@@ -21,9 +21,6 @@ from services.store import load_db, project_dir, public_url
 from services.video_export_service import (
     create_jianying_native_draft,
     jianying_drafts_root,
-    probe_media,
-    render_looped_background_music,
-    render_project_video,
 )
 
 router = APIRouter(prefix="/api/projects", tags=["export"])
@@ -67,10 +64,7 @@ def open_draft_folder(project_id: str):
 
 
 @router.post("/{project_id}/export/assets")
-def export_assets(
-    project_id: str,
-    output: str = Query("mp4", pattern="^(mp4|draft)$"),
-):
+def export_assets(project_id: str):
     db = load_db()
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
@@ -92,8 +86,6 @@ def export_assets(
             "voice_text",
             "duration_sec",
             "visual_need",
-            "person_gender",
-            "person_description",
             "required_object",
             "required_scene",
             "status",
@@ -191,61 +183,33 @@ def export_assets(
     music_start_sec = float(project.get("background_music_start_sec") or 0)
     music_volume = float(project.get("background_music_volume") or 0.2)
     voice_volume = max(0.0, min(float(project.get("voice_volume", 1.0)), 2.0))
-    prepared_music = None
-    music_report = None
     if source_music:
         music_copy = export_dir / f"background_music_source{source_music.suffix.lower()}"
         shutil.copy2(source_music, music_copy)
-        if output == "mp4":
-            prepared_music = export_dir / "background_music_loop.m4a"
-            music_report = render_looped_background_music(
-                music_copy,
-                prepared_music,
-                probe_media(copied_audio)["duration_sec"],
-                start_sec=music_start_sec,
-                volume=music_volume,
-                crossfade_sec=1.0,
-            )
 
     try:
-        if output == "mp4":
-            video_report = render_project_video(
-                shots,
-                scene_paths,
-                copied_audio,
-                export_dir / "subtitles.srt",
-                export_dir / "final_video.mp4",
-                title_line1=project.get("title_line1", ""),
-                title_line2=project.get("title_line2", ""),
-                background_music_path=prepared_music,
-                voice_volume=voice_volume,
-            )
-            draft_report = None
-        else:
-            video_report = None
-            draft_report = create_jianying_native_draft(
-                export_dir / "jianying_draft",
-                project["name"],
-                shots,
-                scene_paths,
-                copied_audio,
-                export_dir / "subtitles.srt",
-                cover_source if cover_source.exists() else None,
-                title_line1=project.get("title_line1", ""),
-                title_line2=project.get("title_line2", ""),
-                background_music_path=source_music,
-                background_music_start_sec=music_start_sec,
-                background_music_volume=music_volume,
-                music_crossfade_sec=1.0,
-                voice_volume=voice_volume,
-            )
+        draft_report = create_jianying_native_draft(
+            export_dir / "jianying_draft",
+            project["name"],
+            shots,
+            scene_paths,
+            copied_audio,
+            export_dir / "subtitles.srt",
+            cover_source if cover_source.exists() else None,
+            title_line1=project.get("title_line1", ""),
+            title_line2=project.get("title_line2", ""),
+            background_music_path=source_music,
+            background_music_start_sec=music_start_sec,
+            background_music_volume=music_volume,
+            music_crossfade_sec=1.0,
+            voice_volume=voice_volume,
+        )
     except Exception as exc:
         raise HTTPException(500, f"Failed to generate export deliverables: {exc}") from exc
     verification = {
-        "output": output,
-        "mp4": video_report,
+        "output": "draft",
         "jianying": draft_report,
-        "background_music": music_report or ({
+        "background_music": ({
             "source": source_music.name,
             "source_start_sec": music_start_sec,
             "volume": music_volume,
@@ -257,24 +221,15 @@ def export_assets(
         json.dumps(verification, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    download_url = None
-    zip_file_name = None
-    video_url = None
-    if output == "draft":
-        zip_path = base / "exports" / f"{safe_filename(project['name'])}_jianying_draft.zip"
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for path in export_dir.rglob("*"):
-                if path.is_file():
-                    zf.write(path, path.relative_to(export_dir))
-        download_url = public_url(zip_path)
-        zip_file_name = zip_path.name
-    else:
-        video_url = public_url(export_dir / "final_video.mp4")
+    zip_path = base / "exports" / f"{safe_filename(project['name'])}_jianying_draft.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in export_dir.rglob("*"):
+            if path.is_file():
+                zf.write(path, path.relative_to(export_dir))
     return {
-        "output": output,
-        "download_url": download_url,
-        "video_url": video_url,
-        "zip_file_name": zip_file_name,
+        "output": "draft",
+        "download_url": public_url(zip_path),
+        "zip_file_name": zip_path.name,
         "export_folder": str((base / "exports").resolve()),
         "verification": verification,
     }

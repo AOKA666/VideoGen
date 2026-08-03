@@ -83,7 +83,7 @@ class ShotAiConcurrencyTests(unittest.TestCase):
         self.assertTrue(all(shot["status"] == "ai_generated" for shot in state["shots"]))
         project = state["projects"][0]
         self.assertEqual("shots_ready", project["status"])
-        self.assertEqual(4, project["search_completed"])
+        self.assertEqual(4, project["generation_completed"])
 
 
 if __name__ == "__main__":

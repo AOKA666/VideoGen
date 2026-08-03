@@ -11,32 +11,15 @@ API_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(API_ROOT))
 
 from services.text_service import (  # noqa: E402
-    BOOK_SCRIPT_STORY_SEEDS,
-    FAMILIAR_DEFAULT_AI_SCRIPT_PEOPLE,
-    GUOZHIJILIANG_PEOPLE,
-    GUOZHIJILIANG_STORY_SEEDS,
-    MIN_GUOZHIJILIANG_SCRIPT_CHARS,
-    MIN_GUOZHIJILIANG_SCRIPT_PARAGRAPHS,
     MIN_REWRITE_DIFFERENCE,
     REWRITE_COMPRESSION_WARNING_RATIO,
-    RECENT_GUOZHIJILIANG_OPENINGS,
-    RECENT_GUOZHIJILIANG_PEOPLE,
-    RECENT_BOOK_SCRIPT_PEOPLE,
-    SENSITIVE_AI_SCRIPT_PEOPLE,
     RewriteGenerationError,
     apply_rewrite_fact_coverage_quality,
-    build_book_script_prompt,
-    build_guozhijiliang_script_prompt_v2,
-    build_original_script_method_prompt,
     build_rewrite_analysis_prompt,
     build_rewrite_prompt,
-    choose_book_script_seed,
-    choose_guozhijiliang_seed,
-    clean_shot_visual_terms,
     compare_scripts,
     cover_title_rejection_reasons,
     cover_title_needs_rewrite,
-    discover_book_script_seed,
     ensure_original_opening,
     ensure_rewrite_book_promotion,
     extract_leading_title,
@@ -45,11 +28,8 @@ from services.text_service import (  # noqa: E402
     extract_opening_hook,
     fallback_rewrite_fact_brief,
     generate_publish_assistant,
-    generate_guozhijiliang_script,
     generate_viral_title,
     generate_shots,
-    guozhijiliang_opening_needs_rewrite,
-    guozhijiliang_script_stats,
     keywords_from_text,
     normalize_auto_title,
     normalize_rewrite_fact_brief,
@@ -58,10 +38,9 @@ from services.text_service import (  # noqa: E402
     parse_title_candidates,
     request_minimax_rewrite_fact_coverage,
     request_minimax_rewrite_analysis,
-    request_online_person_selection,
     rewrite_script,
     rewrite_script_with_minimax,
-    search_person_sources,
+    split_script_into_storyboards,
 )
 
 
@@ -200,15 +179,15 @@ class ShotTagGenerationTests(unittest.TestCase):
             return_value=FakeResponse(),
         ) as urlopen:
             brief = request_minimax_rewrite_analysis(
-                "钱学森回到祖国。此后，他继续推进科研工作。",
+                "曹操，率军北上。此后，他继续推进部署。",
                 "test-key",
             )
 
         self.assertEqual(2, urlopen.call_count)
         self.assertTrue(brief["material_cards"])
-        self.assertEqual(["钱学森"], brief["protagonists"])
+        self.assertEqual(["曹操"], brief["protagonists"])
         self.assertFalse(brief["timeline_verified"])
-        self.assertNotIn("钱学森回到祖国。", brief["material_cards"][0]["fact"])
+        self.assertNotIn("曹操，率军北上。", brief["material_cards"][0]["fact"])
         self.assertIn("系统已按原文段落生成保底资料卡继续二创", brief["analysis_warning"])
 
     def test_fallback_cards_do_not_mark_every_background_chunk_as_must(self) -> None:
@@ -694,320 +673,6 @@ class ShotTagGenerationTests(unittest.TestCase):
         self.assertEqual(1, result.count("第一段固定开头。"))
         self.assertEqual(1, result.count("第二段继续制造悬念。"))
         self.assertEqual(1, result.count("第三段揭示核心人物。"))
-
-    def test_guozhijiliang_seed_pool_covers_book_people(self) -> None:
-        seed_people = {person for person, _ in GUOZHIJILIANG_STORY_SEEDS}
-
-        self.assertEqual(40, len(GUOZHIJILIANG_PEOPLE))
-        self.assertTrue(set(GUOZHIJILIANG_PEOPLE).issubset(seed_people))
-
-    def test_guozhijiliang_random_seed_avoids_recent_repeats(self) -> None:
-        RECENT_GUOZHIJILIANG_PEOPLE.clear()
-        selected = [choose_guozhijiliang_seed()[0] for _ in range(13)]
-        RECENT_GUOZHIJILIANG_PEOPLE.clear()
-
-        self.assertEqual(len(selected), len(set(selected)))
-        self.assertFalse(set(selected) & FAMILIAR_DEFAULT_AI_SCRIPT_PEOPLE["国之脊梁"])
-
-    def test_ai_script_defaults_to_underknown_people_for_each_book(self) -> None:
-        RECENT_GUOZHIJILIANG_PEOPLE.clear()
-        for recent in RECENT_BOOK_SCRIPT_PEOPLE.values():
-            recent.clear()
-
-        for book_title in ("女性人物传记", "历史深处的民国"):
-            underknown_count = (
-                len(BOOK_SCRIPT_STORY_SEEDS[book_title])
-                - len(FAMILIAR_DEFAULT_AI_SCRIPT_PEOPLE[book_title])
-            )
-            selected = [
-                choose_book_script_seed(book_title)[0]
-                for _ in range(underknown_count)
-            ]
-            self.assertEqual(underknown_count, len(set(selected)))
-            self.assertFalse(set(selected) & FAMILIAR_DEFAULT_AI_SCRIPT_PEOPLE[book_title])
-
-        RECENT_GUOZHIJILIANG_PEOPLE.clear()
-        for recent in RECENT_BOOK_SCRIPT_PEOPLE.values():
-            recent.clear()
-
-    def test_ai_script_person_search_uses_live_web_results(self) -> None:
-        search_page = """
-        <ul><li class="res-list">
-          <h3 class="res-title"><a href="/link" data-mdurl="https://example.edu.cn/wang-yinglai">
-            被遗忘的生物化学家<em>王应睐</em>
-          </a></h3>
-          <span class="res-list-summary">王应睐组织人工合成牛胰岛素研究，长期推动中国生物化学发展。</span>
-        </li></ul>"""
-
-        class FakeResponse:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def read(self):
-                return search_page.encode("utf-8")
-
-        with patch(
-            "services.text_service.urllib.request.urlopen",
-            return_value=FakeResponse(),
-        ) as urlopen:
-            results = search_person_sources("国之脊梁")
-
-        self.assertEqual("被遗忘的生物化学家王应睐", results[0]["title"])
-        self.assertIn("so.com/s", urlopen.call_args.args[0].full_url)
-
-    def test_online_person_selection_must_be_supported_by_search_results(self) -> None:
-        search_results = [{
-            "title": "王应睐与中国生物化学",
-            "url": "https://example.edu.cn/wang-yinglai",
-            "summary": "王应睐组织人工合成牛胰岛素研究。",
-        }]
-
-        class FakeResponse:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def read(self):
-                return json.dumps({
-                    "choices": [{
-                        "message": {
-                            "content": json.dumps({
-                                "person": "王应睐",
-                                "event_angle": "组织人工合成牛胰岛素研究",
-                                "evidence_indices": [1],
-                            }, ensure_ascii=False)
-                        }
-                    }]
-                }, ensure_ascii=False).encode("utf-8")
-
-        with patch(
-            "services.text_service.urllib.request.urlopen",
-            return_value=FakeResponse(),
-        ):
-            selected = request_online_person_selection(
-                "国之脊梁",
-                search_results,
-                "test-key",
-                ["汪猷"],
-            )
-
-        self.assertEqual("王应睐", selected["person"])
-        self.assertEqual(
-            ["https://example.edu.cn/wang-yinglai"],
-            selected["source_urls"],
-        )
-
-    def test_ai_script_discovers_a_person_online_when_name_is_blank(self) -> None:
-        first_paragraph = "飞机出事前，他把装有关键资料的文件紧紧护在怀里。"
-        script = "\n".join(
-            [first_paragraph]
-            + [
-                f"这是第{index}段经过核实的人物经历，包含具体行动、现实处境、关键选择与实际结果，足以形成一个完整画面。"
-                for index in range(2, 24)
-            ]
-        )
-        response_body = {
-            "choices": [{
-                "message": {
-                    "content": json.dumps({
-                        "title": "无名之光",
-                        "person": "王应睐",
-                        "event_angle": "组织人工合成牛胰岛素研究",
-                        "script": script,
-                    }, ensure_ascii=False)
-                }
-            }]
-        }
-        captured_prompts = []
-
-        class FakeResponse:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def read(self):
-                return json.dumps(response_body, ensure_ascii=False).encode("utf-8")
-
-        def fake_urlopen(request, **_kwargs):
-            payload = json.loads(request.data.decode("utf-8"))
-            captured_prompts.append(payload["messages"][1]["content"])
-            return FakeResponse()
-
-        discovery = {
-            "person": "王应睐",
-            "event_angle": "组织人工合成牛胰岛素研究",
-            "research_notes": "- 中国科学院资料：王应睐组织相关科研工作。（https://example.cn/source）",
-            "source_urls": ["https://example.cn/source"],
-        }
-        with patch.dict("os.environ", {"MINIMAX_API_KEY": "test-key"}), patch(
-            "services.text_service.discover_book_script_seed",
-            return_value=discovery,
-        ) as discover, patch(
-            "services.text_service.remember_ai_script_person",
-        ), patch(
-            "services.text_service.urllib.request.urlopen",
-            side_effect=fake_urlopen,
-        ):
-            result = generate_guozhijiliang_script(
-                promotion_book_title="国之脊梁"
-            )
-
-        discover.assert_called_once()
-        self.assertEqual("王应睐", result["person"])
-        self.assertEqual("online_search", result["person_selection"])
-        self.assertEqual(["https://example.cn/source"], result["research_sources"])
-        self.assertIn("本次联网检索资料", captured_prompts[0])
-        self.assertIn("https://example.cn/source", captured_prompts[0])
-
-    def test_ai_script_retries_read_timeout_with_configurable_timeout(self) -> None:
-        response_body = {
-            "choices": [{
-                "message": {
-                    "content": json.dumps({
-                        "title": "测试标题",
-                        "person": "测试人物",
-                        "event_angle": "测试事件",
-                        "script": "生成成功",
-                    }, ensure_ascii=False)
-                }
-            }]
-        }
-
-        class FakeResponse:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def read(self):
-                return json.dumps(response_body, ensure_ascii=False).encode("utf-8")
-
-        with patch.dict("os.environ", {
-            "MINIMAX_API_KEY": "test-key",
-            "MINIMAX_AI_SCRIPT_TIMEOUT_SECONDS": "345",
-        }), patch(
-            "services.text_service.search_person_sources",
-            return_value=[],
-        ), patch(
-            "services.text_service.guozhijiliang_script_stats",
-            return_value={"chars": 1200, "paragraphs": 22},
-        ), patch(
-            "services.text_service.guozhijiliang_opening_needs_rewrite",
-            return_value=False,
-        ), patch(
-            "services.text_service.remember_ai_script_person",
-        ), patch(
-            "services.text_service.urllib.request.urlopen",
-            side_effect=[TimeoutError("The read operation timed out"), FakeResponse()],
-        ) as mocked_urlopen:
-            result = generate_guozhijiliang_script("测试人物", "测试事件")
-
-        self.assertEqual("生成成功", result["script"])
-        self.assertEqual(2, mocked_urlopen.call_count)
-        self.assertEqual([345, 345], [
-            call.kwargs["timeout"] for call in mocked_urlopen.call_args_list
-        ])
-
-    def test_ai_script_reports_timeout_after_retry_limit(self) -> None:
-        with patch.dict("os.environ", {
-            "MINIMAX_API_KEY": "test-key",
-            "MINIMAX_AI_SCRIPT_TIMEOUT_SECONDS": "31",
-        }), patch(
-            "services.text_service.search_person_sources",
-            return_value=[],
-        ), patch(
-            "services.text_service.urllib.request.urlopen",
-            side_effect=TimeoutError("The read operation timed out"),
-        ) as mocked_urlopen:
-            with self.assertRaises(RuntimeError) as raised:
-                generate_guozhijiliang_script("测试人物", "测试事件")
-
-        self.assertEqual(2, mocked_urlopen.call_count)
-        self.assertIn("2 requests (31s timeout each)", str(raised.exception))
-
-    def test_guozhijiliang_prompt_discourages_reused_opening_templates(self) -> None:
-        RECENT_GUOZHIJILIANG_OPENINGS.clear()
-        prompt = build_guozhijiliang_script_prompt_v2("茅以升", "亲手建成钱塘江大桥，又在战火逼近时含泪参与炸桥")
-        RECENT_GUOZHIJILIANG_OPENINGS.clear()
-
-        self.assertIn("本篇独特点", prompt)
-        self.assertIn("本篇开头策略", prompt)
-        self.assertIn("第一句话就是钩子", prompt)
-        self.assertIn("不能承担介绍任务", prompt)
-        self.assertIn("不能描写环境、天气、时代氛围", prompt)
-        self.assertIn("必须先出事，再补背景", prompt)
-        self.assertIn("前三秒必须做到“三连击”", prompt)
-        self.assertIn("第一句给爆点", prompt)
-        self.assertIn("强冲突开头示例", prompt)
-        self.assertIn("1000到1300", prompt)
-        self.assertIn("20到30", prompt)
-        self.assertIn("换成另一个科学家也能用，必须推翻重写", prompt)
-        self.assertNotIn("去大街上拉住", prompt)
-        self.assertNotIn("随便问十个人", prompt)
-        self.assertNotIn("9999", prompt)
-
-    def test_ai_script_seed_and_prompt_follow_selected_book(self) -> None:
-        female_person, _ = choose_book_script_seed("女性人物传记")
-        history_person, _ = choose_book_script_seed("历史深处的民国")
-        female_prompt = build_book_script_prompt(
-            "女性人物传记", "张爱玲", "在爱情受挫与远走他乡之间作出选择"
-        )
-        history_prompt = build_book_script_prompt(
-            "历史深处的民国", "宋教仁", "议会政治刚露出希望时遇刺"
-        )
-
-        self.assertIn(female_person, {person for person, _ in BOOK_SCRIPT_STORY_SEEDS["女性人物传记"]})
-        self.assertIn(history_person, {person for person, _ in BOOK_SCRIPT_STORY_SEEDS["历史深处的民国"]})
-        self.assertNotIn(female_person, FAMILIAR_DEFAULT_AI_SCRIPT_PEOPLE["女性人物传记"])
-        self.assertNotIn(history_person, FAMILIAR_DEFAULT_AI_SCRIPT_PEOPLE["历史深处的民国"])
-        self.assertIn("爱情、婚姻、家庭、事业、自由", female_prompt)
-        self.assertIn("《女性人物传记》", female_prompt)
-        self.assertIn("晚清至民国关键人物", history_prompt)
-        self.assertIn("《历史深处的民国》", history_prompt)
-        self.assertIn("禁止套用《国之脊梁》的科学家报国模板", female_prompt)
-
-    def test_original_script_method_uses_uploaded_high_performance_rules(self) -> None:
-        prompt = build_original_script_method_prompt("历史深处的民国")
-
-        self.assertIn("一人三极", prompt)
-        self.assertIn("七段推进", prompt)
-        self.assertIn("前80字", prompt)
-        self.assertIn("一个主悬念和至少两个副悬念", prompt)
-        self.assertIn("每200到350字", prompt)
-        self.assertIn("至少满足九项", prompt)
-        self.assertIn("自然承接到《历史深处的民国》", prompt)
-
-    def test_ai_script_seed_avoids_sensitive_people_even_when_requested(self) -> None:
-        for blocked_name in SENSITIVE_AI_SCRIPT_PEOPLE:
-            person, angle = choose_book_script_seed(
-                "历史深处的民国",
-                blocked_name,
-                f"围绕{blocked_name}展开",
-            )
-            self.assertNotIn(person, SENSITIVE_AI_SCRIPT_PEOPLE)
-            self.assertTrue(all(name not in person + angle for name in SENSITIVE_AI_SCRIPT_PEOPLE))
-
-    def test_guozhijiliang_script_stats_counts_length_and_paragraphs(self) -> None:
-        script = "第一段有内容。\n\n第二段也有内容。"
-        stats = guozhijiliang_script_stats(script)
-
-        self.assertEqual(2, stats["paragraphs"])
-        self.assertGreater(stats["chars"], 10)
-        self.assertEqual(1000, MIN_GUOZHIJILIANG_SCRIPT_CHARS)
-        self.assertEqual(20, MIN_GUOZHIJILIANG_SCRIPT_PARAGRAPHS)
-
-    def test_guozhijiliang_opening_rejects_weak_intros(self) -> None:
-        self.assertTrue(guozhijiliang_opening_needs_rewrite("在那个年代，很多科学家都很伟大。\n第二段"))
-        self.assertTrue(guozhijiliang_opening_needs_rewrite("茅以升是我国著名桥梁专家。\n第二段"))
-        self.assertFalse(guozhijiliang_opening_needs_rewrite("他亲手建起的大桥，最后却要亲手炸掉。\n第二段"))
 
     def test_cover_title_rejects_stiff_titles(self) -> None:
         self.assertTrue(cover_title_needs_rewrite("伟大一生", "民族脊梁"))
@@ -2183,35 +1848,21 @@ class ShotTagGenerationTests(unittest.TestCase):
         flattened = tags["people"] + tags["scene"] + tags["era"] + tags["keywords"]
         self.assertEqual([], flattened)
 
-    def test_generate_shots_leaves_tags_empty_when_ai_visuals_unavailable(self) -> None:
+    def test_generate_shots_has_no_local_visual_fallback(self) -> None:
         script = "alpha beta gamma delta epsilon\nzeta eta theta iota kappa"
 
-        with patch.dict("os.environ", {"MINIMAX_API_KEY": ""}):
-            shots = generate_shots(script)
+        with patch.dict("os.environ", {"DEEPSEEK_API_KEY": ""}):
+            with self.assertRaisesRegex(RuntimeError, "DEEPSEEK_API_KEY"):
+                generate_shots(script)
 
-        self.assertGreaterEqual(len(shots), 1)
-        for shot in shots:
-            self.assertEqual([], shot["required_object"])
-            self.assertEqual([], shot["required_scene"])
-            self.assertEqual([], shot["object_tags"])
-            self.assertEqual([], shot["scene_tags"])
-            self.assertEqual([], shot["keywords"])
-            self.assertEqual([], shot["search_keywords"])
+    def test_storyboard_split_is_limited_to_six_to_nine_ordered_shots(self) -> None:
+        script = "".join(f"第{index}段讲述朝堂中的一次关键转折。" for index in range(1, 18))
 
-    def test_clean_shot_visual_terms_rejects_sentence_fragments(self) -> None:
-        terms = clean_shot_visual_terms(
-            [
-                "\u7684\u538b\u529b",
-                "\u753b\u9762\u9700\u8981",
-                "validSubject",
-                "subject,with,punctuation",
-                "toolongfragmentvalue",
-            ],
-            max_length=12,
-        )
+        chunks = split_script_into_storyboards(script)
 
-        self.assertEqual(["validSubject"], terms)
-
+        self.assertGreaterEqual(len(chunks), 6)
+        self.assertLessEqual(len(chunks), 9)
+        self.assertEqual(script, "".join(chunks))
 
 if __name__ == "__main__":
     unittest.main()

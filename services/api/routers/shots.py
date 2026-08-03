@@ -12,7 +12,6 @@ from services.generation_service import build_image_prompt, generate_doubao_imag
 from services.material_library_service import apply_material_intent
 from services.store import load_db, project_dir, public_url, save_db
 from services.text_service import ai_generate_shot_visuals, generate_shots
-from services.web_image_pipeline import mark_project_searching, request_stop_project_search, reset_project_web_images, run_project_web_image_search
 
 router = APIRouter(prefix="/api/projects", tags=["shots"])
 REANALYZE_SAVE_LOCK = threading.Lock()
@@ -30,7 +29,7 @@ def ai_image_concurrency(total: int) -> int:
 
 def _generate_one_ai_image(project_id: str, generated_shot: dict) -> tuple[dict, object, dict]:
     out = project_dir(project_id) / "images" / f"shot_{generated_shot['shot_index']:03d}.png"
-    result = generate_doubao_image(out, generated_shot, "1:1")
+    result = generate_doubao_image(out, generated_shot, "9:16")
     return generated_shot, out, result
 
 
@@ -85,11 +84,11 @@ def _generate_ai_images(project_id: str, run_id: str, shots: list[dict]) -> None
                     "project_id": project_id,
                     "shot_id": shot_id,
                     "type": "image",
+                    "asset_source": "ai_generated",
                     "prompt": result["prompt"],
                     "provider": result.get("provider"),
                     "model": result.get("model"),
                     "image_size": result.get("image_size"),
-                    "person_gender": result.get("person_gender"),
                     "remote_url": result.get("remote_url"),
                     "seed": result.get("seed"),
                     "file_url": public_url(out),
@@ -99,13 +98,14 @@ def _generate_ai_images(project_id: str, run_id: str, shots: list[dict]) -> None
                 })
                 shot["selected_asset_id"] = generated_id
                 shot["asset_source"] = "ai_generated"
+                shot["image_prompt"] = result["prompt"]
                 shot["status"] = "ai_generated"
                 shot["updated_at"] = datetime.now().isoformat(timespec="seconds")
-            project["search_stage"] = "generating_ai_images"
-            project["search_completed"] = completed
-            project["search_total"] = total
+            project["generation_stage"] = "generating_ai_images"
+            project["generation_completed"] = completed
+            project["generation_total"] = total
             project["current_shot_index"] = generated_shot.get("shot_index")
-            project["current_search_keyword"] = f"正在并发生成 AI 图片：{completed}/{total}"
+            project["current_generation_message"] = f"正在并发生成 AI 图片：{completed}/{total}"
             project["ai_image_concurrency"] = ai_image_concurrency(total)
             project["updated_at"] = datetime.now().isoformat(timespec="seconds")
             save_db(db)
@@ -116,11 +116,11 @@ def _generate_ai_images(project_id: str, run_id: str, shots: list[dict]) -> None
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if project and project.get("shot_generation_run_id") == run_id:
         project["status"] = "shots_ready"
-        project["search_stage"] = "done"
-        project["search_completed"] = total
-        project["search_total"] = total
+        project["generation_stage"] = "done"
+        project["generation_completed"] = total
+        project["generation_total"] = total
         project["current_shot_index"] = None
-        project["current_search_keyword"] = ""
+        project["current_generation_message"] = ""
         project["updated_at"] = datetime.now().isoformat(timespec="seconds")
         save_db(db)
 
@@ -132,29 +132,34 @@ def _save_image_prompts(project: dict, shots: list[dict], now: str) -> None:
         shot["status"] = "prompt_ready"
         shot["updated_at"] = now
     project["status"] = "shots_ready"
-    project["search_stage"] = "done"
-    project["search_total"] = len(shots)
-    project["search_completed"] = len(shots)
+    project["generation_stage"] = "done"
+    project["generation_total"] = len(shots)
+    project["generation_completed"] = len(shots)
     project["current_shot_index"] = None
-    project["current_search_keyword"] = ""
+    project["current_generation_message"] = ""
 
 
-def _generate_project_shots(project_id: str, run_id: str, image_search_provider: str, material_source_strategy: str) -> None:
+def _generate_project_shots(
+    project_id: str,
+    run_id: str,
+    material_source_strategy: str,
+    storyboard_model_provider: str = "deepseek",
+) -> None:
     db = load_db()
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project or project.get("shot_generation_run_id") != run_id:
         return
     script = project.get("rewritten_script") or project["raw_script"]
     try:
-        generated = generate_shots(script)
+        generated = generate_shots(script, model_provider=storyboard_model_provider)
     except Exception as exc:
         db = load_db()
         project = next((p for p in db["projects"] if p["id"] == project_id), None)
         if project and project.get("shot_generation_run_id") == run_id:
             project.update({
                 "status": "shot_generation_failed",
-                "search_stage": "shot_generation_failed",
-                "search_error": str(exc)[:500],
+                "generation_stage": "shot_generation_failed",
+                "generation_error": str(exc)[:500],
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
             })
             save_db(db)
@@ -168,60 +173,73 @@ def _generate_project_shots(project_id: str, run_id: str, image_search_provider:
         shot.update({"id": str(uuid4()), "project_id": project_id, "created_at": now, "updated_at": now})
         apply_material_intent(shot)
         db["shots"].append(shot)
-    project["status"] = "searching_images"
-    project["image_search_provider"] = image_search_provider
     project["material_source_strategy"] = material_source_strategy
     project["updated_at"] = now
     if material_source_strategy == "prompt_only":
         _save_image_prompts(project, generated, now)
-    elif material_source_strategy != "ai_only":
-        mark_project_searching(db, project_id)
     else:
-        project["search_stage"] = "generating_ai_images"
-        project["search_total"] = len(generated)
-        project["search_completed"] = 0
-        project["current_search_keyword"] = "准备生成 AI 图片..."
+        project["status"] = "generating_images"
+        project["generation_stage"] = "generating_ai_images"
+        project["generation_total"] = len(generated)
+        project["generation_completed"] = 0
+        project["current_generation_message"] = "准备生成 AI 图片..."
     save_db(db)
     if material_source_strategy == "ai_only":
         _generate_ai_images(project_id, run_id, generated)
-    elif material_source_strategy != "prompt_only":
-        run_project_web_image_search(project_id)
 
 
 @router.post("/{project_id}/shots")
 def create_shots(
     project_id: str,
     background_tasks: BackgroundTasks,
-    image_search_provider: str = Query("so", pattern="^(so|tencent)$"),
     material_source_strategy: str = Query(
-        "library_first",
-        pattern="^(library_first|library_only|web_only|ai_only|prompt_only)$",
+        "ai_only",
+        pattern="^(ai_only|prompt_only)$",
+    ),
+    storyboard_model_provider: str = Query(
+        "deepseek",
+        pattern="^(minimax|deepseek|openai)$",
     ),
 ):
     db = load_db()
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
         raise HTTPException(404, "Project not found")
-    request_stop_project_search(db, project_id)
     db["shots"] = [s for s in db["shots"] if s["project_id"] != project_id]
     db["project_assets"] = [
         item for item in db.get("project_assets", [])
         if item.get("project_id") != project_id
     ]
-    reset_project_web_images(db, project_id)
+    db["generated_assets"] = [
+        item for item in db.get("generated_assets", [])
+        if item.get("project_id") != project_id
+    ]
     now = datetime.now().isoformat(timespec="seconds")
     run_id = str(uuid4())
     project["shot_generation_run_id"] = run_id
     project["status"] = "generating_shots"
-    project["search_stage"] = "generating_shots"
-    project["search_error"] = ""
-    project["search_stop_requested"] = False
-    project["image_search_provider"] = image_search_provider
+    project["generation_stage"] = "generating_shots"
+    project["generation_error"] = ""
+    project["generation_completed"] = 0
+    project["generation_total"] = 0
+    project["current_generation_message"] = "正在生成分镜提示词..."
     project["material_source_strategy"] = material_source_strategy
+    project["storyboard_model_provider"] = storyboard_model_provider
     project["updated_at"] = now
     save_db(db)
-    background_tasks.add_task(_generate_project_shots, project_id, run_id, image_search_provider, material_source_strategy)
-    return {"shots": [], "status": "generating_shots", "run_id": run_id}
+    background_tasks.add_task(
+        _generate_project_shots,
+        project_id,
+        run_id,
+        material_source_strategy,
+        storyboard_model_provider,
+    )
+    return {
+        "shots": [],
+        "status": "generating_shots",
+        "run_id": run_id,
+        "storyboard_model_provider": storyboard_model_provider,
+    }
 
 
 @router.patch("/{project_id}/shots/{shot_id}")
@@ -231,9 +249,8 @@ def update_shot(project_id: str, shot_id: str, patch: dict):
     if not shot:
         raise HTTPException(404, "Shot not found")
     allowed = {
-        "voice_text", "duration_sec", "visual_need", "person_gender",
-        "person_names", "person_description",
-        "required_object", "required_scene", "search_keywords",
+        "voice_text", "duration_sec", "visual_need",
+        "required_object", "required_scene",
     }
     for key, value in patch.items():
         if key in allowed:
@@ -243,8 +260,15 @@ def update_shot(project_id: str, shot_id: str, patch: dict):
     return {"shot": shot}
 
 
-@router.post("/{project_id}/shots/{shot_id}/reanalyze-image")
-def reanalyze_shot_image(project_id: str, shot_id: str):
+@router.post("/{project_id}/shots/{shot_id}/regenerate-image-prompt")
+def regenerate_shot_image_prompt(
+    project_id: str,
+    shot_id: str,
+    storyboard_model_provider: str | None = Query(
+        None,
+        pattern="^(minimax|deepseek|openai)$",
+    ),
+):
     db = load_db()
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     shot = next((s for s in db["shots"] if s["project_id"] == project_id and s["id"] == shot_id), None)
@@ -254,29 +278,44 @@ def reanalyze_shot_image(project_id: str, shot_id: str):
         raise HTTPException(404, "Shot not found")
 
     full_script = project.get("rewritten_script") or project.get("raw_script") or ""
-    result = ai_generate_shot_visuals([shot], full_script).get(str(shot.get("shot_index")))
+    model_provider = str(
+        storyboard_model_provider
+        or project.get("storyboard_model_provider")
+        or "deepseek"
+    )
+    project["storyboard_model_provider"] = model_provider
+    result = ai_generate_shot_visuals(
+        [shot],
+        full_script,
+        model_provider=model_provider,
+    ).get(str(shot.get("shot_index")))
     if not result:
-        raise HTTPException(502, "MiniMax did not return image analysis")
+        raise HTTPException(502, f"{model_provider} did not return an image prompt")
 
-    # MiniMax calls run concurrently. Serialize only the short read-modify-write
-    # section so one completed recognition cannot overwrite another one's result.
+    # Prompt generation calls can run concurrently. Serialize only the short
+    # read-modify-write section so completed requests cannot overwrite each other.
     with REANALYZE_SAVE_LOCK:
         db = load_db()
+        current_project = next((p for p in db["projects"] if p["id"] == project_id), None)
         current_shot = next(
             (s for s in db["shots"] if s["project_id"] == project_id and s["id"] == shot_id),
             None,
         )
+        if current_project:
+            current_project["storyboard_model_provider"] = model_provider
         if not current_shot:
             raise HTTPException(404, "Shot not found")
         for key in (
-            "visual_need", "person_gender", "person_names", "person_description",
-            "search_keywords", "object_tags", "scene_tags", "keywords",
+            "visual_need", "object_tags", "scene_tags", "keywords",
         ):
             if key in result:
                 current_shot[key] = result[key]
         current_shot["required_object"] = list(current_shot.get("object_tags") or [])
         current_shot["required_scene"] = list(current_shot.get("scene_tags") or [])
         apply_material_intent(current_shot)
+        current_shot["image_prompt"] = build_image_prompt(current_shot)
+        if not current_shot.get("selected_asset_id"):
+            current_shot["status"] = "prompt_ready"
         current_shot["updated_at"] = datetime.now().isoformat(timespec="seconds")
         save_db(db)
         return {"shot": current_shot}

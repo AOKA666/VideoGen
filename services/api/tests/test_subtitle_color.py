@@ -13,14 +13,26 @@ from services import video_export_service  # noqa: E402
 
 
 class SubtitleColorTests(unittest.TestCase):
-    def test_mp4_and_jianying_subtitles_are_white(self) -> None:
-        self.assertEqual("&H00FFFFFF", video_export_service.SUBTITLE_ASS_PRIMARY_COLOR)
+    def test_jianying_subtitles_are_white_and_have_a_strong_border(self) -> None:
         self.assertEqual((1.0, 1.0, 1.0), video_export_service.SUBTITLE_RGB_COLOR)
+        self.assertEqual(70.0, video_export_service.SUBTITLE_JIANYING_BORDER_WIDTH)
 
-        mp4_source = inspect.getsource(video_export_service.render_project_video)
         draft_source = inspect.getsource(video_export_service.create_jianying_native_draft)
-        self.assertIn("SUBTITLE_ASS_PRIMARY_COLOR", mp4_source)
         self.assertIn("color=SUBTITLE_RGB_COLOR", draft_source)
+        self.assertIn("width=SUBTITLE_JIANYING_BORDER_WIDTH", draft_source)
+
+    def test_jianying_title_uses_editable_feiyang_text_layers(self) -> None:
+        draft_source = inspect.getsource(video_export_service.create_jianying_native_draft)
+        self.assertIn("draft.FontType.飞扬行书", draft_source)
+        self.assertIn('draft.TrackType.text, "title_line1"', draft_source)
+        self.assertIn('draft.TrackType.text, "title_line2"', draft_source)
+        self.assertNotIn('draft.TrackType.video, "title_overlay"', draft_source)
+
+    def test_jianying_title_geometry_matches_the_previous_image_title(self) -> None:
+        geometry = video_export_service._jianying_title_geometry("《道德经》", "命运的巨大漏洞")
+        self.assertEqual(20.0, geometry["font_size"])
+        self.assertAlmostEqual(0.645, geometry["line1_transform_y"], places=3)
+        self.assertAlmostEqual(0.485, geometry["line2_transform_y"], places=3)
 
 
 if __name__ == "__main__":

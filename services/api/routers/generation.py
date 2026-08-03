@@ -9,7 +9,7 @@ from io import BytesIO
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from PIL import Image, ImageOps
 from pydantic import BaseModel
@@ -31,6 +31,7 @@ from services.generation_service import (
     synthesize_project_voice,
     weighted_music_timeline_from_shots,
     write_timeline,
+    normalize_cover_title_positions,
 )
 from services.store import load_db, project_dir, public_url, save_db
 from services.text_service import generate_publish_assistant, generate_viral_title
@@ -383,7 +384,7 @@ def generate_image(project_id: str, shot_id: str, payload: ImageGenerationPayloa
         raise HTTPException(404, "Shot not found")
     out = project_dir(project_id) / "images" / f"shot_{shot['shot_index']:03d}.png"
     try:
-        result = generate_doubao_image(out, shot, "1:1", payload.prompt if payload else None)
+        result = generate_doubao_image(out, shot, "9:16", payload.prompt if payload else None)
     except Exception as exc:
         raise HTTPException(502, str(exc)) from exc
     prompt = result["prompt"]
@@ -401,11 +402,11 @@ def generate_image(project_id: str, shot_id: str, payload: ImageGenerationPayloa
             "project_id": project_id,
             "shot_id": shot_id,
             "type": "image",
+            "asset_source": "ai_generated",
             "prompt": prompt,
             "provider": result.get("provider"),
             "model": result.get("model"),
             "image_size": result.get("image_size"),
-            "person_gender": result.get("person_gender"),
             "remote_url": result.get("remote_url"),
             "seed": result.get("seed"),
             "file_url": public_url(out),
@@ -416,6 +417,7 @@ def generate_image(project_id: str, shot_id: str, payload: ImageGenerationPayloa
         db["generated_assets"].append(asset)
         shot["selected_asset_id"] = generated_id
         shot["asset_source"] = "ai_generated"
+        shot["image_prompt"] = prompt
         shot["status"] = "ai_generated"
         save_db(db)
     return {
@@ -427,7 +429,6 @@ def generate_image(project_id: str, shot_id: str, payload: ImageGenerationPayloa
         "provider": result.get("provider"),
         "model": result.get("model"),
         "image_size": result.get("image_size"),
-        "person_gender": result.get("person_gender"),
         "status": "success",
     }
 
@@ -581,8 +582,20 @@ def generate_publish(project_id: str):
     }
 
 
+@router.get("/_fonts/cover-title")
+def download_cover_title_font():
+    font_path = Path(__file__).resolve().parents[3] / "assets" / "龚帆怒放体.ttf"
+    if not font_path.is_file():
+        raise HTTPException(404, "Cover title font not found")
+    return FileResponse(font_path, media_type="font/ttf", filename="cover-title.ttf")
+
+
 @router.post("/{project_id}/generate-cover")
-def generate_cover(project_id: str, file: UploadFile = File(...)):
+def generate_cover(
+    project_id: str,
+    file: UploadFile | None = File(None),
+    title_positions: str = Form(""),
+):
     db = load_db()
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
@@ -592,7 +605,7 @@ def generate_cover(project_id: str, file: UploadFile = File(...)):
     title_line2 = str(project.get("title_line2") or "").strip()
     if not title_line1 or not title_line2:
         raise HTTPException(400, "Please confirm the two-line title before generating the cover")
-    if not str(file.content_type or "").startswith("image/"):
+    if file is not None and not str(file.content_type or "").startswith("image/"):
         raise HTTPException(400, "Please upload an image file")
 
     cover_dir = project_dir(project_id) / "cover"
@@ -600,13 +613,23 @@ def generate_cover(project_id: str, file: UploadFile = File(...)):
     source_path = cover_dir / "portrait-upload"
     cover_path = cover_dir / "cover.png"
     try:
-        with source_path.open("wb") as target:
-            shutil.copyfileobj(file.file, target)
-        if source_path.stat().st_size > 20 * 1024 * 1024:
-            raise ValueError("Uploaded image must not exceed 20 MB")
-        compose_uploaded_cover(source_path, cover_path, title_line1, title_line2)
+        if file is not None:
+            upload_path = cover_dir / "portrait-upload.tmp"
+            with upload_path.open("wb") as target:
+                shutil.copyfileobj(file.file, target)
+            if upload_path.stat().st_size > 20 * 1024 * 1024:
+                upload_path.unlink(missing_ok=True)
+                raise ValueError("Uploaded image must not exceed 20 MB")
+            upload_path.replace(source_path)
+        if not source_path.is_file():
+            raise ValueError("Please upload an image file")
+        try:
+            raw_positions = json.loads(title_positions) if title_positions else {}
+        except json.JSONDecodeError as exc:
+            raise ValueError("Invalid cover title positions") from exc
+        positions = normalize_cover_title_positions(raw_positions)
+        compose_uploaded_cover(source_path, cover_path, title_line1, title_line2, positions)
     except Exception as exc:
-        source_path.unlink(missing_ok=True)
         raise HTTPException(400, f"Cover image processing failed: {exc}") from exc
 
     now = datetime.now().isoformat(timespec="seconds")
@@ -618,6 +641,7 @@ def generate_cover(project_id: str, file: UploadFile = File(...)):
         "cover_prompt": "",
         "cover_provider": "uploaded_image",
         "cover_model": "pillow_composite",
+        "cover_title_positions": positions,
         "cover_updated_at": now,
         "updated_at": now,
     })
@@ -630,6 +654,7 @@ def generate_cover(project_id: str, file: UploadFile = File(...)):
         "provider": project["cover_provider"],
         "model": project["cover_model"],
         "image_size": "1080x1920",
+        "title_positions": positions,
     }
 
 

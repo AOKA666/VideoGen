@@ -9,7 +9,6 @@ router = APIRouter(prefix="/api/system", tags=["system"])
 
 API_DIR = Path(__file__).resolve().parents[1]
 LOG_FILES = {
-    "image_search": API_DIR / "logs" / "image-search.log",
     "runtime": API_DIR / "logs" / "uvicorn.stdout.log",
     "errors": API_DIR / "logs" / "uvicorn.stderr.log",
 }
@@ -28,7 +27,7 @@ def tail_text(path: Path, max_chars: int) -> str:
 
 @router.get("/logs")
 def read_logs(
-    stream: str = Query("image_search", pattern="^(image_search|runtime|errors)$"),
+    stream: str = Query("runtime", pattern="^(runtime|errors)$"),
     max_chars: int = Query(12000, ge=1000, le=60000),
 ):
     path = LOG_FILES[stream]

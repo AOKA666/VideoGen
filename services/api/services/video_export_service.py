@@ -4,50 +4,39 @@ import json
 import os
 import re
 import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from PIL import Image, ImageOps
 
-
-CREATE_NO_WINDOW = 0x08000000
-SUBTITLE_ASS_PRIMARY_COLOR = "&H00FFFFFF"
 SUBTITLE_RGB_COLOR = (1.0, 1.0, 1.0)
+SUBTITLE_JIANYING_BORDER_WIDTH = 70.0
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+SUBTITLE_FONT_FILE = PROJECT_ROOT / "assets" / "DouyinSansBold.otf"
+SUBTITLE_FONT_NAME = "Douyin Sans"
+TITLE_FONT_FILE = PROJECT_ROOT / "assets" / "龚帆怒放体.ttf"
+TITLE_FONT_NAME = "gongfannufangti"
 
 
-def _escape_ffmpeg_filter_path(path: str | Path) -> str:
-    """Escape a filesystem path embedded in an FFmpeg filter graph."""
-    return str(path).replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
+def _font_result(path: str | Path, name: str) -> tuple[str, str]:
+    return (str(path).replace("\\", "/"), name)
 
 
-def _find_preferred_font() -> tuple[str, str]:
-    """Find the preferred font file and name.
-
-    Prioritizes 文源圆体 (WenYuan Rounded), falling back to
-    Microsoft YaHei / SimHei if not available.
-
-    Returns:
-        (font_file_path, font_name) — font_file_path uses forward slashes
-        for FFmpeg compatibility; font_name is for the subtitles force_style
-        FontName parameter.
-    """
-    configured_font = os.getenv("VIDEOGEN_FONT_FILE", "").strip()
+def _find_subtitle_font() -> tuple[str, str]:
+    """Use the bundled Douyin Sans Bold font for burned-in subtitles."""
+    configured_font = os.getenv("VIDEOGEN_SUBTITLE_FONT_FILE", "").strip()
+    configured_name = os.getenv("VIDEOGEN_SUBTITLE_FONT_NAME", "").strip()
     if configured_font and Path(configured_font).is_file():
-        return (configured_font.replace("\\", "/"), "Noto Sans CJK SC")
+        return _font_result(configured_font, configured_name or SUBTITLE_FONT_NAME)
 
-    # 1. Look for 文源圆体 bundled in the project root
-    project_root = Path(__file__).resolve().parent.parent.parent.parent
-    wenyuan_candidates = [
-        project_root / "WenYuanRoundedSCVF.ttf",
-        Path("C:/Windows/Fonts/WenYuanRoundedSCVF.ttf"),
-    ]
-    for candidate in wenyuan_candidates:
-        if candidate.exists():
-            return (str(candidate).replace("\\", "/"), "文源圆体")
+    if SUBTITLE_FONT_FILE.is_file():
+        return _font_result(SUBTITLE_FONT_FILE, SUBTITLE_FONT_NAME)
 
-    # 2. Fall back to Microsoft YaHei / SimHei
+    legacy_font = os.getenv("VIDEOGEN_FONT_FILE", "").strip()
+    if legacy_font and Path(legacy_font).is_file():
+        return _font_result(legacy_font, "Noto Sans CJK SC")
+
     fallback_candidates = [
         ("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc", "Noto Sans CJK SC"),
         ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", "Noto Sans CJK SC"),
@@ -57,30 +46,27 @@ def _find_preferred_font() -> tuple[str, str]:
     ]
     for font_path, font_name in fallback_candidates:
         if os.path.exists(font_path):
-            return (font_path.replace("\\", "/"), font_name)
+            return _font_result(font_path, font_name)
 
-    # 3. Preserve the previous local fallback for Windows development.
-    return ("C:/Windows/Fonts/msyhbd.ttc", "Microsoft YaHei")
+    return _font_result("C:/Windows/Fonts/msyhbd.ttc", "Microsoft YaHei")
 
 
-def _run(command: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-    platform_options = {"creationflags": CREATE_NO_WINDOW} if os.name == "nt" else {}
-    try:
-        return subprocess.run(
-            command,
-            cwd=cwd,
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            **platform_options,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"Required executable is not installed: {command[0]}") from exc
-    except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or exc.stdout or str(exc)).strip()
-        raise RuntimeError(f"{command[0]} failed: {detail[-3000:]}") from exc
+def _find_title_font() -> tuple[str, str]:
+    """Use the bundled Gongfan Nufang font for cover titles."""
+    configured_font = os.getenv("VIDEOGEN_TITLE_FONT_FILE", "").strip()
+    configured_name = os.getenv("VIDEOGEN_TITLE_FONT_NAME", "").strip()
+    if configured_font and Path(configured_font).is_file():
+        return _font_result(configured_font, configured_name or TITLE_FONT_NAME)
+
+    if TITLE_FONT_FILE.is_file():
+        return _font_result(TITLE_FONT_FILE, TITLE_FONT_NAME)
+
+    return _find_subtitle_font()
+
+
+def _find_preferred_font() -> tuple[str, str]:
+    """Backward-compatible alias for the configured subtitle font."""
+    return _find_subtitle_font()
 
 
 def _shot_duration(shot: dict[str, Any]) -> float:
@@ -118,310 +104,13 @@ def _shot_display_ranges(
     return ranges
 
 
-def probe_media(path: Path) -> dict[str, Any]:
-    result = _run([
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration:stream=index,codec_type,codec_name,width,height,duration",
-        "-of",
-        "json",
-        str(path),
-    ])
-    data = json.loads(result.stdout)
-    streams = data.get("streams") or []
-    video = next((item for item in streams if item.get("codec_type") == "video"), {})
-    audio = next((item for item in streams if item.get("codec_type") == "audio"), {})
-    format_duration = float((data.get("format") or {}).get("duration") or 0)
+def _jianying_title_geometry(line1: str, line2: str) -> dict[str, float]:
+    """Keep calibrated Jianying title geometry independent of cover font changes."""
     return {
-        "path": path.name,
-        "duration_sec": round(format_duration, 3),
-        "video_duration_sec": round(float(video.get("duration") or 0), 3) if video else None,
-        "audio_duration_sec": round(float(audio.get("duration") or 0), 3) if audio else None,
-        "width": video.get("width"),
-        "height": video.get("height"),
-        "video_codec": video.get("codec_name"),
-        "audio_codec": audio.get("codec_name"),
-        "has_video": bool(video),
-        "has_audio": bool(audio),
+        "font_size": 20.0,
+        "line1_transform_y": 0.645,
+        "line2_transform_y": 0.485,
     }
-
-
-def render_looped_background_music(
-    music_path: Path,
-    output_path: Path,
-    target_duration_sec: float,
-    start_sec: float = 0,
-    volume: float = 0.2,
-    crossfade_sec: float = 1.0,
-) -> dict[str, Any]:
-    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-        raise RuntimeError("FFmpeg and ffprobe are required to prepare background music")
-    music_probe = probe_media(music_path)
-    source_duration = float(music_probe.get("duration_sec") or 0)
-    if source_duration <= 0:
-        raise RuntimeError("Background music has no readable duration")
-
-    start_sec = max(0.0, min(float(start_sec or 0), max(source_duration - 0.1, 0)))
-    target_duration_sec = max(float(target_duration_sec), 0.1)
-    volume = max(0.0, min(float(volume), 1.0))
-    first_duration = source_duration - start_sec
-    fade = min(max(float(crossfade_sec), 0), source_duration / 3, first_duration / 3)
-    if first_duration < 1:
-        start_sec = 0
-        first_duration = source_duration
-        fade = min(max(float(crossfade_sec), 0), source_duration / 3)
-
-    segment_count = 1
-    combined_duration = first_duration
-    added_duration = max(source_duration - fade, 0.1)
-    while combined_duration < target_duration_sec:
-        segment_count += 1
-        combined_duration += added_duration
-    segment_count = min(segment_count, 200)
-
-    split_labels = "".join(f"[s{index}]" for index in range(segment_count))
-    filters = [f"[0:a]asplit={segment_count}{split_labels}"]
-    for index in range(segment_count):
-        trim_start = start_sec if index == 0 else 0
-        filters.append(
-            f"[s{index}]atrim=start={trim_start:.6f}:end={source_duration:.6f},"
-            f"asetpts=PTS-STARTPTS[p{index}]"
-        )
-    current = "p0"
-    for index in range(1, segment_count):
-        output_label = f"x{index}"
-        if fade > 0:
-            filters.append(
-                f"[{current}][p{index}]acrossfade=d={fade:.6f}:c1=tri:c2=tri[{output_label}]"
-            )
-        else:
-            filters.append(f"[{current}][p{index}]concat=n=2:v=0:a=1[{output_label}]")
-        current = output_label
-    filters.append(
-        f"[{current}]atrim=duration={target_duration_sec:.6f},"
-        f"volume={volume:.6f},asetpts=PTS-STARTPTS[aout]"
-    )
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    _run([
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-i", str(music_path.resolve()),
-        "-filter_complex", ";\n".join(filters),
-        "-map", "[aout]",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        str(output_path.resolve()),
-    ])
-    report = probe_media(output_path)
-    report.update({
-        "source": music_path.name,
-        "source_start_sec": round(start_sec, 3),
-        "volume": round(volume, 3),
-        "loop_segments": segment_count,
-        "crossfade_sec": round(fade, 3),
-    })
-    return report
-
-
-def render_project_video(
-    shots: list[dict[str, Any]],
-    scene_paths: list[Path],
-    audio_path: Path,
-    subtitles_path: Path,
-    output_path: Path,
-    transition_sec: float = 0.5,
-    title_line1: str = "",
-    title_line2: str = "",
-    background_music_path: Path | None = None,
-    voice_volume: float = 1.0,
-) -> dict[str, Any]:
-    if len(shots) != len(scene_paths) or not shots:
-        raise RuntimeError("Every shot must have one exported scene")
-    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-        raise RuntimeError("FFmpeg and ffprobe are required to export MP4")
-
-    audio_probe = probe_media(audio_path)
-    total_duration = audio_probe["duration_sec"]
-    display_ranges = _shot_display_ranges(shots, total_duration)
-    durations = [duration for _, duration in display_ranges]
-    effective_transition_sec = 0.0
-    if len(scene_paths) > 1 and transition_sec > 0:
-        effective_transition_sec = min(float(transition_sec), min(durations) * 0.45)
-
-    command = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-    ]
-    input_durations = [
-        duration + (effective_transition_sec if index > 0 else 0)
-        for index, duration in enumerate(durations)
-    ]
-    for scene_path, input_duration in zip(scene_paths, input_durations):
-        command.extend([
-            "-loop", "1",
-            "-framerate", "30",
-            "-t", f"{input_duration:.6f}",
-            "-i", str(scene_path.resolve()),
-        ])
-    audio_input_index = len(scene_paths)
-    command.extend(["-i", str(audio_path.resolve())])
-    music_input_index = audio_input_index + 1
-    if background_music_path:
-        command.extend(["-i", str(background_music_path.resolve())])
-
-    filters = []
-    for index, input_duration in enumerate(input_durations):
-        filters.append(
-            f"[{index}:v]scale=1080:1080:force_original_aspect_ratio=increase,"
-            "crop=1080:1080,pad=1080:1920:0:420:color=black,"
-            f"fps=30,format=yuv420p,setsar=1,trim=duration={input_duration:.6f},"
-            f"setpts=PTS-STARTPTS[vscene{index}]"
-        )
-    if effective_transition_sec > 0:
-        current_label = "vscene0"
-        elapsed_duration = durations[0]
-        for index in range(1, len(scene_paths)):
-            output_label = "vbase" if index == len(scene_paths) - 1 else f"vfade{index}"
-            offset = elapsed_duration - effective_transition_sec
-            filters.append(
-                f"[{current_label}][vscene{index}]"
-                f"xfade=transition=fade:duration={effective_transition_sec:.6f}:"
-                f"offset={offset:.6f}[{output_label}]"
-            )
-            current_label = output_label
-            elapsed_duration += durations[index]
-    elif len(scene_paths) == 1:
-        filters.append("[vscene0]null[vbase]")
-    else:
-        scene_labels = "".join(f"[vscene{index}]" for index in range(len(scene_paths)))
-        filters.append(f"{scene_labels}concat=n={len(scene_paths)}:v=1:a=0[vbase]")
-    video_label = "vbase"
-
-    preferred_font_path, preferred_font_name = _find_preferred_font()
-    preferred_font_dir = _escape_ffmpeg_filter_path(Path(preferred_font_path).parent)
-    filters.append(
-        f"[{video_label}]subtitles=filename='{_escape_ffmpeg_filter_path(subtitles_path.resolve())}':"
-        f"fontsdir='{preferred_font_dir}':"
-        f"force_style='FontName={preferred_font_name},FontSize=15,"
-        f"PrimaryColour={SUBTITLE_ASS_PRIMARY_COLOR},OutlineColour=&H00000000,"
-        "BorderStyle=1,Outline=0.8,Shadow=0,MarginV=55,Alignment=2'[vsub]"
-    )
-
-    # Overlay title text in top blank area if title lines are provided
-    if title_line1 or title_line2:
-        # Escape special characters for FFmpeg drawtext filter
-        def _escape_drawtext(text: str) -> str:
-            return (text
-                    .replace("\\", "\\\\\\\\")
-                    .replace("'", "'\\''")
-                    .replace(":", "\\\\:")
-                    .replace("%", "\\\\%"))
-
-        # Use the preferred font (文源圆体 with fallback) for title text
-        font_path = _escape_ffmpeg_filter_path(preferred_font_path)
-        line1_font_size = max(16, min(52, 900 // max(len(title_line1), 1)))
-        line2_font_size = max(16, min(52, 900 // max(len(title_line2), 1)))
-
-        # Two-line title in the top safe area, lowered slightly from the canvas edge.
-        if title_line1:
-            filters.append(
-                f"[vsub]drawtext=text='{_escape_drawtext(title_line1)}':"
-                f"fontsize={line1_font_size}:fontcolor=white:borderw=4:bordercolor=black:"
-                f"x=(w-text_w)/2:y=80:"
-                f"fontfile='{font_path}'[vt1]"
-            )
-            current_label = "vt1"
-        else:
-            current_label = "vsub"
-
-        # Title line 2 - centered, below line 1
-        if title_line2:
-            filters.append(
-                f"[{current_label}]drawtext=text='{_escape_drawtext(title_line2)}':"
-                f"fontsize={line2_font_size}:fontcolor=yellow:borderw=4:bordercolor=black:"
-                f"x=(w-text_w)/2:y=152:"
-                f"fontfile='{font_path}'[vout]"
-            )
-        else:
-            # Rename current label to vout
-            filters.append(f"[{current_label}]null[vout]")
-    else:
-        # No title - rename vsub to vout
-        filters.append("[vsub]null[vout]")
-    filters.append(
-        f"[{audio_input_index}:a]volume={max(0.0, min(float(voice_volume), 2.0)):.3f},"
-        f"apad,atrim=duration={total_duration:.3f},"
-        "asetpts=PTS-STARTPTS[voice]"
-    )
-    if background_music_path:
-        filters.append(
-            f"[{music_input_index}:a]apad,atrim=duration={total_duration:.3f},"
-            "asetpts=PTS-STARTPTS[music]"
-        )
-        filters.append(
-            "[voice][music]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
-            "alimiter=limit=0.95[aout]"
-        )
-    else:
-        filters.append("[voice]anull[aout]")
-    filter_script = output_path.parent / "ffmpeg_filter.txt"
-    filter_script.write_text(";\n".join(filters), encoding="utf-8")
-
-    command.extend([
-        "-filter_complex_threads",
-        "1",
-        "-filter_complex_script",
-        str(filter_script.resolve()),
-        "-map",
-        "[vout]",
-        "-map",
-        "[aout]",
-        "-c:v",
-        "libx264",
-        "-threads",
-        "2",
-        "-preset",
-        "fast",
-        "-crf",
-        "20",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-movflags",
-        "+faststart",
-        "-t",
-        f"{total_duration:.3f}",
-        str(output_path.resolve()),
-    ])
-    try:
-        _run(command, cwd=output_path.parent)
-    finally:
-        filter_script.unlink(missing_ok=True)
-
-    probe = probe_media(output_path)
-    duration_delta = abs(probe["duration_sec"] - total_duration)
-    video_duration_delta = abs((probe.get("video_duration_sec") or 0) - total_duration)
-    probe.update({
-        "expected_duration_sec": round(total_duration, 3),
-        "duration_delta_sec": round(duration_delta, 3),
-        "video_duration_delta_sec": round(video_duration_delta, 3),
-        "transition": "fade" if effective_transition_sec > 0 else "cut",
-        "transition_sec": round(effective_transition_sec, 3),
-        "subtitles_burned_in": True,
-        "passed": (
-            probe["width"] == 1080
-            and probe["height"] == 1920
-            and probe["video_codec"] == "h264"
-            and probe["audio_codec"] == "aac"
-            and duration_delta <= 0.2
-            and video_duration_delta <= 0.2
-        ),
-    })
-    if not probe["passed"]:
-        raise RuntimeError(f"Generated MP4 failed validation: {probe}")
-    return probe
 
 
 def _safe_draft_name(name: str) -> str:
@@ -590,17 +279,20 @@ def create_jianying_native_draft(
                 break
             target_start_us += max(target_duration_us - fade_us, 1)
             segment_index += 1
-    # Use 思源圆体 (ResourceHanRounded) — the closest built-in rounded font
-    # to 文源圆体 in Jianying. Falls back gracefully if unavailable.
+    # Keep subtitles and both title lines as editable Jianying text layers.
     try:
-        jianying_font = draft.FontType.ResourceHanRoundedCN_Bold
+        jianying_subtitle_font = draft.FontType.抖音美好体
     except AttributeError:
-        jianying_font = None
+        jianying_subtitle_font = None
+    try:
+        jianying_title_font = draft.FontType.飞扬行书
+    except AttributeError:
+        jianying_title_font = None
 
     subtitle_reference = draft.TextSegment(
         "字幕",
         draft.Timerange(0, 1_000_000),
-        font=jianying_font,
+        font=jianying_subtitle_font,
         style=draft.TextStyle(
             size=15,
             bold=True,
@@ -610,7 +302,7 @@ def create_jianying_native_draft(
         ),
         border=draft.TextBorder(
             color=(0.0, 0.0, 0.0),
-            width=20.0,
+            width=SUBTITLE_JIANYING_BORDER_WIDTH,
         ),
         clip_settings=draft.ClipSettings(transform_y=-0.43),
     )
@@ -621,13 +313,11 @@ def create_jianying_native_draft(
         clip_settings=None,
     )
 
-    # Keep both title lines centered near the top, with breathing room above them.
     title_duration_us = max(audio_duration_us, 1)
-    title_line1_size = max(5, min(15, round(135 / max(len(title_line1), 1))))
-    title_line2_size = max(5, min(15, round(135 / max(len(title_line2), 1))))
+    title_geometry = _jianying_title_geometry(title_line1, title_line2)
     title_border = draft.TextBorder(
         color=(0.0, 0.0, 0.0),
-        width=20.0,
+        width=40.0,
     )
     if title_line1:
         script.add_track(draft.TrackType.text, "title_line1")
@@ -635,16 +325,16 @@ def create_jianying_native_draft(
             draft.TextSegment(
                 title_line1,
                 draft.Timerange(0, title_duration_us),
-                font=jianying_font,
+                font=jianying_title_font,
                 style=draft.TextStyle(
-                    size=title_line1_size,
+                    size=title_geometry["font_size"],
                     bold=True,
                     color=(1.0, 1.0, 1.0),
                     align=1,
                     auto_wrapping=False,
                 ),
                 border=title_border,
-                clip_settings=draft.ClipSettings(transform_y=0.82),
+                clip_settings=draft.ClipSettings(transform_y=title_geometry["line1_transform_y"]),
             ),
             "title_line1",
         )
@@ -654,9 +344,9 @@ def create_jianying_native_draft(
             draft.TextSegment(
                 title_line2,
                 draft.Timerange(0, title_duration_us),
-                font=jianying_font,
+                font=jianying_title_font,
                 style=draft.TextStyle(
-                    size=title_line2_size,
+                    size=title_geometry["font_size"],
                     bold=True,
                     underline=True,
                     color=(1.0, 0.86, 0.0),
@@ -664,7 +354,7 @@ def create_jianying_native_draft(
                     auto_wrapping=False,
                 ),
                 border=title_border,
-                clip_settings=draft.ClipSettings(transform_y=0.69),
+                clip_settings=draft.ClipSettings(transform_y=title_geometry["line2_transform_y"]),
             ),
             "title_line2",
         )

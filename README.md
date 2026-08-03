@@ -1,16 +1,16 @@
 # VideoGen 短视频草稿生成器
 
-面向纪实解说、历史人物和知识类短视频的本地工作台。系统可以完成文案改写、分镜拆分、图片搜索与管理、配音字幕、上传图片合成封面、MP4 和剪映草稿导出。
+面向纪实解说、历史人物和知识类短视频的本地工作台。系统可以完成文案改写、分镜拆分、图片管理、配音字幕、上传图片合成封面和剪映草稿导出。
 
 ## 主要功能
 
 - AI 改写口播文案并自动拆分分镜
 - 使用腾讯云或 360 图片搜索分镜素材
 - 手动上传、裁剪、去水印和管理素材库
-- 使用 Seedream 生成 1:1 分镜占位图，使用上传图片合成 9:16 视频封面
+- 使用 Seedream 生成 9:16 竖屏分镜图片，使用上传图片合成 9:16 视频封面
 - 使用豆包语音合成模型 2.0 一次性生成完整配音
 - 读取字词级时间戳，生成每条不超过 9 个汉字的字幕
-- 导出 9:16 MP4、PNG 分镜、字幕、时间线和剪映草稿
+- 导出 PNG 分镜、字幕、时间线和剪映草稿
 - 剪映草稿包含缩放组合动画和独立视频封面
 
 ## 环境要求
@@ -40,6 +40,16 @@ MINIMAX_API_KEY=your_minimax_api_key
 MINIMAX_ENDPOINT=https://api.minimaxi.com/v1
 MINIMAX_MODEL=MiniMax-M3
 MINIMAX_IMAGE_MODEL=MiniMax-M3
+
+# DeepSeek：文案界面可选创作模型
+DEEPSEEK_API_KEY=your_deepseek_api_key
+DEEPSEEK_ENDPOINT=https://api.deepseek.com
+DEEPSEEK_MODEL=deepseek-v4-flash
+
+# OpenAI：文案界面可选创作模型
+OPENAI_API_KEY=your_openai_api_key
+OPENAI_ENDPOINT=https://api.openai.com/v1
+OPENAI_MODEL=gpt-5.6
 WHISPERX_COMMAND=whisperx
 WHISPERX_MODEL=small
 WHISPERX_LANGUAGE=zh
@@ -88,6 +98,8 @@ JIANYING_DRAFTS_DIR=E:\JianyingPro Drafts
 | 功能 | 必填变量 |
 | --- | --- |
 | 文案改写、搜索意图和素材库图片识别 | `MINIMAX_API_KEY` |
+| 文案界面选择 DeepSeek 时 | `DEEPSEEK_API_KEY` |
+| 文案界面选择 OpenAI 时 | `OPENAI_API_KEY` |
 | Seedream 分镜图片与去水印 | `ARK_API_KEY` |
 | 腾讯图片搜索 | `TENCENT_CLOUD_SECRET_ID`、`TENCENT_CLOUD_SECRET_KEY` |
 | 豆包配音与时间戳 | `VOLC_TTS_APP_ID`、`VOLC_TTS_ACCESS_KEY` |

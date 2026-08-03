@@ -16,7 +16,7 @@
 - 正式部署采用 Docker Compose：Nginx 静态前端与同域代理、FastAPI 单 worker、宿主机持久化 `storage/`。
 - 由于应用当前没有内置登录鉴权，公网入口必须使用 Cloudflare Access；API 容器不直接发布端口。
 - Nginx 禁止公开 `storage/db.json`、内部日志和隐藏文件；发布前自动备份 storage。
-- Linux 容器安装 FFmpeg 与 Noto CJK，并通过 `VIDEOGEN_FONT_FILE` 指定中文字体；Windows 本地默认行为保持不变。
+- Linux 容器内置 `DouyinSansBold.otf` 作为字幕字体、`龚帆怒放体.ttf` 作为封面标题字体，并保留 Noto CJK 作为缺字回退。
 
 ## LOG
 - 2026-07-14 用户报 bug：上传视频识别标签完成后，顶部 status 徽标仍一直显示“素材已上传，正在识别标签”。

@@ -10,7 +10,6 @@ from services.asset_service import analyze_asset, new_id, safe_storage_name
 from services.match_service import score_asset
 from services.r2_storage import R2StorageError, ensure_asset_local, upload_asset, upload_asset_metadata
 from services.store import ASSETS_DIR, load_db, public_url, save_db
-from services.text_service import keywords_from_text
 
 
 MAX_TAG_LENGTH = {
@@ -62,21 +61,11 @@ def build_material_intent(shot: dict) -> dict:
     ai_scenes = clean_asset_tags("scene", shot.get("scene_tags") or [])
     ai_keywords = clean_asset_tags("keywords", shot.get("keywords") or [])
 
-    # Fill each category independently. A valid scene tag must not prevent an
-    # empty object or keyword category from using its fallback.
+    # Structured storyboard tags are authoritative; do not infer people or
+    # scenes from legacy local keyword lists.
     objects = ai_objects or clean_asset_tags("object", shot.get("required_object") or [])[:4]
     scenes = ai_scenes or clean_asset_tags("scene", shot.get("required_scene") or [])[:3]
     keywords = ai_keywords
-
-    if not objects or not scenes or not keywords:
-        # Last resort: use keywords_from_text (no more "老照片"/"历史档案" defaults)
-        tags = keywords_from_text(f"{shot.get('voice_text', '')} {shot.get('visual_need', '')}")
-        if not objects:
-            objects = [str(x).strip() for x in tags.get("people") or [] if str(x).strip()][:4]
-        if not scenes:
-            scenes = [str(x).strip() for x in tags.get("scene") or [] if str(x).strip()][:3]
-        if not keywords:
-            keywords = clean_asset_tags("keywords", shot.get("search_keywords") or [])[:5]
 
     return {
         "objects": objects,

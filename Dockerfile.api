@@ -19,6 +19,8 @@ RUN python -m pip install --upgrade pip \
     && python -m pip install -r /tmp/requirements.txt
 
 COPY services/api /app/services/api
+COPY assets/DouyinSansBold.otf /app/assets/DouyinSansBold.otf
+COPY assets/龚帆怒放体.ttf /app/assets/龚帆怒放体.ttf
 COPY 二创提示词.txt /app/services/api/二创提示词.txt
 COPY 带书提示词.txt /app/services/api/带书提示词.txt
 

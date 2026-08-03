@@ -9,9 +9,13 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from services.store import PROJECTS_DIR, load_db, project_dir, save_db
-from services.history_workflow_service import STEP_LABELS, generate_history_step, revise_history_step
-from services.text_service import RewriteGenerationError, RewriteQualityError, compare_scripts, extract_opening_hook, generate_guozhijiliang_script, infer_title, merge_short_script_paragraphs, rewrite_script
-from services.web_image_pipeline import DONE_STATUSES, recover_interrupted_searches
+from services.history_workflow_service import (
+    STEP_LABELS,
+    generate_history_step,
+    normalize_history_model_provider,
+    revise_history_step,
+)
+from services.text_service import RewriteGenerationError, RewriteQualityError, compare_scripts, extract_opening_hook, infer_title, merge_short_script_paragraphs, rewrite_script
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 DEFAULT_PROMOTION_BOOK_TITLE = "国之脊梁"
@@ -67,12 +71,6 @@ class ScriptUpdate(BaseModel):
     archived: bool | None = None
 
 
-class AiScriptPayload(BaseModel):
-    person_name: str | None = None
-    event_angle: str | None = None
-    promotion_book_title: str = DEFAULT_PROMOTION_BOOK_TITLE
-
-
 class MergeParagraphsPayload(BaseModel):
     rewritten_script: str
 
@@ -94,6 +92,10 @@ class HistoryChatPayload(BaseModel):
 
 class HistoryBookPayload(BaseModel):
     title: str
+
+
+class HistoryModelPayload(BaseModel):
+    provider: str
 
 
 @router.get("")
@@ -143,6 +145,8 @@ def create_project(payload: ProjectCreate):
         "voice_style": payload.voice_style,
         "video_ratio": payload.video_ratio,
         "promotion_book_title": promotion_book_title,
+        "history_model_provider": "minimax",
+        "storyboard_model_provider": "deepseek",
         "status": "created",
         "archived": False,
         "created_at": now,
@@ -153,23 +157,6 @@ def create_project(payload: ProjectCreate):
     save_db(db)
     project_dir(project_id)
     return {"project_id": project_id, "status": "created", "project": project}
-
-
-@router.post("/generate-ai-script")
-@router.post("/generate-guozhijiliang-script", include_in_schema=False)
-def generate_ai_script(payload: AiScriptPayload | None = None):
-    try:
-        promotion_book_title = normalize_promotion_book_title(
-            payload.promotion_book_title if payload else DEFAULT_PROMOTION_BOOK_TITLE
-        )
-        result = generate_guozhijiliang_script(
-            (payload.person_name if payload else "") or "",
-            (payload.event_angle if payload else "") or "",
-            promotion_book_title,
-        )
-    except Exception as exc:
-        raise HTTPException(502, f"AI script generation failed: {exc}") from exc
-    return {"status": "success", **result}
 
 
 @router.get("/promotion-books")
@@ -215,59 +202,30 @@ def get_project(project_id: str):
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
         raise HTTPException(404, "Project not found")
-    if recover_interrupted_searches(db, project_id):
-        save_db(db)
-
-    if project.get("status") != "searching_images" and (
-        project.get("current_shot_index") is not None
-        or project.get("current_search_keyword")
-    ):
-        project["current_shot_index"] = None
-        project["current_search_keyword"] = ""
-        save_db(db)
-
-    # Fix orphaned shot statuses: if project is not searching, shots stuck in
-    # active search statuses should be reset to failed so the UI doesn't hang
-    if project.get("status") not in ("searching_images",):
-        active_statuses = {"searching", "pending_search", "analyzing_intent"}
-        now = datetime.now().isoformat(timespec="seconds")
-        fixed = False
-        for shot in db["shots"]:
-            if shot.get("project_id") == project_id and shot.get("status") in active_statuses:
-                shot["status"] = "no_image"
-                shot["current_search_keyword"] = ""
-                shot["updated_at"] = now
-                fixed = True
-        if fixed:
-            save_db(db)
-
     shots = [s for s in db["shots"] if s["project_id"] == project_id]
     if project.get("status") == "shots_ready":
-        completed = sum(1 for shot in shots if shot.get("status") in DONE_STATUSES)
+        completed = sum(1 for shot in shots if shot.get("status") in {
+            "ai_generated", "prompt_ready", "uploaded", "matched",
+        })
         if (
-            project.get("search_total") != len(shots)
-            or project.get("search_completed") != completed
-            or (completed == len(shots) and project.get("search_stage") != "done")
+            project.get("generation_total") != len(shots)
+            or project.get("generation_completed") != completed
+            or (completed == len(shots) and project.get("generation_stage") != "done")
         ):
-            project["search_total"] = len(shots)
-            project["search_completed"] = completed
+            project["generation_total"] = len(shots)
+            project["generation_completed"] = completed
             if completed == len(shots):
-                project["search_stage"] = "done"
+                project["generation_stage"] = "done"
             save_db(db)
     generated_assets = [
         a for a in db.get("generated_assets", [])
         if a.get("project_id") == project_id
         and (not a.get("local_path") or Path(str(a.get("local_path"))).exists())
     ]
-    web_image_diagnostics = [
-        item for item in db.get("web_image_diagnostics", [])
-        if item.get("project_id") == project_id
-    ]
     return {
         "project": project,
         "shots": sorted(shots, key=lambda s: s["shot_index"]),
         "generated_assets": generated_assets,
-        "web_image_diagnostics": web_image_diagnostics,
     }
 
 
@@ -340,22 +298,35 @@ def run_history_workflow_step(project_id: str, step: int):
     outputs = dict(workflow.get("outputs") or {})
     messages = dict(workflow.get("messages") or {})
     active_step = int(workflow.get("active_step") or 0)
-    if step > 1 and (active_step != step - 1 or not outputs.get(str(step - 1))):
+    is_regeneration = bool(outputs.get(str(step))) and step <= active_step
+    can_advance = step > 1 and active_step == step - 1 and bool(outputs.get(str(step - 1)))
+    if step > 1 and not (can_advance or is_regeneration):
         raise HTTPException(409, f"请先完成并确认 step{step - 1}")
     if step == 1:
         outputs = {}
         messages = {}
         workflow = {}
+    elif is_regeneration:
+        for invalidated_step in range(step, 4):
+            outputs.pop(str(invalidated_step), None)
+            messages.pop(str(invalidated_step), None)
+    model_provider = normalize_history_model_provider(
+        project.get("history_model_provider") or "minimax"
+    )
     try:
-        output = generate_history_step(
+        generated = generate_history_step(
             step,
             project.get("raw_script", ""),
             outputs,
             messages,
             project.get("promotion_book_title") or DEFAULT_PROMOTION_BOOK_TITLE,
+            model_provider,
+            return_details=step == 2,
         )
     except Exception as exc:
         raise HTTPException(502, f"历史创作 step{step} 生成失败：{exc}") from exc
+    step_two_comparison = generated if step == 2 and isinstance(generated, dict) else None
+    output = str(step_two_comparison.get("final_output") if step_two_comparison else generated)
     now = datetime.now().isoformat(timespec="seconds")
     outputs[str(step)] = output
     messages[str(step)] = []
@@ -364,15 +335,29 @@ def run_history_workflow_step(project_id: str, step: int):
         "status": "awaiting_confirmation",
         "outputs": outputs,
         "messages": messages,
+        "model_provider": model_provider,
         "updated_at": now,
     })
+    if step_two_comparison is not None:
+        workflow["step2_comparison"] = step_two_comparison
+    elif step == 1:
+        workflow.pop("step2_comparison", None)
     project["history_workflow"] = workflow
-    if step >= 2:
+    if step == 1:
+        project["rewritten_script"] = ""
+        project["status"] = "created"
+    else:
         project["rewritten_script"] = output
         project["status"] = "script_ready"
     project["updated_at"] = now
     save_db(db)
-    return {"status": "success", "workflow": workflow, "output": output}
+    return {
+        "status": "success",
+        "workflow": workflow,
+        "output": output,
+        "step2_comparison": step_two_comparison,
+        "regenerated": is_regeneration,
+    }
 
 
 @router.post("/{project_id}/history-workflow/chat")
@@ -393,6 +378,9 @@ def chat_history_workflow(project_id: str, payload: HistoryChatPayload):
     messages = dict(workflow.get("messages") or {})
     step_messages = list(messages.get(str(step)) or [])
     try:
+        model_provider = normalize_history_model_provider(
+            project.get("history_model_provider") or "minimax"
+        )
         assistant_reply = revise_history_step(
             step,
             project.get("raw_script", ""),
@@ -400,6 +388,7 @@ def chat_history_workflow(project_id: str, payload: HistoryChatPayload):
             message,
             step_messages,
             project.get("promotion_book_title") or DEFAULT_PROMOTION_BOOK_TITLE,
+            model_provider,
         )
     except Exception as exc:
         raise HTTPException(502, f"AI 修改失败：{exc}") from exc
@@ -412,6 +401,7 @@ def chat_history_workflow(project_id: str, payload: HistoryChatPayload):
     workflow.update({
         "outputs": outputs,
         "messages": messages,
+        "model_provider": model_provider,
         "status": "awaiting_confirmation",
         "updated_at": now,
     })
@@ -424,6 +414,28 @@ def chat_history_workflow(project_id: str, payload: HistoryChatPayload):
         "output": current_output,
         "assistant_message": assistant_reply,
     }
+
+
+@router.post("/{project_id}/history-workflow/model")
+def select_history_workflow_model(project_id: str, payload: HistoryModelPayload):
+    try:
+        provider = normalize_history_model_provider(payload.provider)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    db = load_db()
+    project = next((p for p in db["projects"] if p["id"] == project_id), None)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    now = datetime.now().isoformat(timespec="seconds")
+    workflow = dict(project.get("history_workflow") or {})
+    if workflow:
+        workflow["model_provider"] = provider
+        workflow["updated_at"] = now
+        project["history_workflow"] = workflow
+    project["history_model_provider"] = provider
+    project["updated_at"] = now
+    save_db(db)
+    return {"status": "success", "provider": provider, "workflow": workflow}
 
 
 @router.post("/{project_id}/history-workflow/book")
