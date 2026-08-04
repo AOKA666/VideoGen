@@ -2220,11 +2220,19 @@ h3 { font-size: 16px; line-height: 1.48; }
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  min-width: 0;
 }
 .image-preview-head strong {
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.image-preview-head .image-preview-actions {
+  flex: 0 0 auto;
+}
+.image-preview-head .image-preview-actions button {
   white-space: nowrap;
 }
 .image-preview img,

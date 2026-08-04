@@ -8,6 +8,7 @@ import threading
 from io import BytesIO
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
@@ -202,10 +203,13 @@ def download_generated_image_png(project_id: str, asset_id: str):
         raise HTTPException(500, f"PNG conversion failed: {exc}") from exc
 
     filename = f"{Path(str(asset.get('file_name') or path.name)).stem}.png"
+    encoded_filename = quote(filename, safe="")
     return StreamingResponse(
         output,
         media_type="image/png",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        # HTTP response headers must remain ASCII/Latin-1 encodable. RFC 5987's
+        # filename* form preserves Chinese and other Unicode download names.
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"},
     )
 
 

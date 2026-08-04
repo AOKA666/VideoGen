@@ -242,7 +242,7 @@ function CoverTitleEditor({ imageUrl, line1, line2, positions, onChange }) {
     const startY = event.clientY;
     const start = { ...positions[key] };
 
-    const handleMove = (moveEvent) => {
+    const applyInteraction = (moveEvent) => {
       const dx = moveEvent.clientX - startX;
       const dy = moveEvent.clientY - startY;
       if (mode === 'resize') {
@@ -259,12 +259,22 @@ function CoverTitleEditor({ imageUrl, line1, line2, positions, onChange }) {
         y: Math.max(0.03, Math.min(0.97, start.y + dy / rect.height)),
       });
     };
-    const handleUp = () => {
+    const handleMove = (moveEvent) => applyInteraction(moveEvent);
+    const cleanup = () => {
       window.removeEventListener('pointermove', handleMove);
       window.removeEventListener('pointerup', handleUp);
+      window.removeEventListener('pointercancel', handleCancel);
     };
+    const handleUp = (upEvent) => {
+      // Some browsers do not emit a final pointermove before pointerup. Applying
+      // the release coordinates keeps the last visible size as the saved value.
+      applyInteraction(upEvent);
+      cleanup();
+    };
+    const handleCancel = () => cleanup();
     window.addEventListener('pointermove', handleMove);
-    window.addEventListener('pointerup', handleUp, { once: true });
+    window.addEventListener('pointerup', handleUp);
+    window.addEventListener('pointercancel', handleCancel);
   }
 
   return (
@@ -351,6 +361,7 @@ function App() {
   const [coverImage, setCoverImage] = useState(null);
   const [coverImagePreviewUrl, setCoverImagePreviewUrl] = useState('');
   const [coverTitlePositions, setCoverTitlePositions] = useState(DEFAULT_COVER_TITLE_POSITIONS);
+  const projectCoverTitlePositionsKey = JSON.stringify(project?.cover_title_positions ?? null);
   const [backgroundMusicId, setBackgroundMusicId] = useState('');
   const [backgroundMusicStart, setBackgroundMusicStart] = useState(0);
   const [backgroundMusicVolume, setBackgroundMusicVolume] = useState(20);
@@ -588,7 +599,7 @@ function App() {
     project?.publish_description,
     project?.cover_url,
     project?.cover_source_url,
-    project?.cover_title_positions,
+    projectCoverTitlePositionsKey,
     project?.background_music_id,
     project?.background_music_start_sec,
     project?.background_music_volume,
