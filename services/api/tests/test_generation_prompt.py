@@ -63,6 +63,18 @@ class ImagePromptTests(unittest.TestCase):
         self.assertEqual("第一段。", plan[0]["voice_text"])
         self.assertEqual("文士在岔路前驻足沉思。", plan[1]["visual_need"])
 
+    def test_storyboard_plan_parser_rejects_nested_sub_storyboards(self) -> None:
+        content = """分镜6：转折
+文案对应：
+<旁白>队伍在山谷间迂回前进。</旁白>
+图片提示词：
+<提示词>【分镜 6-1】队伍渡河。【分镜 6-2】队伍穿过密林。</提示词>"""
+
+        plan = _parse_storyboard_plan(content)
+
+        self.assertEqual(1, len(plan))
+        self.assertEqual("", plan[0]["visual_need"])
+
     def test_storyboard_end_quotes_split_original_script_without_rewriting(self) -> None:
         script = "第一段原文。\n\n第二段原文。\n第三段原文。"
         plan = [
@@ -119,6 +131,23 @@ class ImagePromptTests(unittest.TestCase):
         self.assertEqual("第1段。", shots[0]["voice_text"])
         self.assertEqual("第6幅具体画面", shots[5]["visual_need"])
 
+    def test_generate_shots_regenerates_only_invalid_visuals(self) -> None:
+        plan = [
+            {"shot_index": index, "voice_text": f"第{index}段。", "visual_need": f"第{index}幅具体画面"}
+            for index in range(1, 7)
+        ]
+        plan[5]["visual_need"] = ""
+        with patch("services.text_service.ai_generate_storyboard_plan", return_value=plan), patch(
+            "services.text_service.ai_generate_shot_visuals",
+            return_value={"6": {"visual_need": "单一的第6幅具体画面"}},
+        ) as regenerate_visuals:
+            shots = generate_shots("".join(item["voice_text"] for item in plan))
+
+        requested_shots = regenerate_visuals.call_args.args[0]
+        self.assertEqual([6], [shot["shot_index"] for shot in requested_shots])
+        self.assertEqual("第1幅具体画面", shots[0]["visual_need"])
+        self.assertEqual("单一的第6幅具体画面", shots[5]["visual_need"])
+
     def test_local_narration_fallback_honors_ai_selected_shot_count(self) -> None:
         script = "".join(f"第{index}段讲述一个转折。" for index in range(1, 20))
 
@@ -132,7 +161,9 @@ class ImagePromptTests(unittest.TestCase):
 
         self.assertTrue(prompt.startswith("9:16竖屏，新国风宋式水墨工笔"))
         self.assertIn("古绢泛黄宣纸底色", prompt)
-        self.assertIn("柔和均匀殿内柔光，无强烈明暗对比", prompt)
+        self.assertIn("无强烈明暗对比", prompt)
+        self.assertNotIn("殿内柔光", prompt)
+        self.assertNotIn("古朴木质立柱", prompt)
         self.assertIn("人物为中国古风", prompt)
         self.assertIn("纯手绘国画质感，无厚涂油画笔触，无CG塑料感", prompt)
         self.assertIn("画面全程无任何文字、字幕、水印、logo", prompt)
@@ -360,6 +391,41 @@ class ImagePromptTests(unittest.TestCase):
 
         self.assertEqual("大殿内，老臣展开奏章", result["1"]["visual_need"])
         self.assertEqual("宫门外，骑兵冒雨抵达", result["2"]["visual_need"])
+
+    def test_nested_sub_storyboards_are_retried_for_single_shot(self) -> None:
+        responses = iter([
+            "【分镜 6-1】队伍渡河。【分镜 6-2】队伍穿过密林。",
+            "俯瞰山谷，队伍沿河岸快速迂回前进。",
+        ])
+
+        class FakeResponse:
+            def __init__(self, content):
+                self.content = content
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "choices": [{"message": {"content": self.content}}],
+                }, ensure_ascii=False).encode("utf-8")
+
+        def fake_urlopen(_request, timeout=None):
+            return FakeResponse(next(responses))
+
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}), patch(
+            "services.text_service.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ) as urlopen:
+            result = ai_generate_shot_visuals([
+                {"shot_index": 6, "voice_text": "队伍在山谷间迂回前进。"},
+            ], "队伍在山谷间迂回前进。")
+
+        self.assertEqual(2, urlopen.call_count)
+        self.assertEqual("俯瞰山谷，队伍沿河岸快速迂回前进。", result["6"]["visual_need"])
 
 
 if __name__ == "__main__":

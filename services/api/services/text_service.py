@@ -2287,11 +2287,29 @@ LOGGER = logging.getLogger(__name__)
 
 STORYBOARD_STYLE_GUIDANCE = (
     "9:16竖屏，新国风宋式水墨工笔，古绢泛黄宣纸底色，传统国画白描线条，"
-    "淡墨晕染肌理，低饱和赭石暖金配色，柔和均匀殿内柔光，无强烈明暗对比，"
-    "人物为中国古风，线条细腻流畅，古朴木质立柱，画面庄重肃穆，构图居中均衡，"
+    "淡墨晕染肌理，低饱和赭石暖金配色，无强烈明暗对比，"
+    "人物线条细腻流畅，画面庄重肃穆，构图居中均衡，"
     "纯手绘国画质感，无厚涂油画笔触，无CG塑料感，画面全程无任何文字、字幕、"
     "水印、logo，干净留白古画氛围感"
 )
+
+
+NESTED_STORYBOARD_MARKER = re.compile(
+    r"(?:【\s*)?分镜\s*\d+\s*[-—–_]\s*\d+(?:\s*】)?",
+    flags=re.IGNORECASE,
+)
+STORYBOARD_LABEL_MARKER = re.compile(
+    r"(?:【\s*)?(?:分镜|镜头)\s*(?:\d+|[一二三四五六七八九十]+)(?:\s*】)?",
+    flags=re.IGNORECASE,
+)
+
+
+def _contains_nested_storyboards(prompt: str) -> bool:
+    """Return whether a supposed single-image prompt contains sub-storyboards."""
+    text = str(prompt or "")
+    return bool(NESTED_STORYBOARD_MARKER.search(text)) or len(
+        STORYBOARD_LABEL_MARKER.findall(text)
+    ) > 1
 
 
 def _build_storyboard_plan_prompt(full_script: str) -> str:
@@ -2301,6 +2319,8 @@ def _build_storyboard_plan_prompt(full_script: str) -> str:
 {STORYBOARD_STYLE_GUIDANCE}
 
 所有分镜画面中都禁止出现任何可读文字，包括标题、字幕、书名、牌匾文字、奏章文字、纸张文字、屏幕文字、印章文字、标语、logo和水印。需要出现书籍、匾额、信件、奏章或屏幕时，只表现无字外观，不要描述任何文字内容。
+
+每个分镜的图片提示词只能描述一个明确瞬间和一个构图，禁止在一条提示词中继续拆分子分镜，禁止输出“分镜6-1”“镜头一/镜头二”或多幅画面方案。
 
 完整文案：
 {full_script}
@@ -2362,7 +2382,9 @@ def _parse_storyboard_plan(content: str) -> list[dict[str, str]]:
         image_prompt = re.sub(
             r"\s+", " ", str(prompt_match.group(1) if prompt_match else "")
         ).strip()
-        if shot_index and (narration or end_quote) and image_prompt:
+        if _contains_nested_storyboards(image_prompt):
+            image_prompt = ""
+        if shot_index and (narration or end_quote):
             parsed.append({
                 "shot_index": shot_index,
                 "voice_text": narration,
@@ -2531,6 +2553,8 @@ def _build_shot_visuals_prompt(shot_items: list[dict], full_script: str) -> str:
 
 所有画面都禁止出现任何可读文字。书籍、匾额、信件、奏章、纸张和屏幕只能呈现无字外观，不要在图片提示词中设计标题、字幕、书名、标语、logo或水印。
 
+每条图片提示词只能描述一个明确瞬间和一个构图，禁止继续拆分子分镜，禁止输出“分镜6-1”“镜头一/镜头二”或多幅画面方案。
+
 按分镜编号顺序逐条写出图片提示词，能清楚区分每个分镜即可。直接输出结果，不要返回 JSON，也不要解释创作过程。""".strip()
 
 
@@ -2555,7 +2579,7 @@ def _parse_storyboard_prompt_lines(
             match.group(2),
         )
         image_prompt = re.sub(r"\s+", " ", image_prompt).strip()
-        if image_prompt:
+        if image_prompt and not _contains_nested_storyboards(image_prompt):
             parsed[shot_id] = image_prompt
     if parsed:
         ids = [str(item) for item in (expected_ids or [])]
@@ -2566,7 +2590,10 @@ def _parse_storyboard_prompt_lines(
     ids = [str(item) for item in (expected_ids or [])]
     if len(ids) == 1 and raw:
         prompt = re.sub(r"^\s*(?:图片)?提示词\s*[：:]\s*", "", raw)
-        return {ids[0]: re.sub(r"\s+", " ", prompt).strip()}
+        prompt = re.sub(r"\s+", " ", prompt).strip()
+        if prompt and not _contains_nested_storyboards(prompt):
+            return {ids[0]: prompt}
+        return {}
 
     blocks = [
         re.sub(r"^\s*[-•]\s*", "", item).strip()
@@ -2577,6 +2604,7 @@ def _parse_storyboard_prompt_lines(
         return {
             shot_id: re.sub(r"\s+", " ", prompt).strip()
             for shot_id, prompt in zip(ids, blocks)
+            if not _contains_nested_storyboards(prompt)
         }
     return parsed
 
@@ -2585,6 +2613,7 @@ def ai_generate_shot_visuals(
     shots: list[dict],
     full_script: str,
     model_provider: str = "deepseek",
+    _semantic_retries: int = 1,
 ) -> dict[str, dict]:
     """Ask the selected model for one image prompt per storyboard shot."""
     provider = normalize_storyboard_model_provider(model_provider)
@@ -2683,6 +2712,19 @@ def ai_generate_shot_visuals(
                     model_provider=provider,
                 ))
         elif missing_shots:
+            if _semantic_retries > 0:
+                LOGGER.warning(
+                    "%s returned an invalid prompt for shot %s; requesting it again",
+                    provider_label,
+                    missing_shots[0]["shot_index"],
+                )
+                all_visuals.update(ai_generate_shot_visuals(
+                    missing_shots,
+                    full_script,
+                    model_provider=provider,
+                    _semantic_retries=_semantic_retries - 1,
+                ))
+                continue
             raise RuntimeError(
                 f"{provider_label} returned an empty prompt for shot {missing_shots[0]['shot_index']}"
             )
@@ -3126,8 +3168,8 @@ def generate_shots(
 
     missing_visuals = [shot for shot in shots if not shot["visual_need"]]
     if missing_visuals:
-        visuals = ai_generate_shot_visuals(shots, script, model_provider=provider)
-        for shot in shots:
+        visuals = ai_generate_shot_visuals(missing_visuals, script, model_provider=provider)
+        for shot in missing_visuals:
             visual = visuals.get(str(shot["shot_index"]))
             if not visual or not visual.get("visual_need"):
                 raise RuntimeError(f"{provider} did not return shot {shot['shot_index']}")
