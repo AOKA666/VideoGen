@@ -599,6 +599,7 @@ def generate_cover(
     project_id: str,
     file: UploadFile | None = File(None),
     title_positions: str = Form(""),
+    mask_opacity: float = Form(0.35),
 ):
     db = load_db()
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
@@ -632,7 +633,15 @@ def generate_cover(
         except json.JSONDecodeError as exc:
             raise ValueError("Invalid cover title positions") from exc
         positions = normalize_cover_title_positions(raw_positions)
-        compose_uploaded_cover(source_path, cover_path, title_line1, title_line2, positions)
+        normalized_mask_opacity = max(0.0, min(0.8, float(mask_opacity)))
+        compose_uploaded_cover(
+            source_path,
+            cover_path,
+            title_line1,
+            title_line2,
+            positions,
+            normalized_mask_opacity,
+        )
     except Exception as exc:
         raise HTTPException(400, f"Cover image processing failed: {exc}") from exc
 
@@ -646,6 +655,7 @@ def generate_cover(
         "cover_provider": "uploaded_image",
         "cover_model": "pillow_composite",
         "cover_title_positions": positions,
+        "cover_mask_opacity": normalized_mask_opacity,
         "cover_updated_at": now,
         "updated_at": now,
     })
@@ -659,6 +669,7 @@ def generate_cover(
         "model": project["cover_model"],
         "image_size": "1080x1920",
         "title_positions": positions,
+        "mask_opacity": normalized_mask_opacity,
     }
 
 

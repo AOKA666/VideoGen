@@ -94,6 +94,24 @@ class CoverCompositionTests(unittest.TestCase):
         self.assertEqual({"x": 0.03, "y": 0.97, "font_size": 260}, positions["line1"])
         self.assertEqual(124, positions["line2"]["font_size"])
 
+    def test_cover_applies_black_mask_below_title(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_path = root / "source.png"
+            output_path = root / "cover.png"
+            Image.new("RGB", (90, 160), (200, 100, 50)).save(source_path)
+
+            compose_uploaded_cover(
+                source_path,
+                output_path,
+                "标题一",
+                "标题二",
+                mask_opacity=0.5,
+            )
+
+            with Image.open(output_path) as cover:
+                self.assertEqual((100, 50, 25), cover.getpixel((12, 1200)))
+
 
 if __name__ == "__main__":
     unittest.main()

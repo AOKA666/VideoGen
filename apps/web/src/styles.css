@@ -1548,9 +1548,21 @@ h3 { font-size: 16px; line-height: 1.48; }
   object-fit: contain;
   pointer-events: none;
 }
+.cover-image-mask {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background: #000;
+  pointer-events: none;
+}
+.cover-mask-control {
+  display: grid;
+  gap: 7px;
+}
+.cover-mask-control small { color: var(--muted); }
 .cover-title-box {
   position: absolute;
-  z-index: 1;
+  z-index: 2;
   min-width: 80px;
   padding: .08em .18em;
   transform: translate(-50%, -50%);
@@ -1877,6 +1889,7 @@ h3 { font-size: 16px; line-height: 1.48; }
   animation: aiWandSpin .9s linear infinite;
 }
 .shot-card p { color: #56626a; line-height: 1.62; }
+.shot-visual-description { margin-top: 28px; }
 .shot-voice-display {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

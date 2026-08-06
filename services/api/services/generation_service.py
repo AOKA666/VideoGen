@@ -618,6 +618,7 @@ def compose_uploaded_cover(
     line1: str,
     line2: str,
     title_positions: dict | None = None,
+    mask_opacity: float = 0.0,
 ) -> None:
     """Compose a full 9:16 cover without cropping the uploaded image."""
     canvas_width, canvas_height = 1080, 1920
@@ -638,6 +639,13 @@ def compose_uploaded_cover(
             (canvas_height - fitted_cover.height) // 2,
         ),
     )
+    normalized_mask_opacity = max(0.0, min(0.8, float(mask_opacity)))
+    if normalized_mask_opacity:
+        canvas = Image.blend(
+            canvas,
+            Image.new("RGB", canvas.size, (0, 0, 0)),
+            normalized_mask_opacity,
+        )
     draw = ImageDraw.Draw(canvas)
 
     _draw_cover_title(draw, canvas_width, canvas_height, line1, line2, title_positions)

@@ -218,7 +218,7 @@ function normalizeCoverTitlePositions(value) {
   }));
 }
 
-function CoverTitleEditor({ imageUrl, line1, line2, positions, onChange }) {
+function CoverTitleEditor({ imageUrl, line1, line2, positions, maskOpacity, onChange }) {
   const canvasRef = useRef(null);
   const [canvasWidth, setCanvasWidth] = useState(405);
 
@@ -280,6 +280,11 @@ function CoverTitleEditor({ imageUrl, line1, line2, positions, onChange }) {
   return (
     <div className="cover-title-editor" ref={canvasRef}>
       <img src={imageUrl} alt="封面人物图片" draggable="false" />
+      <div
+        className="cover-image-mask"
+        style={{ opacity: Math.max(0, Math.min(100, Number(maskOpacity) || 0)) / 100 }}
+        aria-hidden="true"
+      />
       {[
         ['line1', line1, '第一行标题'],
         ['line2', line2, '第二行标题'],
@@ -361,6 +366,7 @@ function App() {
   const [coverImage, setCoverImage] = useState(null);
   const [coverImagePreviewUrl, setCoverImagePreviewUrl] = useState('');
   const [coverTitlePositions, setCoverTitlePositions] = useState(DEFAULT_COVER_TITLE_POSITIONS);
+  const [coverMaskOpacity, setCoverMaskOpacity] = useState(35);
   const projectCoverTitlePositionsKey = JSON.stringify(project?.cover_title_positions ?? null);
   const [backgroundMusicId, setBackgroundMusicId] = useState('');
   const [backgroundMusicStart, setBackgroundMusicStart] = useState(0);
@@ -583,6 +589,7 @@ function App() {
     setPublishDescription(project.publish_description || '');
     setCoverImage(null);
     setCoverTitlePositions(normalizeCoverTitlePositions(project.cover_title_positions));
+    setCoverMaskOpacity(Math.round(Number(project.cover_mask_opacity ?? 0.35) * 100));
     setBackgroundMusicId(project.background_music_id || '');
     setBackgroundMusicStart(Number(project.background_music_start_sec || 0));
     setBackgroundMusicVolume(Math.round(Number(project.background_music_volume ?? 0.2) * 100));
@@ -600,6 +607,7 @@ function App() {
     project?.cover_url,
     project?.cover_source_url,
     projectCoverTitlePositionsKey,
+    project?.cover_mask_opacity,
     project?.background_music_id,
     project?.background_music_start_sec,
     project?.background_music_volume,
@@ -1525,6 +1533,7 @@ function App() {
     const data = new FormData();
     if (coverImage) data.append('file', coverImage, coverImage.name);
     data.append('title_positions', JSON.stringify(coverTitlePositions));
+    data.append('mask_opacity', String(coverMaskOpacity / 100));
     const result = await run('生成视频封面', () => request(`/api/projects/${projectId}/generate-cover`, {
       method: 'POST',
       body: data,
@@ -1552,7 +1561,7 @@ function App() {
     document.body.appendChild(link);
     link.click();
     link.remove();
-    setMessage('已应用当前标题位置和大小，封面下载已开始');
+    setMessage('已应用当前标题位置、大小和遮罩透明度，封面下载已开始');
   }
 
   function updateVoiceVolume(value) {
@@ -2511,7 +2520,7 @@ function App() {
               {/* Step 2: Cover Generation (only after title is confirmed) */}
               <div className="cover-section">
                 <h3>第二步 · 生成封面</h3>
-                <p className="cover-layout-note">封面保持完整的 9:16 竖屏画面，不做裁剪；标题使用龚帆怒放体。上传图片后，可在右侧分别拖动两行标题，拖动选框右下角可调整大小。</p>
+                <p className="cover-layout-note">封面保持完整的 9:16 竖屏画面，不做裁剪；图片上方会叠加黑色遮罩，标题显示在遮罩上层。上传图片后，可在右侧分别拖动两行标题，拖动选框右下角可调整大小。</p>
                 <input
                   ref={coverInputRef}
                   className="hidden-input"
@@ -2527,6 +2536,18 @@ function App() {
                   <ImagePlus size={18} /> {coverImage ? '更换人物图片' : '上传人物图片'}
                 </button>
                 {coverImage && <small className="cover-file-name">{coverImage.name}</small>}
+                <label className="cover-mask-control">
+                  遮罩不透明度：{coverMaskOpacity}%
+                  <input
+                    type="range"
+                    min="0"
+                    max="80"
+                    step="1"
+                    value={coverMaskOpacity}
+                    onChange={(event) => setCoverMaskOpacity(Number(event.target.value))}
+                  />
+                  <small>数值越高，背景越暗，标题越醒目。</small>
+                </label>
                 <div className="actions">
                   <button
                     className="primary"
@@ -2688,6 +2709,7 @@ function App() {
                     line1={titleLine1}
                     line2={titleLine2}
                     positions={coverTitlePositions}
+                    maskOpacity={coverMaskOpacity}
                     onChange={updateCoverTitlePosition}
                   />
                   <small className="cover-editor-hint">拖动标题框调整位置，拖动右下角圆点调整字号</small>
@@ -3323,10 +3345,7 @@ function ShotCard({
             <button type="button" onClick={() => setEditingVoiceText(true)}>编辑镜头文案</button>
           </div>
         )}
-        <p>画面描述：{shot.visual_need || '暂无描述'}</p>
-        <p>主体标签：{((shot.material_intent?.objects?.length ? shot.material_intent.objects : shot.object_tags) || shot.required_object || []).join(' / ') || '—'}</p>
-        <p>场景标签：{((shot.material_intent?.scenes?.length ? shot.material_intent.scenes : shot.scene_tags) || shot.required_scene || []).join(' / ') || '—'}</p>
-        <p>关键词：{((shot.material_intent?.keywords?.length ? shot.material_intent.keywords : shot.keywords) || []).join(' / ') || '—'}</p>
+        <p className="shot-visual-description">画面描述：{shot.visual_need || '暂无描述'}</p>
         {savedImagePrompt && (
           <div className="saved-image-prompt">
             <div>
