@@ -24,7 +24,8 @@ from services.generation_service import (
     compose_uploaded_cover,
     convert_music_to_main_voice,
     expected_lyrics_from_shots,
-    generate_doubao_image,
+    generate_ai_image,
+    normalize_image_generation_provider,
     generate_export_srt,
     lrc_from_lines,
     remove_watermark_with_seedream,
@@ -60,6 +61,7 @@ def _first_script_sentence(text: str) -> str:
 
 class ImageGenerationPayload(BaseModel):
     prompt: str | None = None
+    provider: str | None = None
 
 
 class SquareCropPayload(BaseModel):
@@ -386,9 +388,16 @@ def generate_image(project_id: str, shot_id: str, payload: ImageGenerationPayloa
     shot = next((s for s in db["shots"] if s["project_id"] == project_id and s["id"] == shot_id), None)
     if not shot:
         raise HTTPException(404, "Shot not found")
+    project = next((p for p in db["projects"] if p["id"] == project_id), None)
+    try:
+        provider = normalize_image_generation_provider(
+            payload.provider if payload and payload.provider else (project or {}).get("image_generation_provider")
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     out = project_dir(project_id) / "images" / f"shot_{shot['shot_index']:03d}.png"
     try:
-        result = generate_doubao_image(out, shot, "9:16", payload.prompt if payload else None)
+        result = generate_ai_image(out, shot, "9:16", payload.prompt if payload else None, provider)
     except Exception as exc:
         raise HTTPException(502, str(exc)) from exc
     prompt = result["prompt"]
@@ -423,6 +432,9 @@ def generate_image(project_id: str, shot_id: str, payload: ImageGenerationPayloa
         shot["asset_source"] = "ai_generated"
         shot["image_prompt"] = prompt
         shot["status"] = "ai_generated"
+        project = next((p for p in db["projects"] if p["id"] == project_id), None)
+        if project:
+            project["image_generation_provider"] = provider
         save_db(db)
     return {
         "shot_id": shot_id,

@@ -39,7 +39,7 @@ class ManualAiImageConcurrencyTests(unittest.TestCase):
                 state.clear()
                 state.update(copy.deepcopy(value))
 
-        def fake_generate(path, shot, ratio, prompt):
+        def fake_generate(path, shot, ratio, prompt, provider):
             generation_barrier.wait(timeout=2)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(shot["id"].encode())
@@ -51,7 +51,7 @@ class ManualAiImageConcurrencyTests(unittest.TestCase):
         ), patch("routers.generation.save_db", side_effect=fake_save_db), patch(
             "routers.generation.project_dir",
             return_value=Path(temp_dir),
-        ), patch("routers.generation.generate_doubao_image", side_effect=fake_generate), patch(
+        ), patch("routers.generation.generate_ai_image", side_effect=fake_generate), patch(
             "routers.generation.public_url",
             side_effect=lambda path: f"/{path.name}",
         ):
@@ -61,7 +61,7 @@ class ManualAiImageConcurrencyTests(unittest.TestCase):
                         generate_image,
                         project_id,
                         f"shot-{index}",
-                        ImageGenerationPayload(prompt=f"prompt-{index}"),
+                        ImageGenerationPayload(prompt=f"prompt-{index}", provider="openai"),
                     )
                     for index in (1, 2)
                 ]
@@ -70,6 +70,7 @@ class ManualAiImageConcurrencyTests(unittest.TestCase):
         self.assertEqual(2, len(results))
         self.assertEqual(2, len(state["generated_assets"]))
         self.assertTrue(all(shot["status"] == "ai_generated" for shot in state["shots"]))
+        self.assertTrue(all(asset["provider"] == "test" for asset in state["generated_assets"]))
 
 
 if __name__ == "__main__":

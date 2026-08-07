@@ -15,6 +15,10 @@ const HISTORY_MODEL_LABELS = {
   deepseek: 'DeepSeek',
   openai: 'OpenAI',
 };
+const IMAGE_GENERATION_PROVIDER_LABELS = {
+  seedream: 'Seedream',
+  openai: 'OpenAI',
+};
 const MAX_VOICE_VOLUME_PERCENT = 200;
 const DEFAULT_COVER_TITLE_POSITIONS = {
   line1: { x: 0.5, y: 0.18, font_size: 124 },
@@ -350,6 +354,7 @@ function App() {
   const [imagePromptEditors, setImagePromptEditors] = useState({});
   const [materialSourceStrategy, setMaterialSourceStrategy] = useState('ai_only');
   const [storyboardModelProvider, setStoryboardModelProvider] = useState('deepseek');
+  const [imageGenerationProvider, setImageGenerationProvider] = useState('seedream');
   const [voiceType, setVoiceType] = useState(VOICE_OPTIONS[0].value);
   const [speechRate, setSpeechRate] = useState(0);
   const [voicePreviewUrl, setVoicePreviewUrl] = useState('');
@@ -512,6 +517,7 @@ function App() {
       setProjectId(id);
       setHistoryBookTitle(formatPromotionBookTitle(projectData.project.promotion_book_title));
       setStoryboardModelProvider(projectData.project.storyboard_model_provider || 'deepseek');
+      setImageGenerationProvider(projectData.project.image_generation_provider || 'seedream');
     } else {
       setProject(null);
       setShots([]);
@@ -527,6 +533,7 @@ function App() {
     setShots(data.shots);
     setGeneratedAssets(data.generated_assets || []);
     setStoryboardModelProvider(data.project.storyboard_model_provider || 'deepseek');
+    setImageGenerationProvider(data.project.image_generation_provider || 'seedream');
   }
 
 
@@ -1069,7 +1076,7 @@ function App() {
         body: JSON.stringify({ rewritten_script: paragraphs.join('\n\n') }),
       });
       await request(
-        `/api/projects/${projectId}/shots?material_source_strategy=${materialSourceStrategy}&storyboard_model_provider=${storyboardModelProvider}`,
+        `/api/projects/${projectId}/shots?material_source_strategy=${materialSourceStrategy}&storyboard_model_provider=${storyboardModelProvider}&image_generation_provider=${imageGenerationProvider}`,
         { method: 'POST' },
       );
       await refreshAll(projectId);
@@ -1092,7 +1099,7 @@ function App() {
         body: JSON.stringify({ rewritten_script: project.raw_script }),
       });
       await request(
-        `/api/projects/${projectId}/shots?material_source_strategy=${materialSourceStrategy}&storyboard_model_provider=${storyboardModelProvider}`,
+        `/api/projects/${projectId}/shots?material_source_strategy=${materialSourceStrategy}&storyboard_model_provider=${storyboardModelProvider}&image_generation_provider=${imageGenerationProvider}`,
         { method: 'POST' },
       );
       await refreshAll(projectId);
@@ -1251,7 +1258,10 @@ function App() {
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ prompt: String(prompt).trim() }),
+          body: JSON.stringify({
+            prompt: String(prompt).trim(),
+            provider: imageGenerationProvider,
+          }),
         },
       );
       closeImagePromptEditor(shotId);
@@ -2017,6 +2027,15 @@ function App() {
                   <option value="openai">OpenAI</option>
                 </select>
               </label>
+              {materialSourceStrategy === 'ai_only' && (
+                <label className="source-strategy">
+                  出图模型
+                  <select value={imageGenerationProvider} onChange={(event) => setImageGenerationProvider(event.target.value)}>
+                    <option value="seedream">Seedream</option>
+                    <option value="openai">OpenAI</option>
+                  </select>
+                </label>
+              )}
               <div className="actions raw-script-actions">
                 <button
                   className="primary"
@@ -2246,6 +2265,15 @@ function App() {
                       <option value="openai">OpenAI</option>
                     </select>
                   </label>
+                  {materialSourceStrategy === 'ai_only' && (
+                    <label className="source-strategy">
+                      出图模型
+                      <select value={imageGenerationProvider} onChange={(event) => setImageGenerationProvider(event.target.value)}>
+                        <option value="seedream">Seedream</option>
+                        <option value="openai">OpenAI</option>
+                      </select>
+                    </label>
+                  )}
                   <button type="button" className="primary" onClick={() => generateShots()}>
                     <Archive size={17} /> 生成分镜
                   </button>
@@ -2259,6 +2287,13 @@ function App() {
           <section className="band">
             <div className="storyboard-actions">
               <div className="storyboard-action-buttons">
+                <label className="storyboard-model-picker">
+                  出图模型
+                  <select value={imageGenerationProvider} onChange={(event) => setImageGenerationProvider(event.target.value)}>
+                    <option value="seedream">Seedream</option>
+                    <option value="openai">OpenAI</option>
+                  </select>
+                </label>
                 <label className="storyboard-model-picker">
                   提示词模型
                   <select value={storyboardModelProvider} onChange={(event) => setStoryboardModelProvider(event.target.value)}>
@@ -2297,7 +2332,11 @@ function App() {
               </div>
               <small>优先保存已选图片；未选择时保存该镜头第一张，重复图片自动跳过。</small>
             </div>
-            <StoryboardProgress progress={generationProgress} project={project} />
+            <StoryboardProgress
+              progress={generationProgress}
+              project={project}
+              imageGenerationProvider={imageGenerationProvider}
+            />
             <div className="shot-list">
               {shots.map((shot) => (
                 <ShotCard
@@ -2306,6 +2345,7 @@ function App() {
                   assets={generatedAssetsByShot.get(shot.id) || []}
                   selectedAssetId={shot.selected_asset_id}
                   project={project}
+                  imageGenerationProvider={imageGenerationProvider}
                   onSelect={(assetId, assetSource) => selectAsset(shot.id, assetId, assetSource)}
                   onPreview={setPreviewAsset}
                   imagePrompt={imagePromptEditors[shot.id]}
@@ -2397,6 +2437,7 @@ function App() {
                     assets={generatedAssetsByShot.get(shot.id) || []}
                     selectedAssetId={shot.selected_asset_id}
                     project={project}
+                    imageGenerationProvider={imageGenerationProvider}
                     onSelect={(assetId, assetSource) => selectAsset(shot.id, assetId, assetSource)}
                     onPreview={setPreviewAsset}
                     imagePrompt={imagePromptEditors[shot.id]}
@@ -3032,7 +3073,7 @@ function SpeechRateSelect({ value, onChange }) {
   );
 }
 
-function StoryboardProgress({ progress, project }) {
+function StoryboardProgress({ progress, project, imageGenerationProvider = 'seedream' }) {
   const generating = ['generating_shots', 'generating_images'].includes(project?.status);
   const promptOnly = project?.material_source_strategy === 'prompt_only';
   const label = progress.total
@@ -3044,7 +3085,9 @@ function StoryboardProgress({ progress, project }) {
       <div className="progress-row">
         <strong>
           分镜{promptOnly ? '提示词' : '图片'}进度
-          <span className="provider-badge">{promptOnly ? 'AI 提示词' : 'Seedream AI 出图'}</span>
+          <span className="provider-badge">
+            {promptOnly ? 'AI 提示词' : `${IMAGE_GENERATION_PROVIDER_LABELS[imageGenerationProvider]} AI 出图`}
+          </span>
         </strong>
         <div className="progress-actions">
           <span>{label}</span>
@@ -3282,6 +3325,7 @@ function ShotCard({
   assets = [],
   selectedAssetId,
   project,
+  imageGenerationProvider = 'seedream',
   onSelect,
   onPreview,
   imagePrompt,
@@ -3313,6 +3357,7 @@ function ShotCard({
     .slice(0, 2);
   const placeholders = Math.max(0, 2 - visibleAssets.length);
   const canReanalyze = !isRecognizingImage && project?.status !== 'generating_shots';
+  const imageProviderLabel = IMAGE_GENERATION_PROVIDER_LABELS[imageGenerationProvider] || imageGenerationProvider;
   return (
     <article className={isRecognizingImage ? 'shot-card recognizing-image' : 'shot-card'}>
       <div className="shot-main">
@@ -3367,7 +3412,7 @@ function ShotCard({
               <textarea
                 value={imagePrompt}
                 onChange={(event) => onImagePromptChange?.(event.target.value)}
-                placeholder="输入希望 Seedream 生成的画面描述"
+                placeholder={`输入希望 ${imageProviderLabel} 生成的画面描述`}
                 autoFocus
               />
               <div className="ai-prompt-actions">
@@ -3387,7 +3432,7 @@ function ShotCard({
             <div className="ai-generating-overlay">
               <Wand2 size={26} />
               <strong>AI 图片生成中</strong>
-              <small>Seedream 正在绘制 9:16 竖屏图片，请稍候</small>
+              <small>{imageProviderLabel} 正在绘制 9:16 竖屏图片，请稍候</small>
             </div>
           )}
           {visibleAssets.map((item) => (
@@ -3459,7 +3504,7 @@ function ShotCard({
           {Array.from({ length: placeholders }).map((_, index) => (
             <div className="search-placeholder" key={`placeholder-${index}`}>
               <strong>暂无 AI 图片</strong>
-              <small>可编辑提示词后调用 Seedream 生成</small>
+              <small>可编辑提示词后调用 {imageProviderLabel} 生成</small>
             </div>
           ))}
         </div>

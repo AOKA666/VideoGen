@@ -50,6 +50,10 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 OPENAI_API_KEY=your_openai_api_key
 OPENAI_ENDPOINT=https://api.openai.com/v1
 OPENAI_MODEL=gpt-5.6
+# OpenAI：分镜图片生成（与文案 Key 分开）
+OPENAI_IMAGE_API_KEY=your_openai_image_api_key
+OPENAI_IMAGE_MODEL=gpt-image-2
+OPENAI_IMAGE_QUALITY=medium
 WHISPERX_COMMAND=whisperx
 WHISPERX_MODEL=small
 WHISPERX_LANGUAGE=zh
@@ -100,6 +104,7 @@ JIANYING_DRAFTS_DIR=E:\JianyingPro Drafts
 | 文案改写、搜索意图和素材库图片识别 | `MINIMAX_API_KEY` |
 | 文案界面选择 DeepSeek 时 | `DEEPSEEK_API_KEY` |
 | 文案界面选择 OpenAI 时 | `OPENAI_API_KEY` |
+| 分镜出图选择 OpenAI 时 | `OPENAI_IMAGE_API_KEY` |
 | Seedream 分镜图片与去水印 | `ARK_API_KEY` |
 | 腾讯图片搜索 | `TENCENT_CLOUD_SECRET_ID`、`TENCENT_CLOUD_SECRET_KEY` |
 | 豆包配音与时间戳 | `VOLC_TTS_APP_ID`、`VOLC_TTS_ACCESS_KEY` |

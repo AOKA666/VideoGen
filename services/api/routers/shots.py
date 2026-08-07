@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 
-from services.generation_service import build_image_prompt, generate_doubao_image
+from services.generation_service import build_image_prompt, generate_ai_image
 from services.material_library_service import apply_material_intent
 from services.store import load_db, project_dir, public_url, save_db
 from services.text_service import ai_generate_shot_visuals, generate_shots
@@ -27,13 +27,22 @@ def ai_image_concurrency(total: int) -> int:
     return max(1, min(configured, MAX_AI_IMAGE_CONCURRENCY, max(1, total)))
 
 
-def _generate_one_ai_image(project_id: str, generated_shot: dict) -> tuple[dict, object, dict]:
+def _generate_one_ai_image(
+    project_id: str,
+    generated_shot: dict,
+    image_generation_provider: str,
+) -> tuple[dict, object, dict]:
     out = project_dir(project_id) / "images" / f"shot_{generated_shot['shot_index']:03d}.png"
-    result = generate_doubao_image(out, generated_shot, "9:16")
+    result = generate_ai_image(out, generated_shot, "9:16", provider=image_generation_provider)
     return generated_shot, out, result
 
 
-def _generate_ai_images(project_id: str, run_id: str, shots: list[dict]) -> None:
+def _generate_ai_images(
+    project_id: str,
+    run_id: str,
+    shots: list[dict],
+    image_generation_provider: str = "seedream",
+) -> None:
     """Generate and select one AI image for every newly created shot."""
     total = len(shots)
     failed = 0
@@ -43,7 +52,12 @@ def _generate_ai_images(project_id: str, run_id: str, shots: list[dict]) -> None
         thread_name_prefix=f"ai-image-{project_id[:8]}",
     )
     futures = {
-        executor.submit(_generate_one_ai_image, project_id, generated_shot): generated_shot
+        executor.submit(
+            _generate_one_ai_image,
+            project_id,
+            generated_shot,
+            image_generation_provider,
+        ): generated_shot
         for generated_shot in shots
     }
     try:
@@ -144,6 +158,7 @@ def _generate_project_shots(
     run_id: str,
     material_source_strategy: str,
     storyboard_model_provider: str = "deepseek",
+    image_generation_provider: str = "seedream",
 ) -> None:
     db = load_db()
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
@@ -174,6 +189,7 @@ def _generate_project_shots(
         apply_material_intent(shot)
         db["shots"].append(shot)
     project["material_source_strategy"] = material_source_strategy
+    project["image_generation_provider"] = image_generation_provider
     project["updated_at"] = now
     if material_source_strategy == "prompt_only":
         _save_image_prompts(project, generated, now)
@@ -185,7 +201,7 @@ def _generate_project_shots(
         project["current_generation_message"] = "准备生成 AI 图片..."
     save_db(db)
     if material_source_strategy == "ai_only":
-        _generate_ai_images(project_id, run_id, generated)
+        _generate_ai_images(project_id, run_id, generated, image_generation_provider)
 
 
 @router.post("/{project_id}/shots")
@@ -199,6 +215,10 @@ def create_shots(
     storyboard_model_provider: str = Query(
         "deepseek",
         pattern="^(minimax|deepseek|openai)$",
+    ),
+    image_generation_provider: str = Query(
+        "seedream",
+        pattern="^(seedream|openai)$",
     ),
 ):
     db = load_db()
@@ -225,6 +245,7 @@ def create_shots(
     project["current_generation_message"] = "正在生成分镜提示词..."
     project["material_source_strategy"] = material_source_strategy
     project["storyboard_model_provider"] = storyboard_model_provider
+    project["image_generation_provider"] = image_generation_provider
     project["updated_at"] = now
     save_db(db)
     background_tasks.add_task(
@@ -233,12 +254,14 @@ def create_shots(
         run_id,
         material_source_strategy,
         storyboard_model_provider,
+        image_generation_provider,
     )
     return {
         "shots": [],
         "status": "generating_shots",
         "run_id": run_id,
         "storyboard_model_provider": storyboard_model_provider,
+        "image_generation_provider": image_generation_provider,
     }
 
 

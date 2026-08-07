@@ -53,7 +53,7 @@ class ShotAiConcurrencyTests(unittest.TestCase):
                 state.clear()
                 state.update(copy.deepcopy(value))
 
-        def fake_generate(path, shot, ratio):
+        def fake_generate(path, shot, ratio, prompt_override=None, provider="seedream"):
             nonlocal active, max_active
             with active_lock:
                 active += 1
@@ -72,10 +72,10 @@ class ShotAiConcurrencyTests(unittest.TestCase):
             "routers.shots.save_db",
             side_effect=fake_save_db,
         ), patch("routers.shots.project_dir", return_value=Path(temp_dir)), patch(
-            "routers.shots.generate_doubao_image",
+            "routers.shots.generate_ai_image",
             side_effect=fake_generate,
         ), patch("routers.shots.public_url", side_effect=lambda path: f"/{path.name}"):
-            _generate_ai_images(project_id, run_id, shots)
+            _generate_ai_images(project_id, run_id, shots, "openai")
 
         self.assertGreaterEqual(max_active, 2)
         self.assertLessEqual(max_active, 3)

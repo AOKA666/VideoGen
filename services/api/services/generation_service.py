@@ -27,7 +27,9 @@ from services.store import public_url
 
 
 STORYBOARD_SEEDREAM_MODEL = "doubao-seedream-4-0-250828"
+STORYBOARD_OPENAI_MODEL = "gpt-image-2"
 STORYBOARD_IMAGE_SIZE = "1440x2560"
+IMAGE_GENERATION_PROVIDERS = {"seedream", "openai"}
 
 SONG_COURT_STYLE_PROMPT = (
     "9:16竖屏，新国风宋式水墨工笔，古绢泛黄宣纸底色，"
@@ -81,6 +83,21 @@ def ark_image_model() -> str:
 
 def ark_image_edit_model() -> str:
     return os.getenv("ARK_IMAGE_EDIT_MODEL", ark_image_model())
+
+
+def openai_image_endpoint() -> str:
+    return os.getenv("OPENAI_ENDPOINT", "https://api.openai.com/v1").rstrip("/")
+
+
+def openai_image_model() -> str:
+    return os.getenv("OPENAI_IMAGE_MODEL", STORYBOARD_OPENAI_MODEL).strip() or STORYBOARD_OPENAI_MODEL
+
+
+def normalize_image_generation_provider(value: object) -> str:
+    provider = str(value or "seedream").strip().lower()
+    if provider not in IMAGE_GENERATION_PROVIDERS:
+        raise ValueError("image generation provider must be seedream or openai")
+    return provider
 
 
 def image_size_for_ratio(video_ratio: str | None) -> str:
@@ -274,6 +291,76 @@ def generate_doubao_image(
         "image_size": payload["size"],
         "seed": body.get("seed"),
     }
+
+
+def generate_openai_image(
+    path: Path,
+    shot: dict,
+    video_ratio: str | None = "9:16",
+    prompt_override: str | None = None,
+) -> dict:
+    api_key = os.getenv("OPENAI_IMAGE_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_IMAGE_API_KEY is not configured")
+
+    prompt = str(prompt_override or "").strip() or build_image_prompt(shot)
+    payload = {
+        "model": openai_image_model(),
+        "prompt": prompt,
+        "size": storyboard_image_size(),
+        "quality": os.getenv("OPENAI_IMAGE_QUALITY", "medium").strip() or "medium",
+    }
+    request = urllib.request.Request(
+        f"{openai_image_endpoint()}/images/generations",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=180) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI image API {exc.code}: {error_body}") from exc
+
+    images = body.get("data") or body.get("images") or []
+    image = images[0] if images and isinstance(images[0], dict) else {}
+    image_b64 = image.get("b64_json") or image.get("base64")
+    image_url = image.get("url") or image.get("image_url")
+    if image_b64:
+        content = base64.b64decode(image_b64)
+    elif image_url:
+        with urllib.request.urlopen(image_url, timeout=180) as response:
+            content = response.read()
+    else:
+        raise RuntimeError(f"OpenAI image response does not contain an image: {body}")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    return {
+        "prompt": prompt,
+        "provider": "openai",
+        "model": openai_image_model(),
+        "remote_url": image_url or "",
+        "image_size": payload["size"],
+        "seed": body.get("seed"),
+    }
+
+
+def generate_ai_image(
+    path: Path,
+    shot: dict,
+    video_ratio: str | None = "9:16",
+    prompt_override: str | None = None,
+    provider: str = "seedream",
+) -> dict:
+    normalized_provider = normalize_image_generation_provider(provider)
+    if normalized_provider == "openai":
+        return generate_openai_image(path, shot, video_ratio, prompt_override)
+    return generate_doubao_image(path, shot, video_ratio, prompt_override)
 
 
 def generate_seedream_cover(

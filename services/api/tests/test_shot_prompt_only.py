@@ -55,7 +55,7 @@ class ShotPromptOnlyTests(unittest.TestCase):
             "routers.shots.apply_material_intent",
         ), patch(
             "routers.shots.build_image_prompt", return_value="纪实风格实验室画面",
-        ), patch("routers.shots.generate_doubao_image") as generate_image:
+        ), patch("routers.shots.generate_ai_image") as generate_image:
             _generate_project_shots(
                 project_id,
                 run_id,
