@@ -25,7 +25,7 @@ class ShotAiConcurrencyTests(unittest.TestCase):
         with patch.dict(os.environ, {"AI_IMAGE_CONCURRENCY": "99"}):
             self.assertEqual(8, ai_image_concurrency(20))
         with patch.dict(os.environ, {"AI_IMAGE_CONCURRENCY": "invalid"}):
-            self.assertEqual(3, ai_image_concurrency(10))
+            self.assertEqual(5, ai_image_concurrency(10))
 
     def test_ai_images_are_generated_concurrently_but_saved_safely(self) -> None:
         project_id = "project-1"

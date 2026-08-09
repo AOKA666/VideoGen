@@ -31,8 +31,8 @@ class _Response:
 
 
 class OpenAiImageGenerationTests(unittest.TestCase):
-    def test_generates_portrait_png_from_base64_response(self) -> None:
-        response = _Response({"data": [{"b64_json": base64.b64encode(b"png-data").decode()}]})
+    def test_generates_fast_portrait_jpeg_from_base64_response(self) -> None:
+        response = _Response({"data": [{"b64_json": base64.b64encode(b"jpeg-data").decode()}]})
         with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
             os.environ,
             {
@@ -42,7 +42,7 @@ class OpenAiImageGenerationTests(unittest.TestCase):
                 "OPENAI_IMAGE_QUALITY": "high",
             },
         ), patch("services.generation_service.urllib.request.urlopen", return_value=response) as urlopen:
-            output = Path(temp_dir) / "shot.png"
+            output = Path(temp_dir) / "shot.jpg"
             result = generate_openai_image(output, {}, prompt_override="test prompt")
             output_bytes = output.read_bytes()
 
@@ -50,9 +50,11 @@ class OpenAiImageGenerationTests(unittest.TestCase):
         payload = json.loads(request.data.decode("utf-8"))
         self.assertEqual("https://openai.test/v1/images/generations", request.full_url)
         self.assertEqual("gpt-image-test", payload["model"])
-        self.assertEqual("1440x2560", payload["size"])
+        self.assertEqual("720x1280", payload["size"])
         self.assertEqual("high", payload["quality"])
-        self.assertEqual(b"png-data", output_bytes)
+        self.assertEqual("jpeg", payload["output_format"])
+        self.assertEqual(85, payload["output_compression"])
+        self.assertEqual(b"jpeg-data", output_bytes)
         self.assertEqual("openai", result["provider"])
 
 

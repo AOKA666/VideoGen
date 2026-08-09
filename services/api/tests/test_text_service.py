@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -60,6 +61,7 @@ class PublishAssistantTests(unittest.TestCase):
                             "content": json.dumps({
                                 "short_title": "他隐姓埋名二十年只为守住中国的秘密",
                                 "description": "他把名字藏进岁月，把选择留给国家。那些无人知晓的坚持，最终变成了守护无数人的力量，也让今天的我们重新看见沉默背后的重量。",
+                                "tags": ["无名英雄", "家国情怀", "人物故事", "致敬先辈"],
                             }, ensure_ascii=False)
                         }
                     }]
@@ -72,11 +74,14 @@ class PublishAssistantTests(unittest.TestCase):
             result = generate_publish_assistant("他隐姓埋名二十年，只为守住中国的秘密。")
 
         self.assertEqual("他隐姓埋名二十年只为守住中国的秘密", result["short_title"])
+        self.assertTrue(result["description"].endswith("#无名英雄 #家国情怀 #人物故事 #致敬先辈"))
+        self.assertEqual(4, len(re.findall(r"#[^#\s]+", result["description"])))
 
     def test_fallback_short_title_keeps_the_complete_first_sentence(self) -> None:
         result = fallback_publish_assistant("他隐姓埋名二十年，只为守住中国的秘密。后来人们才知道他的名字。")
 
         self.assertEqual("他隐姓埋名二十年只为守住中国的秘密", result["short_title"])
+        self.assertEqual(4, len(re.findall(r"#[^#\s]+", result["description"])))
 
 
 class ShotTagGenerationTests(unittest.TestCase):

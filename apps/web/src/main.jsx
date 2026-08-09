@@ -400,6 +400,7 @@ function App() {
   const mainVoiceAudioGraphRef = useRef({ element: null, context: null, gain: null });
   const playVoicePreviewAfterLoadRef = useRef(false);
   const playGeneratedVoiceAfterLoadRef = useRef(false);
+  const hydratedProjectSettingsRef = useRef('');
   const lastProjectStatusRef = useRef('');
   const rewrittenScriptDirtyRef = useRef(false);
   const paragraphSaveVersionRef = useRef(0);
@@ -516,13 +517,17 @@ function App() {
       setGeneratedAssets(projectData.generated_assets || []);
       setProjectId(id);
       setHistoryBookTitle(formatPromotionBookTitle(projectData.project.promotion_book_title));
-      setStoryboardModelProvider(projectData.project.storyboard_model_provider || 'deepseek');
-      setImageGenerationProvider(projectData.project.image_generation_provider || 'seedream');
+      if (hydratedProjectSettingsRef.current !== id) {
+        hydratedProjectSettingsRef.current = id;
+        setStoryboardModelProvider(projectData.project.storyboard_model_provider || 'deepseek');
+        setImageGenerationProvider(projectData.project.image_generation_provider || 'seedream');
+      }
     } else {
       setProject(null);
       setShots([]);
       setGeneratedAssets([]);
       setProjectId('');
+      hydratedProjectSettingsRef.current = '';
     }
   }
 
@@ -532,8 +537,6 @@ function App() {
     setProject(data.project);
     setShots(data.shots);
     setGeneratedAssets(data.generated_assets || []);
-    setStoryboardModelProvider(data.project.storyboard_model_provider || 'deepseek');
-    setImageGenerationProvider(data.project.image_generation_provider || 'seedream');
   }
 
 

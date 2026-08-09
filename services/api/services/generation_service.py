@@ -29,6 +29,7 @@ from services.store import public_url
 STORYBOARD_SEEDREAM_MODEL = "doubao-seedream-4-0-250828"
 STORYBOARD_OPENAI_MODEL = "gpt-image-2"
 STORYBOARD_IMAGE_SIZE = "1440x2560"
+OPENAI_FAST_IMAGE_SIZE = "720x1280"
 IMAGE_GENERATION_PROVIDERS = {"seedream", "openai"}
 
 SONG_COURT_STYLE_PROMPT = (
@@ -91,6 +92,21 @@ def openai_image_endpoint() -> str:
 
 def openai_image_model() -> str:
     return os.getenv("OPENAI_IMAGE_MODEL", STORYBOARD_OPENAI_MODEL).strip() or STORYBOARD_OPENAI_MODEL
+
+
+def openai_image_size() -> str:
+    return os.getenv("OPENAI_IMAGE_SIZE", OPENAI_FAST_IMAGE_SIZE).strip() or OPENAI_FAST_IMAGE_SIZE
+
+
+def openai_image_output_format() -> str:
+    output_format = os.getenv("OPENAI_IMAGE_FORMAT", "jpeg").strip().lower()
+    return output_format if output_format in {"png", "jpeg", "webp"} else "jpeg"
+
+
+def generated_image_extension(provider: str) -> str:
+    if normalize_image_generation_provider(provider) != "openai":
+        return ".png"
+    return {"jpeg": ".jpg", "webp": ".webp", "png": ".png"}[openai_image_output_format()]
 
 
 def normalize_image_generation_provider(value: object) -> str:
@@ -304,12 +320,20 @@ def generate_openai_image(
         raise RuntimeError("OPENAI_IMAGE_API_KEY is not configured")
 
     prompt = str(prompt_override or "").strip() or build_image_prompt(shot)
+    output_format = openai_image_output_format()
     payload = {
         "model": openai_image_model(),
         "prompt": prompt,
-        "size": storyboard_image_size(),
-        "quality": os.getenv("OPENAI_IMAGE_QUALITY", "medium").strip() or "medium",
+        "size": openai_image_size(),
+        "quality": os.getenv("OPENAI_IMAGE_QUALITY", "low").strip() or "low",
+        "output_format": output_format,
     }
+    if output_format in {"jpeg", "webp"}:
+        try:
+            compression = int(os.getenv("OPENAI_IMAGE_COMPRESSION", "85"))
+        except ValueError:
+            compression = 85
+        payload["output_compression"] = max(0, min(compression, 100))
     request = urllib.request.Request(
         f"{openai_image_endpoint()}/images/generations",
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -344,6 +368,7 @@ def generate_openai_image(
         "prompt": prompt,
         "provider": "openai",
         "model": openai_image_model(),
+        "output_format": output_format,
         "remote_url": image_url or "",
         "image_size": payload["size"],
         "seed": body.get("seed"),

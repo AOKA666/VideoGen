@@ -2960,6 +2960,26 @@ def clean_publish_description(text: str, limit: int = 140) -> str:
     return description
 
 
+def append_publish_hashtags(description: str, tags: object = None) -> str:
+    """Append exactly four unique hashtags to a publish description."""
+    description_tags = re.findall(r"#([^#\s，。！？、；：,.!?;:]+)", str(description or ""))
+    body = re.sub(r"#([^#\s，。！？、；：,.!?;:]+)", "", str(description or ""))
+    body = clean_publish_description(body)
+
+    candidates: list[str] = []
+    raw_tags = tags if isinstance(tags, list) else []
+    for raw_tag in [*raw_tags, *description_tags, "人物故事", "历史故事", "家国情怀", "值得铭记"]:
+        tag = re.sub(r"^[#＃]+", "", str(raw_tag or "").strip())
+        tag = re.sub(r"[\s#＃，。！？、；：,.!?;:]+", "", tag)
+        if tag and tag not in candidates:
+            candidates.append(tag)
+        if len(candidates) == 4:
+            break
+
+    hashtag_line = " ".join(f"#{tag}" for tag in candidates)
+    return f"{body}\n{hashtag_line}" if body else hashtag_line
+
+
 def fallback_publish_assistant(script: str) -> dict:
     sentences = split_sentences(script)
     first = sentences[0] if sentences else script[:40]
@@ -2968,12 +2988,12 @@ def fallback_publish_assistant(script: str) -> dict:
         or "这个故事值得被看见"
     )
     description_source = " ".join(sentences[:3]) if sentences else script
-    description = clean_publish_description(description_source)
+    description = append_publish_hashtags(description_source)
     return {"short_title": short_title, "description": description}
 
 
 def generate_publish_assistant(script: str) -> dict:
-    """Generate a platform-ready description and a punctuation-free short title."""
+    """Generate a platform-ready description with four hashtags and a short title."""
     api_key = os.getenv("MINIMAX_API_KEY", "").strip()
     if not api_key:
         return fallback_publish_assistant(script)
@@ -2984,15 +3004,16 @@ def generate_publish_assistant(script: str) -> dict:
         "\n1. short_title 是一句语义完整的短标题，建议 8 到 24 个汉字，不要任何标点符号。"
         "\n2. short_title 必须表达完整，不能为了控制字数截断词语、人物、事件或句意。"
         "\n3. short_title 要有悬念或反差，但必须忠于文案事实，不要标题党造假。"
-        "\n4. description 是视频描述，80 到 140 个汉字，适合发视频号/抖音/小红书。"
+        "\n4. description 是视频描述正文，80 到 140 个汉字，适合发视频号/抖音/小红书；正文中不要写标签。"
         "\n5. description 开头要吸引人，点出故事冲突、反差、情绪爆点或评论点，让人想点开看完。"
         "\n6. description 只写视频内容本身，不要介绍书，不要提书名，不要写读书感受，不要出现买书、带书、小黄车、家长购买等表达。"
         "\n7. description 不要写成片头文案，不要写“本视频讲述”，不要堆砌空话。"
-        "\n8. 只返回 JSON，不要 Markdown，不要解释。"
+        "\n8. tags 是根据视频主题提炼的 4 个适合发布平台的中文标签；每项不带 #，不得重复。"
+        "\n9. 只返回 JSON，不要 Markdown，不要解释。"
         "\n\n文案内容："
         f"\n{script[:1200]}"
         "\n\n返回格式："
-        '\n{"short_title": "一句话短标题", "description": "吸引人的视频描述"}'
+        '\n{"short_title": "一句话短标题", "description": "吸引人的视频描述", "tags": ["标签一", "标签二", "标签三", "标签四"]}'
     )
 
     payload = {
@@ -3024,9 +3045,10 @@ def generate_publish_assistant(script: str) -> dict:
             content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
         result = json.loads(extract_json(str(content)))
         short_title = strip_title_punctuation(result.get("short_title", ""))
-        description = clean_publish_description(result.get("description", ""))
-        if not short_title or not description:
+        raw_description = clean_publish_description(result.get("description", ""))
+        if not short_title or not raw_description:
             return fallback_publish_assistant(script)
+        description = append_publish_hashtags(raw_description, result.get("tags"))
         return {"short_title": short_title, "description": description}
     except Exception as exc:
         return {"short_title": "", "description": "", "error": str(exc)[:200]}

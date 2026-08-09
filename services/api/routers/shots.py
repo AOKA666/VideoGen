@@ -8,14 +8,14 @@ from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 
-from services.generation_service import build_image_prompt, generate_ai_image
+from services.generation_service import build_image_prompt, generate_ai_image, generated_image_extension
 from services.material_library_service import apply_material_intent
 from services.store import load_db, project_dir, public_url, save_db
 from services.text_service import ai_generate_shot_visuals, generate_shots
 
 router = APIRouter(prefix="/api/projects", tags=["shots"])
 REANALYZE_SAVE_LOCK = threading.Lock()
-DEFAULT_AI_IMAGE_CONCURRENCY = 3
+DEFAULT_AI_IMAGE_CONCURRENCY = 5
 MAX_AI_IMAGE_CONCURRENCY = 8
 
 
@@ -32,7 +32,8 @@ def _generate_one_ai_image(
     generated_shot: dict,
     image_generation_provider: str,
 ) -> tuple[dict, object, dict]:
-    out = project_dir(project_id) / "images" / f"shot_{generated_shot['shot_index']:03d}.png"
+    extension = generated_image_extension(image_generation_provider)
+    out = project_dir(project_id) / "images" / f"shot_{generated_shot['shot_index']:03d}{extension}"
     result = generate_ai_image(out, generated_shot, "9:16", provider=image_generation_provider)
     return generated_shot, out, result
 

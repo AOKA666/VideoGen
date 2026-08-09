@@ -26,6 +26,7 @@ from services.generation_service import (
     expected_lyrics_from_shots,
     generate_ai_image,
     normalize_image_generation_provider,
+    generated_image_extension,
     generate_export_srt,
     lrc_from_lines,
     remove_watermark_with_seedream,
@@ -395,7 +396,8 @@ def generate_image(project_id: str, shot_id: str, payload: ImageGenerationPayloa
         )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    out = project_dir(project_id) / "images" / f"shot_{shot['shot_index']:03d}.png"
+    extension = generated_image_extension(provider)
+    out = project_dir(project_id) / "images" / f"shot_{shot['shot_index']:03d}{extension}"
     try:
         result = generate_ai_image(out, shot, "9:16", payload.prompt if payload else None, provider)
     except Exception as exc:
