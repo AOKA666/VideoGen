@@ -11,17 +11,28 @@ API_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(API_ROOT))
 
 from routers.shots import _generate_project_shots  # noqa: E402
-from routers.matching import router as matching_router  # noqa: E402
+from main import app  # noqa: E402
 
 
 class ShotPromptOnlyTests(unittest.TestCase):
     def test_online_image_search_routes_are_removed(self) -> None:
-        paths = {route.path for route in matching_router.routes}
+        paths = {route.path for route in app.routes}
 
+        self.assertFalse(any(path.startswith("/api/assets") for path in paths))
         self.assertNotIn("/api/projects/{project_id}/match-assets", paths)
         self.assertNotIn("/api/projects/{project_id}/stop-image-search", paths)
         self.assertNotIn("/api/projects/{project_id}/retry-failed-shots", paths)
         self.assertNotIn("/api/projects/{project_id}/shots/{shot_id}/retry-image-search", paths)
+        self.assertNotIn("/api/projects/{project_id}/shots/{shot_id}/manual-image", paths)
+
+    def test_voice_routes_remain_but_music_lyric_route_is_removed(self) -> None:
+        paths = {route.path for route in app.routes}
+
+        self.assertIn("/api/projects/{project_id}/generate-voice", paths)
+        self.assertIn("/api/projects/{project_id}/voice-preview", paths)
+        self.assertIn("/api/projects/{project_id}/voice-settings", paths)
+        self.assertIn("/api/projects/{project_id}/generate-subtitles", paths)
+        self.assertNotIn("/api/projects/{project_id}/generate-music-voice", paths)
 
     def test_prompt_only_saves_prompts_without_generating_or_searching_images(self) -> None:
         project_id = "project-1"
@@ -33,7 +44,6 @@ class ShotPromptOnlyTests(unittest.TestCase):
                 "shot_generation_run_id": run_id,
             }],
             "shots": [],
-            "project_assets": [],
             "generated_assets": [],
         }
 
@@ -52,8 +62,6 @@ class ShotPromptOnlyTests(unittest.TestCase):
         with patch("routers.shots.load_db", side_effect=fake_load_db), patch(
             "routers.shots.save_db", side_effect=fake_save_db,
         ), patch("routers.shots.generate_shots", return_value=generated) as generate_shots, patch(
-            "routers.shots.apply_material_intent",
-        ), patch(
             "routers.shots.build_image_prompt", return_value="纪实风格实验室画面",
         ), patch("routers.shots.generate_ai_image") as generate_image:
             _generate_project_shots(

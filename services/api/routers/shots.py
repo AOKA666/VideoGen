@@ -9,7 +9,6 @@ from uuid import uuid4
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 
 from services.generation_service import build_image_prompt, generate_ai_image, generated_image_extension
-from services.material_library_service import apply_material_intent
 from services.store import load_db, project_dir, public_url, save_db
 from services.text_service import ai_generate_shot_visuals, generate_shots
 
@@ -91,7 +90,7 @@ def _generate_ai_images(
                     shot["status"] = "no_image"
                     shot["image_generation_error"] = str(generation_error)[:500]
                     shot["updated_at"] = datetime.now().isoformat(timespec="seconds")
-                project["search_error"] = f"{failed} 个分镜 AI 图片生成失败"
+                project["generation_error"] = f"{failed} 个分镜 AI 图片生成失败"
             elif shot and result is not None and out is not None:
                 generated_id = str(uuid4())
                 db.setdefault("generated_assets", []).append({
@@ -187,7 +186,6 @@ def _generate_project_shots(
     now = datetime.now().isoformat(timespec="seconds")
     for shot in generated:
         shot.update({"id": str(uuid4()), "project_id": project_id, "created_at": now, "updated_at": now})
-        apply_material_intent(shot)
         db["shots"].append(shot)
     project["material_source_strategy"] = material_source_strategy
     project["image_generation_provider"] = image_generation_provider
@@ -227,10 +225,6 @@ def create_shots(
     if not project:
         raise HTTPException(404, "Project not found")
     db["shots"] = [s for s in db["shots"] if s["project_id"] != project_id]
-    db["project_assets"] = [
-        item for item in db.get("project_assets", [])
-        if item.get("project_id") != project_id
-    ]
     db["generated_assets"] = [
         item for item in db.get("generated_assets", [])
         if item.get("project_id") != project_id
@@ -336,10 +330,41 @@ def regenerate_shot_image_prompt(
                 current_shot[key] = result[key]
         current_shot["required_object"] = list(current_shot.get("object_tags") or [])
         current_shot["required_scene"] = list(current_shot.get("scene_tags") or [])
-        apply_material_intent(current_shot)
         current_shot["image_prompt"] = build_image_prompt(current_shot)
         if not current_shot.get("selected_asset_id"):
             current_shot["status"] = "prompt_ready"
         current_shot["updated_at"] = datetime.now().isoformat(timespec="seconds")
         save_db(db)
         return {"shot": current_shot}
+
+
+@router.patch("/{project_id}/shots/{shot_id}/asset")
+def select_generated_image(project_id: str, shot_id: str, payload: dict):
+    db = load_db()
+    shot = next(
+        (item for item in db["shots"] if item["project_id"] == project_id and item["id"] == shot_id),
+        None,
+    )
+    if not shot:
+        raise HTTPException(404, "Shot not found")
+
+    asset_id = payload.get("asset_id")
+    asset = next(
+        (
+            item for item in db.get("generated_assets", [])
+            if item.get("id") == asset_id
+            and item.get("project_id") == project_id
+            and item.get("shot_id") == shot_id
+            and item.get("asset_source") == "ai_generated"
+        ),
+        None,
+    )
+    if asset_id and not asset:
+        raise HTTPException(404, "AI-generated image not found")
+
+    shot["selected_asset_id"] = asset_id
+    shot["asset_source"] = "ai_generated" if asset_id else None
+    shot["status"] = "ai_generated" if asset_id else "no_image"
+    shot["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    save_db(db)
+    return {"shot": shot}

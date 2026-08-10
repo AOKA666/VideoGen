@@ -10,6 +10,8 @@ from uuid import uuid4
 
 from PIL import Image, ImageOps
 
+from services.settings_service import configured_jianying_directory
+
 SUBTITLE_RGB_COLOR = (1.0, 1.0, 1.0)
 SUBTITLE_JIANYING_BORDER_WIDTH = 70.0
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -121,6 +123,7 @@ def _safe_draft_name(name: str) -> str:
 def jianying_drafts_root() -> Path:
     configured = os.getenv("JIANYING_DRAFTS_DIR", "").strip()
     candidates = [
+        configured_jianying_directory(),
         Path(configured) if configured else None,
         Path(r"E:\JianyingPro Drafts"),
         Path(os.getenv("LOCALAPPDATA", "")) / "JianyingPro" / "User Data" / "Projects" / "com.lveditor.draft",

@@ -9,30 +9,23 @@ from io import BytesIO
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
+from uuid import uuid4
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from PIL import Image, ImageOps
 from pydantic import BaseModel
 
-from services.asset_service import new_id
-from services.r2_storage import ensure_asset_local
 from services.generation_service import (
-    align_lyrics,
-    align_lyrics_to_shots,
     build_image_prompt,
     compose_uploaded_cover,
-    convert_music_to_main_voice,
-    expected_lyrics_from_shots,
     generate_ai_image,
     normalize_image_generation_provider,
     generated_image_extension,
     generate_export_srt,
-    lrc_from_lines,
     remove_watermark_with_seedream,
     synthesize_volcengine_tts,
     synthesize_project_voice,
-    weighted_music_timeline_from_shots,
     write_timeline,
     normalize_cover_title_positions,
 )
@@ -75,11 +68,6 @@ class MusicSettingsPayload(BaseModel):
     music_id: str | None = None
     start_sec: float = 0
     volume: float = 0.2
-
-
-class MusicVoicePayload(BaseModel):
-    music_id: str
-    start_sec: float | None = None
 
 
 def _generated_image(db: dict, project_id: str, asset_id: str) -> tuple[dict, Path]:
@@ -290,51 +278,9 @@ def crop_selected_images(project_id: str):
             ),
             None,
         )
-        if not asset:
-            library_asset = next((item for item in db.get("assets", []) if item.get("id") == selected_id), None)
-            source = ensure_asset_local(library_asset) if library_asset else Path()
-            if not library_asset or not source.exists():
-                skipped += 1
-                continue
-            asset_id = new_id()
-            suffix = source.suffix.lower() if source.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} else ".jpg"
-            target_dir = project_dir(project_id) / "images" / f"shot_{shot['shot_index']:03d}"
-            target_dir.mkdir(parents=True, exist_ok=True)
-            path = target_dir / f"library_crop_{asset_id}{suffix}"
-            shutil.copy2(source, path)
-            now = datetime.now().isoformat(timespec="seconds")
-            asset = {
-                "id": asset_id,
-                "project_id": project_id,
-                "shot_id": shot["id"],
-                "type": "image",
-                "file_type": "image",
-                "file_name": path.name,
-                "asset_source": "library_crop",
-                "provider": "local_library",
-                "source_asset_id": library_asset["id"],
-                "file_url": public_url(path),
-                "local_path": str(path),
-                "status": "success",
-                "created_at": now,
-            }
-            db.setdefault("generated_assets", []).append(asset)
-            shot["selected_asset_id"] = asset_id
-            shot["asset_source"] = "library_crop"
-            selected_id = asset_id
-            for candidate in db.get("project_assets", []):
-                if candidate.get("project_id") == project_id and candidate.get("shot_id") == shot["id"]:
-                    candidate["is_selected"] = False
-            db.setdefault("project_assets", []).append({
-                "project_id": project_id,
-                "shot_id": shot["id"],
-                "asset_id": asset_id,
-                "asset_source": "library_crop",
-                "match_score": shot.get("match_score", 100),
-                "match_reason": "素材库图片项目裁剪副本",
-                "is_selected": True,
-                "created_at": now,
-            })
+        if not asset or asset.get("asset_source") != "ai_generated":
+            skipped += 1
+            continue
         path = Path(str(asset.get("local_path") or ""))
         try:
             _crop_square(path)
@@ -367,9 +313,6 @@ def remove_generated_image_watermark(project_id: str, asset_id: str):
     asset["watermark_provider"] = result.get("provider")
     asset["watermark_model"] = result.get("model")
     _refresh_image_metadata(asset, path, "remove_watermark")
-    for item in db.get("project_assets", []):
-        if item.get("asset_id") == asset_id:
-            item["watermark"] = result
     save_db(db)
     return {"status": "success", "asset": asset, "watermark": result}
 
@@ -403,7 +346,7 @@ def generate_image(project_id: str, shot_id: str, payload: ImageGenerationPayloa
     except Exception as exc:
         raise HTTPException(502, str(exc)) from exc
     prompt = result["prompt"]
-    generated_id = new_id()
+    generated_id = str(uuid4())
     with GENERATED_IMAGE_SAVE_LOCK:
         # Reload after the slow AI request. Other image generations or prompt
         # recognition may have completed while this request was in flight; using
@@ -738,116 +681,6 @@ def update_music_settings(project_id: str, payload: MusicSettingsPayload):
         "music": music,
         "start_sec": project["background_music_start_sec"],
         "volume": project["background_music_volume"],
-    }
-
-
-@router.post("/{project_id}/generate-music-voice")
-def generate_music_voice(project_id: str, payload: MusicVoicePayload):
-    db = load_db()
-    project = next((p for p in db["projects"] if p["id"] == project_id), None)
-    if not project:
-        raise HTTPException(404, "Project not found")
-    shots = sorted([s for s in db["shots"] if s["project_id"] == project_id], key=lambda s: s["shot_index"])
-    if not shots:
-        raise HTTPException(400, "No shots")
-
-    music = next(
-        (item for item in db.get("music_library", []) if item.get("id") == payload.music_id),
-        None,
-    )
-    if not music:
-        raise HTTPException(404, "Music not found")
-    source = Path(str(music.get("local_path") or ""))
-    if not source.exists():
-        raise HTTPException(404, "Music file not found")
-
-    source_duration = float(music.get("duration_sec") or 0)
-    start_sec = (
-        float(payload.start_sec)
-        if payload.start_sec is not None
-        else float(project.get("background_music_start_sec") or 0)
-    )
-    start_sec = max(0.0, start_sec)
-    if source_duration > 0:
-        start_sec = min(start_sec, max(source_duration - 0.1, 0))
-
-    audio_path = project_dir(project_id) / "audio" / "main_voice.mp3"
-    lyrics_path = project_dir(project_id) / "subtitles" / "lyrics.lrc"
-    timeline_path = project_dir(project_id) / "audio" / "voice_timeline.json"
-    lyric_warning = None
-    try:
-        duration = convert_music_to_main_voice(source, audio_path, start_sec=start_sec)
-    except Exception as exc:
-        raise HTTPException(502, str(exc)) from exc
-    try:
-        lyric_result = align_lyrics(audio_path, expected_lyrics_from_shots(shots), duration)
-        shot_timings = align_lyrics_to_shots(
-            lyric_result["lines"],
-            shots,
-            duration,
-            source_start_sec=0,
-        )
-    except Exception as exc:
-        lyric_warning = str(exc)
-        shot_timings = weighted_music_timeline_from_shots(shots, duration)
-        fallback_lines = []
-        for timing in shot_timings:
-            fallback_lines.extend(timing.get("subtitle_timings", []))
-        lyric_result = {
-            "provider": "duration_weighted_fallback",
-            "model": "",
-            "lines": fallback_lines,
-            "lrc": lrc_from_lines(fallback_lines),
-        }
-
-    timing_by_shot = {
-        timing["shot_id"]: timing
-        for timing in shot_timings
-        if timing.get("shot_id")
-    }
-    for shot in shots:
-        timing = timing_by_shot.get(shot["id"])
-        if not timing:
-            continue
-        shot["start_time"] = round(timing["start_time"], 3)
-        shot["end_time"] = round(timing["end_time"], 3)
-        shot["duration_sec"] = round(timing["duration_sec"], 3)
-        shot["subtitle_timings"] = timing.get("subtitle_timings", [])
-
-    timeline_path.write_text(json.dumps(shot_timings, ensure_ascii=False, indent=2), encoding="utf-8")
-    lyrics_path.write_text(lrc_from_lines(lyric_result["lines"]), encoding="utf-8")
-    now = datetime.now().isoformat(timespec="seconds")
-    project.update({
-        "voice_style": "music",
-        "audio_url": public_url(audio_path),
-        "voice_timeline_url": public_url(timeline_path),
-        "lyrics_lrc_url": public_url(lyrics_path),
-        "audio_format": "mp3",
-        "audio_provider": "music_upload",
-        "music_voice_id": music.get("id"),
-        "music_voice_name": music.get("name"),
-        "music_voice_source_start_sec": round(start_sec, 3),
-        "music_voice_lyric_provider": lyric_result.get("provider"),
-        "music_voice_lyric_model": lyric_result.get("model"),
-        "music_voice_lyric_warning": lyric_warning,
-        "background_music_id": None,
-        "background_music_name": "",
-        "background_music_url": "",
-        "background_music_start_sec": 0,
-        "background_music_volume": 0.2,
-        "updated_at": now,
-    })
-    save_db(db)
-    return {
-        "status": "success",
-        "audio_url": project["audio_url"],
-        "voice_timeline_url": project["voice_timeline_url"],
-        "lyrics_lrc_url": project["lyrics_lrc_url"],
-        "duration_sec": duration,
-        "line_count": len(lyric_result["lines"]),
-        "provider": lyric_result.get("provider"),
-        "model": lyric_result.get("model"),
-        "warning": lyric_warning,
     }
 
 

@@ -1,12 +1,11 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Archive, Check, ChevronLeft, ChevronRight, Copy, Download, Eraser, Film, FolderOpen, ImagePlus, Library, MessageSquare, Mic, Music, RefreshCw, Save, Scissors, Send, Tags, Trash2, Wand2 } from 'lucide-react';
+import { Archive, Check, ChevronLeft, ChevronRight, Copy, Download, Eraser, Film, FolderOpen, ImagePlus, MessageSquare, Mic, Music, RefreshCw, Save, Scissors, Send, Settings, Trash2, Wand2 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import './styles.css';
 
 const API = import.meta.env.VITE_API_URL ?? (import.meta.env.DEV ? 'http://127.0.0.1:8000' : '');
-const ASSET_PAGE_SIZE = 60;
 const DEFAULT_PROMOTION_BOOK = '《国之脊梁》';
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'videogen.sidebarCollapsed';
 const ADD_PROMOTION_BOOK_OPTION = '__add_promotion_book__';
@@ -36,22 +35,6 @@ async function request(path, options = {}) {
   const res = await fetch(`${API}${path}`, options);
   if (!res.ok) throw new Error(await res.text());
   return res.json();
-}
-
-function validLibrary(library) {
-  const name = String(library?.name || '').trim();
-  return Boolean(name) && !/^\?+$/.test(name);
-}
-
-function listToText(value) {
-  return Array.isArray(value) ? value.join('，') : '';
-}
-
-function textToList(value) {
-  return String(value || '')
-    .split(/[,，、\n]/)
-    .map((item) => item.trim())
-    .filter(Boolean);
 }
 
 function stripScriptParagraphNumbers(value) {
@@ -191,19 +174,6 @@ function formatProjectTime(value) {
   return date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
 }
 
-function emptyTagForm() {
-  return {
-    object: '',
-    scene: '',
-    keywords: '',
-    source_page: '',
-    source_note: '用户上传',
-    copyright_note: '自用素材',
-    keep_original: false,
-    video_processing_mode: 'split',
-  };
-}
-
 function assetImageUrl(asset) {
   if (!asset?.file_url) return '';
   const version = asset.updated_at || asset.created_at || '';
@@ -332,12 +302,8 @@ function App() {
   const [projectId, setProjectId] = useState('');
   const [project, setProject] = useState(null);
   const [shots, setShots] = useState([]);
-  const [assets, setAssets] = useState([]);
   const [generatedAssets, setGeneratedAssets] = useState([]);
-  const [library, setLibrary] = useState(null);
   const [musicLibrary, setMusicLibrary] = useState([]);
-  const [editingAsset, setEditingAsset] = useState(null);
-  const [pendingUpload, setPendingUpload] = useState(null);
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
   const [rawScriptDraft, setRawScriptDraft] = useState('');
@@ -377,22 +343,20 @@ function App() {
   const [backgroundMusicStart, setBackgroundMusicStart] = useState(0);
   const [backgroundMusicVolume, setBackgroundMusicVolume] = useState(20);
   const [previewAsset, setPreviewAsset] = useState(null);
-  const [libraryPickerShotId, setLibraryPickerShotId] = useState('');
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [exportResult, setExportResult] = useState(null);
-  const [selectedAssetIds, setSelectedAssetIds] = useState(new Set());
-  const [visibleAssetCount, setVisibleAssetCount] = useState(ASSET_PAGE_SIZE);
-  const [assetTypeFilter, setAssetTypeFilter] = useState('all');
   const [projectSearch, setProjectSearch] = useState('');
   const [projectFilter, setProjectFilter] = useState('current');
+  const [appSettings, setAppSettings] = useState({
+    project_directory: '',
+    jianying_drafts_directory: '',
+  });
+  const [selectingDirectory, setSelectingDirectory] = useState('');
   const [sidebarCollapsed, setSidebarCollapsed] = useState(
     () => window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === 'true',
   );
-  const folderFallbackRef = useRef(null);
-  const uploadInputRef = useRef(null);
   const coverInputRef = useRef(null);
   const musicInputRef = useRef(null);
-  const musicVoiceInputRef = useRef(null);
   const musicPreviewRef = useRef(null);
   const voicePreviewRef = useRef(null);
   const generatedVoicePlayerRef = useRef(null);
@@ -407,7 +371,6 @@ function App() {
   const paragraphSaveQueueRef = useRef(Promise.resolve());
   const deletingParagraphRef = useRef(false);
 
-  const activeLibrary = validLibrary(library) ? library : null;
   const rewrittenParagraphs = useMemo(
     () => splitScriptParagraphs(rewrittenScriptEditor),
     [rewrittenScriptEditor],
@@ -420,23 +383,13 @@ function App() {
   const historyModelProvider = project?.history_model_provider || 'minimax';
   const selectedAssets = useMemo(() => {
     const map = new Map();
-    assets.forEach((asset) => map.set(asset.id, asset));
     generatedAssets.forEach((asset) => map.set(asset.id, {
       ...asset,
       file_type: 'image',
       file_name: asset.file_name || `AI 图片 ${asset.image_size || ''}`.trim(),
     }));
     return map;
-  }, [assets, generatedAssets]);
-  const selectableAssets = useMemo(() => [
-    ...generatedAssets.map((asset) => ({
-      ...asset,
-      file_type: 'image',
-      file_name: asset.file_name || `AI 图片 ${asset.image_size || ''}`.trim(),
-      asset_source: asset.asset_source || 'ai_generated',
-    })),
-    ...assets.map((asset) => ({ ...asset, asset_source: 'local' })),
-  ], [assets, generatedAssets]);
+  }, [generatedAssets]);
   const generatedAssetsByShot = useMemo(() => {
     const map = new Map();
     generatedAssets.forEach((asset) => {
@@ -448,25 +401,12 @@ function App() {
       });
       map.set(asset.shot_id, list);
     });
-    shots.forEach((shot) => {
-      const selected = assets.find((asset) => asset.id === shot.selected_asset_id);
-      if (!selected) return;
-      const list = map.get(shot.id) || [];
-      if (!list.some((asset) => asset.id === selected.id)) {
-        list.unshift({
-          ...selected,
-          shot_id: shot.id,
-          asset_source: shot.asset_source === 'library_upload' ? 'library_upload' : 'local',
-        });
-      }
-      map.set(shot.id, list);
-    });
     map.forEach((list) => list.sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || ''))));
     return map;
-  }, [assets, generatedAssets, shots]);
+  }, [generatedAssets]);
   const generationProgress = useMemo(() => {
     const total = shots.length || project?.generation_total || 0;
-    const success = shots.filter((shot) => ['uploaded', 'ai_generated', 'matched', 'prompt_ready'].includes(shot.status)).length;
+    const success = shots.filter((shot) => ['ai_generated', 'prompt_ready'].includes(shot.status)).length;
     const failed = shots.filter((shot) => shot.status === 'no_image').length;
     const completed = shots.length
       ? success + failed
@@ -474,15 +414,6 @@ function App() {
     const percent = total ? Math.min(100, Math.round((completed / total) * 100)) : 0;
     return { total, completed, success, failed, percent };
   }, [project, shots]);
-  const filteredAssets = useMemo(
-    () => assets.filter((asset) => assetTypeFilter === 'all' || asset.file_type === assetTypeFilter),
-    [assets, assetTypeFilter],
-  );
-  const visibleAssets = useMemo(
-    () => filteredAssets.slice(0, visibleAssetCount),
-    [filteredAssets, visibleAssetCount],
-  );
-
   async function run(label, fn) {
     setBusy(true);
     setMessage(`${label}中...`);
@@ -498,17 +429,13 @@ function App() {
   }
 
   async function refreshAll(id = projectId) {
-    const [projectList, assetList, libraryData, musicData, promotionBookData, projectData] = await Promise.all([
+    const [projectList, musicData, promotionBookData, projectData] = await Promise.all([
       request('/api/projects'),
-      request('/api/assets'),
-      request('/api/assets/library'),
-      request('/api/assets/music'),
+      request('/api/music'),
       request('/api/projects/promotion-books'),
       id ? request(`/api/projects/${id}`) : Promise.resolve(null),
     ]);
     setProjects(projectList.projects);
-    setAssets(assetList.assets);
-    setLibrary(validLibrary(libraryData.library) ? libraryData.library : null);
     setMusicLibrary(musicData.music || []);
     setPromotionBooks(promotionBookData.books?.length ? promotionBookData.books : [DEFAULT_PROMOTION_BOOK]);
     if (projectData) {
@@ -539,9 +466,41 @@ function App() {
     setGeneratedAssets(data.generated_assets || []);
   }
 
+  async function refreshSettings() {
+    const data = await request('/api/settings');
+    setAppSettings(data.settings || {});
+  }
+
+  async function selectAppDirectory(kind) {
+    setSelectingDirectory(kind);
+    try {
+      const data = await request('/api/settings/select-directory', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind }),
+      });
+      if (data.cancelled) {
+        setMessage('已取消选择目录');
+        return;
+      }
+      setAppSettings(data.settings || {});
+      if (kind === 'project') {
+        await refreshAll('');
+        setMessage('项目目录已切换');
+      } else {
+        setMessage('剪映草稿目录已保存');
+      }
+    } catch (err) {
+      setMessage(`目录设置失败：${err.message}`);
+    } finally {
+      setSelectingDirectory('');
+    }
+  }
+
 
   useEffect(() => {
     refreshAll();
+    refreshSettings().catch((err) => setMessage(`读取目录设置失败：${err.message}`));
   }, []);
 
   useEffect(() => {
@@ -565,28 +524,6 @@ function App() {
     setCoverImagePreviewUrl(project?.cover_source_url ? `${API}${project.cover_source_url}` : '');
     return undefined;
   }, [coverImage, project?.cover_source_url]);
-
-  useEffect(() => {
-    const hasProcessingVideo = assets.some((asset) => (
-      asset.file_type === 'video' && ['analyzing', 'probing', 'splitting'].includes(asset.analysis_status)
-    ));
-    // 上传视频后会在 message 里挂一句"素材已上传，正在识别标签"，
-    // 但没有任何路径去覆盖它。这里在所有视频都离开处理中状态时把
-    // 这条提示清掉，让徽标回落到默认的"就绪"。
-    if (!hasProcessingVideo && message === '素材已上传，正在识别标签') {
-      setMessage('');
-    }
-    if (!hasProcessingVideo) return undefined;
-    const timer = window.setInterval(async () => {
-      try {
-        const data = await request('/api/assets');
-        setAssets(data.assets || []);
-      } catch (_) {
-        // The next interval will retry without interrupting the rest of the UI.
-      }
-    }, 3000);
-    return () => window.clearInterval(timer);
-  }, [assets, message]);
 
   useEffect(() => {
     if (!project) return;
@@ -680,23 +617,6 @@ function App() {
   }, [voicePreviewUrl]);
 
   useEffect(() => {
-    if (!assets.some((asset) => asset.analysis_status === 'analyzing')) return undefined;
-    const timer = window.setInterval(() => {
-      Promise.all([
-        request('/api/assets').then((data) => setAssets(data.assets)),
-        projectId ? refreshProject(projectId) : Promise.resolve(),
-      ]);
-    }, 2500);
-    return () => window.clearInterval(timer);
-  }, [assets, projectId]);
-
-  useEffect(() => {
-    if (tab === 'assets') {
-      setVisibleAssetCount(ASSET_PAGE_SIZE);
-    }
-  }, [tab, activeLibrary?.id]);
-
-  useEffect(() => {
     if (!projectId || !['generating_shots', 'generating_images'].includes(project?.status)) return undefined;
     const timer = window.setInterval(() => {
       refreshProject(projectId);
@@ -718,34 +638,6 @@ function App() {
     }
     lastProjectStatusRef.current = current;
   }, [project?.status, project?.generation_error, generationProgress.completed, generationProgress.total]);
-
-  async function chooseLibraryFolder() {
-    if ('showDirectoryPicker' in window) {
-      const dir = await window.showDirectoryPicker({ mode: 'read' });
-      await run('设置素材库', () => request('/api/assets/library', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: dir.name, path_hint: dir.name }),
-      }));
-      await refreshAll(projectId);
-      return;
-    }
-    folderFallbackRef.current?.click();
-  }
-
-  async function chooseLibraryFallback(ev) {
-    const file = ev.target.files?.[0];
-    if (!file) return;
-    const path = file.webkitRelativePath || file.name;
-    const name = path.split('/')[0] || '素材库';
-    await run('设置素材库', () => request('/api/assets/library', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, path_hint: name }),
-    }));
-    ev.target.value = '';
-    await refreshAll(projectId);
-  }
 
   async function createProject(ev) {
     ev.preventDefault();
@@ -1114,109 +1006,6 @@ function App() {
     }
   }
 
-  function handleUploadPick(ev) {
-    const files = Array.from(ev.target.files || []);
-    if (!files.length) return;
-    setPendingUpload({ files, form: emptyTagForm() });
-  }
-
-  function closePendingUpload() {
-    setPendingUpload(null);
-    if (uploadInputRef.current) uploadInputRef.current.value = '';
-  }
-
-  async function confirmUpload(form) {
-    if (!pendingUpload?.files?.length) return;
-    const data = new FormData();
-    pendingUpload.files.forEach((file) => data.append('files', file, file.name));
-    data.append('source_page', form.source_page || '');
-    data.append('source_note', form.source_note || '用户上传');
-    data.append('copyright_note', form.copyright_note || '自用素材');
-    data.append('manual_tags', JSON.stringify({
-      object: textToList(form.object),
-      scene: textToList(form.scene),
-      keywords: textToList(form.keywords),
-    }));
-    data.append('keep_original', String(Boolean(form.keep_original)));
-    data.append('video_processing_mode', form.video_processing_mode || 'split');
-    const result = await run('上传素材', () => request('/api/assets/upload', { method: 'POST', body: data }));
-    if (!result) return;
-    closePendingUpload();
-    setTab('assets');
-    setMessage('素材已上传，正在识别标签');
-    await refreshAll(projectId);
-  }
-
-  async function saveAssetTags(assetId, payload) {
-    const result = await run('保存标签', () => request(`/api/assets/${assetId}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }));
-    if (payload.sync_remote) {
-      setMessage(result?.remote_synced ? '标签已保存并同步远程素材库' : '标签已保存，远程素材库未同步');
-    }
-    setEditingAsset(null);
-    await refreshAll(projectId);
-  }
-
-  async function deleteAsset(asset) {
-    if (!window.confirm(`确认删除素材「${asset.file_name}」吗？`)) return;
-    await run('删除素材', () => request(`/api/assets/${asset.id}`, { method: 'DELETE' }));
-    if (editingAsset?.id === asset.id) setEditingAsset(null);
-    setSelectedAssetIds((prev) => { const next = new Set(prev); next.delete(asset.id); return next; });
-    await refreshAll(projectId);
-  }
-
-  async function batchDeleteAssets() {
-    const ids = [...selectedAssetIds];
-    if (!ids.length) return;
-    if (!window.confirm(`确认批量删除 ${ids.length} 个素材吗？`)) return;
-    const result = await run('批量删除', () => request('/api/assets/batch-delete', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ asset_ids: ids }),
-    }));
-    if (!result) return;
-    setSelectedAssetIds(new Set());
-    if (editingAsset && ids.includes(editingAsset.id)) setEditingAsset(null);
-    await refreshAll(projectId);
-    setMessage(`已删除 ${result.deleted_count} 个素材（${result.deleted_files} 个文件）`);
-  }
-
-  async function retryAssetAnalysis() {
-    const result = await run('重试标签识别', () => request('/api/assets/retry-analysis', {
-      method: 'POST',
-    }));
-    if (!result) return;
-    setMessage(result.queued ? `已重新提交 ${result.queued} 张图片进行标签识别` : '没有需要重试的图片');
-    await refreshAll(projectId);
-  }
-
-  async function syncRemoteAssets() {
-    const result = await run('拉取远程素材', () => request('/api/assets/sync-remote', { method: 'POST' }));
-    if (!result) return;
-    await refreshAll(projectId);
-    setMessage(`远程同步完成：新增 ${result.added} 条，更新 ${result.updated} 条，共发现 ${result.remote_count} 条素材`);
-  }
-
-  function toggleAssetSelect(assetId) {
-    setSelectedAssetIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(assetId)) next.delete(assetId);
-      else next.add(assetId);
-      return next;
-    });
-  }
-
-  function toggleSelectAllAssets() {
-    if (selectedAssetIds.size === assets.length) {
-      setSelectedAssetIds(new Set());
-    } else {
-      setSelectedAssetIds(new Set(assets.map((a) => a.id)));
-    }
-  }
-
   async function deleteProject() {
     if (!projectId || !project) return;
     if (!window.confirm(`确认删除项目「${project.name}」吗？项目文案、分镜、生成文件和导出包都会删除。`)) return;
@@ -1416,41 +1205,15 @@ function App() {
       : `一键黑白完成：${succeeded} 张分镜图片已转为黑白照片`);
   }
 
-  async function uploadManualShotImage(shotId, file) {
-    const data = new FormData();
-    data.append('file', file, file.name);
-    await run('上传镜头图片', () => request(
-      `/api/projects/${projectId}/shots/${shotId}/manual-image`,
-      { method: 'POST', body: data },
-    ));
-    await refreshAll(projectId);
-  }
-
-  async function archiveSelectedImages() {
-    const result = await run('批量存入素材库', () => request(
-      `/api/projects/${projectId}/archive-selected-images`,
-      { method: 'POST' },
-    ));
-    if (!result) return;
-    setMessage(`素材入库：新增 ${result.created}，二次识别 ${result.analyzing || 0}，跳过重复 ${result.skipped_duplicates}，无图片 ${result.missing}`);
-    await refreshAll(projectId);
-  }
-
-  async function selectAsset(shotId, assetId, assetSource = 'ai_generated') {
-    const result = await run('指定素材', () => request(`/api/projects/${projectId}/shots/${shotId}/asset`, {
+  async function selectAsset(shotId, assetId) {
+    const result = await run('选择 AI 图片', () => request(`/api/projects/${projectId}/shots/${shotId}/asset`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ asset_id: assetId, asset_source: assetSource }),
+      body: JSON.stringify({ asset_id: assetId }),
     }));
     if (!result) return false;
     await refreshAll(projectId);
     return true;
-  }
-
-  async function uploadShotImageFromLibrary(assetId) {
-    if (!libraryPickerShotId) return;
-    const selected = await selectAsset(libraryPickerShotId, assetId, 'library_upload');
-    if (selected) setLibraryPickerShotId('');
   }
 
   async function generateVoiceAndSubtitles() {
@@ -1493,41 +1256,6 @@ function App() {
     } finally {
       setPreviewingVoice(false);
     }
-  }
-
-  async function generateMusicVoiceAndSubtitles(musicId = backgroundMusicId, startSec = backgroundMusicStart) {
-    if (!musicId) {
-      setMessage('请先上传或选择一首音乐');
-      return false;
-    }
-    const musicResult = await run('生成音乐歌词字幕', () => request(`/api/projects/${projectId}/generate-music-voice`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ music_id: musicId, start_sec: Number(startSec) || 0 }),
-    }));
-    if (!musicResult) return false;
-    const subtitleResult = await run('生成字幕', () => request(`/api/projects/${projectId}/generate-subtitles`, { method: 'POST' }));
-    if (!subtitleResult) return false;
-    await refreshAll(projectId);
-    setMessage(musicResult.warning
-      ? `音乐字幕已生成，但 AI 对齐失败，已按时长临时匹配：${musicResult.warning}`
-      : `音乐已作为主音轨，识别 ${musicResult.line_count || 0} 行歌词并生成字幕`);
-    setTab('cover');
-    return true;
-  }
-
-  async function uploadMusicVoice(file) {
-    if (!file) return;
-    const data = new FormData();
-    data.append('file', file, file.name);
-    const result = await run('上传音乐', () => request('/api/assets/music', {
-      method: 'POST',
-      body: data,
-    }));
-    if (!result?.music) return;
-    const musicData = await request('/api/assets/music');
-    setMusicLibrary(musicData.music || []);
-    await generateMusicVoiceAndSubtitles(result.music.id, 0);
   }
 
   async function generateCover(options = {}) {
@@ -1651,12 +1379,12 @@ function App() {
     if (!file) return;
     const data = new FormData();
     data.append('file', file, file.name);
-    const result = await run('上传背景音乐', () => request('/api/assets/music', {
+    const result = await run('上传背景音乐', () => request('/api/music', {
       method: 'POST',
       body: data,
     }));
     if (!result?.music) return;
-    const musicData = await request('/api/assets/music');
+    const musicData = await request('/api/music');
     setMusicLibrary(musicData.music || []);
     setBackgroundMusicId(result.music.id);
     setBackgroundMusicStart(0);
@@ -1672,11 +1400,11 @@ function App() {
     const selectedMusic = musicLibrary.find((music) => music.id === backgroundMusicId);
     if (!selectedMusic) return;
     if (!window.confirm(`确认删除音乐「${selectedMusic.name}」吗？正在使用它的项目会清空配乐设置。`)) return;
-    const result = await run('删除背景音乐', () => request(`/api/assets/music/${backgroundMusicId}`, {
+    const result = await run('删除背景音乐', () => request(`/api/music/${backgroundMusicId}`, {
       method: 'DELETE',
     }));
     if (!result) return;
-    const musicData = await request('/api/assets/music');
+    const musicData = await request('/api/music');
     setMusicLibrary(musicData.music || []);
     setBackgroundMusicId('');
     setBackgroundMusicStart(0);
@@ -1762,7 +1490,7 @@ function App() {
       if (!generated) return;
     }
     const data = await run('导出剪映草稿', () => request(
-      `/api/projects/${projectId}/export/assets`,
+      `/api/projects/${projectId}/export/package`,
       { method: 'POST' },
     ));
     if (!data) return;
@@ -1821,12 +1549,12 @@ function App() {
         <div className="brand"><Film size={22} /><span className="brand-label">草稿生成器</span></div>
         <nav>
           <button title="项目" className={tab === 'create' ? 'active' : ''} onClick={() => setTab('create')}><Scissors size={18} /><span>项目</span></button>
-          <button title="素材库" className={tab === 'assets' ? 'active' : ''} onClick={() => setTab('assets')}><Library size={18} /><span>素材库</span></button>
           <button title="文案" className={tab === 'script' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('script')}><Wand2 size={18} /><span>文案</span></button>
           <button title="分镜" className={tab === 'storyboard' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('storyboard')}><Archive size={18} /><span>分镜</span></button>
           <button title="配音" className={tab === 'match' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('match')}><Mic size={18} /><span>配音</span></button>
           <button title="标题" className={tab === 'cover' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('cover')}><Music size={18} /><span>标题</span></button>
           <button title="导出" className={tab === 'export' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('export')}><Download size={18} /><span>导出</span></button>
+          <button title="设置" className={tab === 'settings' ? 'active' : ''} onClick={() => setTab('settings')}><Settings size={18} /><span>设置</span></button>
         </nav>
         <div className="project-picker">
           <ProjectSelect
@@ -1846,8 +1574,8 @@ function App() {
       <main>
         <header className="topbar">
           <div>
-            <h1>{project?.name || '真实素材优先的短视频草稿工作台'}</h1>
-            <p>{activeLibrary ? `当前素材库：${activeLibrary.name}` : '进入素材库前，需要先选择一个文件夹作为素材库。'}</p>
+            <h1>{tab === 'settings' ? '本地设置' : (project?.name || 'AI 短视频草稿工作台')}</h1>
+            <p>{tab === 'settings' ? '项目与剪映草稿保存位置' : '使用 AI 图片提示词和 AI 出图完成分镜画面。'}</p>
           </div>
           <div className="top-actions">
             {project && (
@@ -1876,6 +1604,47 @@ function App() {
             <span className={workflowBusy ? 'status busy' : 'status'}>{workflowMessage}</span>
           </div>
         </header>
+
+        {tab === 'settings' && (
+          <section className="band settings-workspace">
+            <div className="settings-heading">
+              <div>
+                <h2>本地目录</h2>
+                <p>目录设置保存在这台电脑上。</p>
+              </div>
+              <span className="settings-mode">本地模式</span>
+            </div>
+            <div className="directory-setting-row">
+              <div className="directory-setting-icon"><FolderOpen size={20} /></div>
+              <div className="directory-setting-copy">
+                <strong>项目目录</strong>
+                <span title={appSettings.project_directory}>{appSettings.project_directory || '未设置'}</span>
+              </div>
+              <button
+                type="button"
+                className="primary"
+                disabled={busy || Boolean(selectingDirectory)}
+                onClick={() => selectAppDirectory('project')}
+              >
+                <FolderOpen size={18} /> {selectingDirectory === 'project' ? '选择中…' : '选择目录'}
+              </button>
+            </div>
+            <div className="directory-setting-row">
+              <div className="directory-setting-icon"><Film size={20} /></div>
+              <div className="directory-setting-copy">
+                <strong>剪映草稿目录</strong>
+                <span title={appSettings.jianying_drafts_directory}>{appSettings.jianying_drafts_directory || '使用剪映默认目录'}</span>
+              </div>
+              <button
+                type="button"
+                disabled={busy || Boolean(selectingDirectory)}
+                onClick={() => selectAppDirectory('jianying')}
+              >
+                <FolderOpen size={18} /> {selectingDirectory === 'jianying' ? '选择中…' : '选择目录'}
+              </button>
+            </div>
+          </section>
+        )}
 
         {tab === 'create' && (
           <section className="band project-workspace">
@@ -1922,82 +1691,6 @@ function App() {
               onArchive={setProjectArchived}
               onDelete={deleteProjectItem}
             />
-          </section>
-        )}
-
-        {tab === 'assets' && (
-          <section className="band">
-            {!activeLibrary ? (
-              <div className="library-gate">
-                <div className="library-icon"><FolderOpen size={42} /></div>
-                <h2>选择素材库文件夹</h2>
-                <p>选择后，系统会把这个文件夹登记为当前素材库。后续上传入口只保留一个，上传后的图片会自动打标签并放入素材库。</p>
-                <button className="primary" onClick={chooseLibraryFolder}><FolderOpen size={18} /> 选择文件夹</button>
-                <input ref={folderFallbackRef} className="hidden-input" type="file" webkitdirectory="" directory="" onChange={chooseLibraryFallback} />
-              </div>
-            ) : (
-              <>
-                <div className="library-bar">
-                  <div>
-                    <strong>{activeLibrary.name}</strong>
-                    <span>{activeLibrary.path_hint}</span>
-                  </div>
-                  <button onClick={chooseLibraryFolder}><FolderOpen size={18} /> 更换素材库</button>
-                  <input ref={folderFallbackRef} className="hidden-input" type="file" webkitdirectory="" directory="" onChange={chooseLibraryFallback} />
-                </div>
-                <div className="toolbar single-upload">
-                  <input ref={uploadInputRef} name="files" type="file" accept=".jpg,.jpeg,.png,.webp,.mp4,.mov" multiple onChange={handleUploadPick} />
-                  <span>{pendingUpload ? `已选择 ${pendingUpload.files.length} 个文件` : '选择图片或视频后先设置标签'}</span>
-                  <div className="asset-upload-actions">
-                    <button type="button" onClick={syncRemoteAssets}><Download size={18} /> 拉取远程素材</button>
-                    <button type="button" onClick={retryAssetAnalysis}><RefreshCw size={18} /> 重试标签识别</button>
-                    <button className="primary" type="button" onClick={() => uploadInputRef.current?.click()}><ImagePlus size={18} /> 选择素材</button>
-                  </div>
-                </div>
-                <div className="asset-type-filter">
-                  <button className={assetTypeFilter === 'all' ? 'active' : ''} onClick={() => { setAssetTypeFilter('all'); setVisibleAssetCount(ASSET_PAGE_SIZE); }}>全部</button>
-                  <button className={assetTypeFilter === 'image' ? 'active' : ''} onClick={() => { setAssetTypeFilter('image'); setVisibleAssetCount(ASSET_PAGE_SIZE); }}>图片</button>
-                  <button className={assetTypeFilter === 'video' ? 'active' : ''} onClick={() => { setAssetTypeFilter('video'); setVisibleAssetCount(ASSET_PAGE_SIZE); }}>视频</button>
-                </div>
-                {assets.length > 0 && (
-                  <div className="batch-bar">
-                    <label className="check-row compact">
-                      <input type="checkbox" checked={selectedAssetIds.size === assets.length && assets.length > 0} onChange={toggleSelectAllAssets} />
-                      全选 ({assets.length})
-                    </label>
-                    <div className={selectedAssetIds.size > 0 ? 'batch-selection-actions visible' : 'batch-selection-actions'}>
-                        <span className="batch-count">已选 {selectedAssetIds.size} 项</span>
-                        <button className="danger compact-button" onClick={batchDeleteAssets}><Trash2 size={16} /> 批量删除</button>
-                        <button className="compact-button" onClick={() => setSelectedAssetIds(new Set())}>取消选择</button>
-                    </div>
-                  </div>
-                )}
-                <div className="asset-grid">
-                  {visibleAssets.map((asset) => (
-                    <AssetCard
-                      key={asset.id}
-                      asset={asset}
-                      libraryCard
-                      selected={selectedAssetIds.has(asset.id)}
-                      onSelect={() => toggleAssetSelect(asset.id)}
-                      onPreview={() => setPreviewAsset(asset)}
-                      onEdit={() => setEditingAsset(asset)}
-                      onDelete={() => deleteAsset(asset)}
-                    />
-                  ))}
-                </div>
-                {visibleAssetCount < filteredAssets.length && (
-                  <div className="load-more-row">
-                    <button
-                      type="button"
-                      onClick={() => setVisibleAssetCount((count) => Math.min(count + ASSET_PAGE_SIZE, filteredAssets.length))}
-                    >
-                      加载更多（{Math.min(ASSET_PAGE_SIZE, filteredAssets.length - visibleAssetCount)} / 剩余 {filteredAssets.length - visibleAssetCount}）
-                    </button>
-                  </div>
-                )}
-              </>
-            )}
           </section>
         )}
 
@@ -2323,17 +2016,7 @@ function App() {
                 >
                   <Film size={18} /> 一键黑白
                 </button>
-                <button
-                  type="button"
-                  className="primary"
-                  disabled={!activeLibrary}
-                  title={activeLibrary ? '保存当前分镜选图到素材库' : '请先在素材库页面选择文件夹'}
-                  onClick={archiveSelectedImages}
-                >
-                  <Archive size={18} /> 批量存入素材库并打标签
-                </button>
               </div>
-              <small>优先保存已选图片；未选择时保存该镜头第一张，重复图片自动跳过。</small>
             </div>
             <StoryboardProgress
               progress={generationProgress}
@@ -2349,7 +2032,7 @@ function App() {
                   selectedAssetId={shot.selected_asset_id}
                   project={project}
                   imageGenerationProvider={imageGenerationProvider}
-                  onSelect={(assetId, assetSource) => selectAsset(shot.id, assetId, assetSource)}
+                  onSelect={(assetId) => selectAsset(shot.id, assetId)}
                   onPreview={setPreviewAsset}
                   imagePrompt={imagePromptEditors[shot.id]}
                   savedImagePrompt={shot.image_prompt}
@@ -2365,8 +2048,6 @@ function App() {
                   generatingShotIds={generatingShotIds}
                   onRemoveWatermark={(assetId) => processGeneratedImage(assetId, 'remove-watermark')}
                   onGrayscale={(assetId) => processGeneratedImage(assetId, 'grayscale')}
-                  onManualUpload={(file) => uploadManualShotImage(shot.id, file)}
-                  onLibraryUpload={() => setLibraryPickerShotId(shot.id)}
                 />
               ))}
             </div>
@@ -2376,33 +2057,12 @@ function App() {
         {tab === 'match' && (
           <section className="band">
             <div className="toolbar voice-toolbar">
-              <input
-                ref={musicVoiceInputRef}
-                className="hidden-input"
-                type="file"
-                accept=".mp3,.wav,.m4a,.aac,.ogg,.flac,audio/*"
-                onChange={(event) => {
-                  const file = event.target.files?.[0];
-                  if (file) uploadMusicVoice(file);
-                  event.target.value = '';
-                }}
-              />
               <VoiceSelect value={voiceType} onChange={setVoiceType} />
               <SpeechRateSelect value={speechRate} onChange={setSpeechRate} />
               <button type="button" onClick={previewVoice} disabled={previewingVoice}>
                 <Mic size={18} /> {previewingVoice ? '试听生成中…' : '试听音色'}
               </button>
               {voicePreviewUrl && <audio ref={voicePreviewRef} className="voice-preview-player" controls src={voicePreviewUrl} />}
-              <button type="button" onClick={() => musicVoiceInputRef.current?.click()}>
-                <Music size={18} /> 上传音乐生成歌词字幕
-              </button>
-              <button
-                type="button"
-                disabled={!backgroundMusicId || busy}
-                onClick={() => generateMusicVoiceAndSubtitles()}
-              >
-                <Music size={18} /> 用音乐库生成歌词字幕
-              </button>
               <button className="primary" onClick={generateVoiceAndSubtitles} disabled={busy}>
                 <Mic size={18} /> {project?.audio_url ? '重新生成配音与字幕' : '生成配音与字幕'}
               </button>
@@ -2441,7 +2101,7 @@ function App() {
                     selectedAssetId={shot.selected_asset_id}
                     project={project}
                     imageGenerationProvider={imageGenerationProvider}
-                    onSelect={(assetId, assetSource) => selectAsset(shot.id, assetId, assetSource)}
+                    onSelect={(assetId) => selectAsset(shot.id, assetId)}
                     onPreview={setPreviewAsset}
                     imagePrompt={imagePromptEditors[shot.id]}
                     savedImagePrompt={shot.image_prompt}
@@ -2457,17 +2117,7 @@ function App() {
                     generatingShotIds={generatingShotIds}
                     onRemoveWatermark={(assetId) => processGeneratedImage(assetId, 'remove-watermark')}
                     onGrayscale={(assetId) => processGeneratedImage(assetId, 'grayscale')}
-                    onManualUpload={(file) => uploadManualShotImage(shot.id, file)}
-                    onLibraryUpload={() => setLibraryPickerShotId(shot.id)}
                   />
-                  <select value={shot.selected_asset_id || ''} onChange={(e) => {
-                    const options = selectableAssets.filter((item) => !item.shot_id || item.shot_id === shot.id);
-                    const selected = options.find((asset) => asset.id === e.target.value);
-                    selectAsset(shot.id, e.target.value, selected?.asset_source || 'ai_generated');
-                  }}>
-                    <option value="">手动选择素材</option>
-                    {selectableAssets.filter((item) => !item.shot_id || item.shot_id === shot.id).map((asset) => <option key={asset.id} value={asset.id}>{asset.file_name}</option>)}
-                  </select>
                 </div>
               ))}
             </div>
@@ -2864,26 +2514,10 @@ function App() {
         )}
       </main>
 
-      {pendingUpload && (
-        <UploadTagDialog
-          files={pendingUpload.files}
-          initialForm={pendingUpload.form}
-          onClose={closePendingUpload}
-          onUpload={confirmUpload}
-        />
-      )}
-      {editingAsset && <AssetEditor asset={editingAsset} onClose={() => setEditingAsset(null)} onSave={saveAssetTags} onDelete={deleteAsset} />}
       {previewAsset && (
         <ImagePreview
           asset={previewAsset}
           onClose={() => setPreviewAsset(null)}
-        />
-      )}
-      {libraryPickerShotId && (
-        <LibraryImagePicker
-          assets={assets}
-          onClose={() => setLibraryPickerShotId('')}
-          onSelect={uploadShotImageFromLibrary}
         />
       )}
     </div>
@@ -2982,13 +2616,9 @@ function ProjectSelect({ projects, projectId, open, onOpenChange, onSelect }) {
   );
 }
 
-function AssetCard({ asset, selected, onSelect, onPreview, onEdit, onDelete, imageTools, libraryCard = false }) {
-  const imageScore = asset.score_result?.score ?? asset.match_score;
-  const imageReason = asset.score_result?.reason;
+function AssetCard({ asset, onPreview, imageTools }) {
   const src = assetImageUrl(asset);
-  const canPreview = Boolean(onPreview && asset.file_type === 'image');
-  // 视频处理有三阶段：probing → splitting → analyzing，单看 'analyzing' 会漏掉前两步。
-  const isAnalyzing = ['analyzing', 'probing', 'splitting'].includes(asset.analysis_status);
+  const canPreview = Boolean(onPreview);
   function openPreview(event) {
     if (!canPreview) return;
     if (event.type === 'keydown' && !['Enter', ' '].includes(event.key)) return;
@@ -2996,12 +2626,7 @@ function AssetCard({ asset, selected, onSelect, onPreview, onEdit, onDelete, ima
     onPreview();
   }
   return (
-    <article className={`${isAnalyzing ? 'asset-card analyzing' : 'asset-card'}${libraryCard ? ' library-asset-card' : ''}${selected ? ' selected' : ''}`}>
-      {onSelect && (
-        <label className="asset-checkbox" onClick={(e) => e.stopPropagation()}>
-          <input type="checkbox" checked={!!selected} onChange={onSelect} />
-        </label>
-      )}
+    <article className="asset-card">
       <div
         className={`preview${canPreview ? ' preview-clickable' : ''}`}
         role={canPreview ? 'button' : undefined}
@@ -3010,29 +2635,9 @@ function AssetCard({ asset, selected, onSelect, onPreview, onEdit, onDelete, ima
         onClick={openPreview}
         onKeyDown={openPreview}
       >
-        {asset.file_type === 'image' ? <SafeImage src={src} alt={asset.file_name} /> : (
-          asset.file_url
-            ? <video src={src} poster={asset.thumbnail_url ? `${API}${asset.thumbnail_url}` : undefined} controls preload="metadata" />
-            : <div className="video-processing-placeholder"><Film size={32} />{asset.processing_stage === 'failed' ? '处理失败' : '原视频已转为片段'}</div>
-        )}
+        <SafeImage src={src} alt={asset.file_name} />
         {imageTools}
       </div>
-      <h3>{asset.file_name}</h3>
-      {asset.file_type === 'video' && asset.processing_stage && asset.processing_stage !== 'ready' && (
-        <div className="asset-processing-progress"><span style={{ width: `${asset.processing_progress || 0}%` }} /></div>
-      )}
-      {asset.file_type === 'video' && asset.duration_ms && <small>{(asset.duration_ms / 1000).toFixed(1)} 秒 · 代理片段</small>}
-      {asset.file_type === 'video' && asset.clip_count !== undefined && <small>已生成 {asset.clip_count} 个片段</small>}
-      {imageScore !== undefined && imageScore !== null && <p>图片评分：{imageScore}</p>}
-      <p>{isAnalyzing ? '识别中' : [...(asset.object || asset.people || []), ...(asset.scene || []), ...(asset.keywords || [])].slice(0, 6).join(' / ') || '待补充标签'}</p>
-      <small>{isAnalyzing ? '识别标签中，请稍候' : `${asset.analysis_provider || 'local_fallback'} · ${asset.copyright_note}`}</small>
-      {imageReason && <small>{imageReason}</small>}
-      {(onEdit || onDelete) && (
-        <div className="asset-actions">
-          {onEdit && <button disabled={isAnalyzing} onClick={onEdit}><Tags size={16} /> 编辑标签</button>}
-          {onDelete && <button className="danger" onClick={onDelete}><Trash2 size={16} /> 删除</button>}
-        </div>
-      )}
     </article>
   );
 }
@@ -3158,171 +2763,6 @@ function ImagePreview({ asset, onClose }) {
   );
 }
 
-function TagFields({ form, update }) {
-  return (
-    <>
-      <div className="grid">
-        <label>主体标签<input value={form.object} onChange={(e) => update('object', e.target.value)} placeholder="武将，战马，城门" /></label>
-        <label>场景标签<input value={form.scene} onChange={(e) => update('scene', e.target.value)} placeholder="实验室，会议室，戈壁滩" /></label>
-        <label>关键词<input value={form.keywords} onChange={(e) => update('keywords', e.target.value)} placeholder="归国科学家，留学回国" /></label>
-      </div>
-      <SourceFields form={form} update={update} />
-    </>
-  );
-}
-
-function SourceFields({ form, update }) {
-  return (
-    <>
-      <div className="grid">
-        <label>来源链接<input value={form.source_page || ''} onChange={(e) => update('source_page', e.target.value)} placeholder="https://..." /></label>
-      </div>
-      <label>来源备注<input value={form.source_note} onChange={(e) => update('source_note', e.target.value)} /></label>
-      <label>版权备注<input value={form.copyright_note} onChange={(e) => update('copyright_note', e.target.value)} /></label>
-    </>
-  );
-}
-
-function UploadTagDialog({ files, initialForm, onClose, onUpload }) {
-  const [form, setForm] = useState(initialForm);
-  function update(key, value) {
-    setForm((current) => ({ ...current, [key]: value }));
-  }
-  function submit(ev) {
-    ev.preventDefault();
-    onUpload(form);
-  }
-  return (
-    <div className="modal-backdrop">
-      <form className="asset-editor" onSubmit={submit}>
-        <div className="row">
-          <h2>上传前设置标签</h2>
-          <button type="button" onClick={onClose}>关闭</button>
-        </div>
-        <div className="selected-files">
-          {files.slice(0, 6).map((file) => <span key={`${file.name}-${file.size}`}>{file.name}</span>)}
-          {files.length > 6 && <span>还有 {files.length - 6} 个文件</span>}
-        </div>
-        <SourceFields form={form} update={update} />
-        {files.some((file) => /\.(mp4|mov|webm)$/i.test(file.name)) && (
-          <div className="video-upload-options">
-            <strong>视频处理方式</strong>
-            <label className="check-row">
-              <input type="radio" name="video-processing-mode" value="split" checked={form.video_processing_mode === 'split'} onChange={() => update('video_processing_mode', 'split')} />
-              智能切割分段（按场景生成多个 3～15 秒素材）
-            </label>
-            <label className="check-row">
-              <input type="radio" name="video-processing-mode" value="full" checked={form.video_processing_mode === 'full'} onChange={() => update('video_processing_mode', 'full')} />
-              保留完整素材（压缩转码，但不改变视频时长）
-            </label>
-            <label className="check-row">
-              <input type="checkbox" checked={Boolean(form.keep_original)} onChange={(e) => update('keep_original', e.target.checked)} />
-              另外长期保存未经压缩的原始文件
-            </label>
-          </div>
-        )}
-        <div className="actions"><button type="button" onClick={onClose}>取消</button><button className="primary"><ImagePlus size={18} /> 上传并自动打标</button></div>
-      </form>
-    </div>
-  );
-}
-
-function AssetEditor({ asset, onClose, onSave, onDelete }) {
-  const [form, setForm] = useState({
-    object: listToText(asset.object || asset.people),
-    scene: listToText(asset.scene),
-    keywords: listToText(asset.keywords),
-    source_page: asset.source_page || asset.remote_url || '',
-    source_note: asset.source_note || '',
-    copyright_note: asset.copyright_note || '',
-    is_available: asset.is_available !== false,
-    sync_remote: asset.storage_provider === 'cloudflare_r2',
-  });
-
-  function update(key, value) {
-    setForm((current) => ({ ...current, [key]: value }));
-  }
-
-  function submit(ev) {
-    ev.preventDefault();
-    onSave(asset.id, {
-      object: textToList(form.object),
-      scene: textToList(form.scene),
-      keywords: textToList(form.keywords),
-      source_page: form.source_page,
-      source_note: form.source_note,
-      copyright_note: form.copyright_note,
-      is_available: form.is_available,
-      sync_remote: form.sync_remote,
-    });
-  }
-
-  return (
-    <div className="modal-backdrop">
-      <form className="asset-editor" onSubmit={submit}>
-        <div className="row">
-          <h2>编辑标签</h2>
-          <button type="button" onClick={onClose}>关闭</button>
-        </div>
-        <div className="editor-preview">
-          {asset.file_type === 'image' ? <SafeImage src={`${API}${asset.file_url}`} alt={asset.file_name} /> : <video src={`${API}${asset.file_url}`} controls />}
-          <strong>{asset.file_name}</strong>
-        </div>
-        <TagFields form={form} update={update} />
-        <label className="check-row"><input type="checkbox" checked={form.is_available} onChange={(e) => update('is_available', e.target.checked)} /> 可用于项目匹配</label>
-        <label className="check-row">
-          <input type="checkbox" checked={form.sync_remote} onChange={(e) => update('sync_remote', e.target.checked)} />
-          同步远程素材库
-        </label>
-        <div className="actions">
-          <button type="button" className="danger" onClick={() => onDelete(asset)}><Trash2 size={18} /> 删除素材</button>
-          <button type="button" onClick={onClose}>取消</button>
-          <button className="primary"><Save size={18} /> 保存标签</button>
-        </div>
-      </form>
-    </div>
-  );
-}
-
-function LibraryImagePicker({ assets, onClose, onSelect }) {
-  const images = assets.filter((asset) => asset.file_type === 'image' && asset.is_available !== false);
-  return (
-    <div
-      className="modal-backdrop"
-      onClick={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
-    >
-      <div className="asset-editor library-image-picker">
-        <div className="row">
-          <div>
-            <h2>从素材库选择图片</h2>
-            <small>选择后会作为用户上传图片应用到当前分镜。</small>
-          </div>
-          <button type="button" onClick={onClose}>关闭</button>
-        </div>
-        {images.length ? (
-          <div className="library-picker-grid">
-            {images.map((asset) => (
-              <button
-                type="button"
-                className="library-picker-item"
-                key={asset.id}
-                onClick={() => onSelect(asset.id)}
-              >
-                <SafeImage src={assetImageUrl(asset)} alt={asset.file_name} />
-                <span>{asset.file_name}</span>
-              </button>
-            ))}
-          </div>
-        ) : (
-          <div className="empty-state">素材库中暂无可用图片，请先到素材库上传图片。</div>
-        )}
-      </div>
-    </div>
-  );
-}
-
 function ShotCard({
   shot,
   assets = [],
@@ -3345,10 +2785,7 @@ function ShotCard({
   generatingShotIds,
   onRemoveWatermark,
   onGrayscale,
-  onManualUpload,
-  onLibraryUpload,
 }) {
-  const manualUploadRef = useRef(null);
   const [editingVoiceText, setEditingVoiceText] = useState(false);
   const [voiceTextDraft, setVoiceTextDraft] = useState(shot.voice_text || '');
   useEffect(() => {
@@ -3448,13 +2885,13 @@ function ShotCard({
                 role="button"
                 tabIndex={0}
                 onClick={(event) => {
-                  onSelect?.(item.id, item.asset_source || 'ai_generated');
+                  onSelect?.(item.id);
                   onPreview?.(item);
                 }}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter' || event.key === ' ') {
                     event.preventDefault();
-                    onSelect?.(item.id, item.asset_source || 'ai_generated');
+                    onSelect?.(item.id);
                     onPreview?.(item);
                   }
                 }}
@@ -3464,8 +2901,6 @@ function ShotCard({
                   asset={item}
                   imageTools={(
                     <div className="image-tools">
-                      {item.asset_source !== 'local' && (
-                        <>
                       <button
                         type="button"
                         title="一键转为黑白照片"
@@ -3490,8 +2925,6 @@ function ShotCard({
                       >
                         <Eraser size={16} />
                       </button>
-                        </>
-                      )}
                     </div>
                   )}
                 />
@@ -3505,7 +2938,7 @@ function ShotCard({
             </div>
           ))}
           {Array.from({ length: placeholders }).map((_, index) => (
-            <div className="search-placeholder" key={`placeholder-${index}`}>
+            <div className="ai-image-placeholder" key={`placeholder-${index}`}>
               <strong>暂无 AI 图片</strong>
               <small>可编辑提示词后调用 {imageProviderLabel} 生成</small>
             </div>
@@ -3519,23 +2952,6 @@ function ShotCard({
           >
             <Wand2 size={18} /> {isGeneratingImage ? 'AI 生成中' : imagePrompt !== undefined ? '编辑提示词中' : 'AI 出图'}
           </button>
-          <button type="button" onClick={() => manualUploadRef.current?.click()}>
-            <ImagePlus size={18} /> 手动上传图片
-          </button>
-          <button type="button" onClick={onLibraryUpload}>
-            <Library size={18} /> 从素材库选择
-          </button>
-          <input
-            ref={manualUploadRef}
-            className="hidden-input"
-            type="file"
-            accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"
-            onChange={(event) => {
-              const file = event.target.files?.[0];
-              if (file) onManualUpload?.(file);
-              event.target.value = '';
-            }}
-          />
         </div>
       </div>
     </article>

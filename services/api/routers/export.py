@@ -16,7 +16,6 @@ from services.generation_service import (
     generate_export_srt,
     write_timeline,
 )
-from services.r2_storage import ensure_asset_local
 from services.store import load_db, project_dir, public_url
 from services.video_export_service import (
     create_jianying_native_draft,
@@ -63,8 +62,8 @@ def open_draft_folder(project_id: str):
     return {"path": str(target.resolve())}
 
 
-@router.post("/{project_id}/export/assets")
-def export_assets(project_id: str):
+@router.post("/{project_id}/export/package")
+def export_package(project_id: str):
     db = load_db()
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
@@ -89,8 +88,7 @@ def export_assets(project_id: str):
             "required_object",
             "required_scene",
             "status",
-            "asset_source",
-            "match_score",
+            "image_prompt",
         ])
         writer.writeheader()
         for shot in shots:
@@ -105,24 +103,20 @@ def export_assets(project_id: str):
     cover_source = base / "cover" / "cover.png"
     if cover_source.exists():
         shutil.copy2(cover_source, export_dir / "cover.png")
-    report = []
-    for shot in shots:
-        candidates = [pa for pa in db["project_assets"] if pa["project_id"] == project_id and pa["shot_id"] == shot["id"]]
-        report.append({"shot_id": shot["id"], "shot_index": shot["shot_index"], "status": shot["status"], "candidates": candidates})
-    (export_dir / "asset_match_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     media_dir = export_dir / "media"
     media_dir.mkdir(exist_ok=True)
     exported_scenes = []
     scene_paths = []
     for shot in shots:
         selected_id = shot.get("selected_asset_id")
-        asset = next((a for a in db["assets"] if a["id"] == selected_id), None) if selected_id else None
-        generated = next((a for a in db["generated_assets"] if a["id"] == selected_id), None) if selected_id else None
-        source_value = (
-            str(ensure_asset_local(asset))
-            if asset
-            else (generated or {}).get("local_path", "")
-        )
+        generated = next(
+            (
+                item for item in db["generated_assets"]
+                if item["id"] == selected_id and item.get("asset_source") == "ai_generated"
+            ),
+            None,
+        ) if selected_id else None
+        source_value = (generated or {}).get("local_path", "")
         source = Path(source_value) if source_value else None
         scene_name = f"scene_{int(shot['shot_index']):02d}.png"
         target = media_dir / scene_name
@@ -133,7 +127,7 @@ def export_assets(project_id: str):
             try:
                 with Image.open(source) as image:
                     converted = ImageOps.exif_transpose(image).convert("RGBA")
-                    crop = (generated or asset or {}).get("crop_region") or {}
+                    crop = (generated or {}).get("crop_region") or {}
                     width, height = converted.size
                     crop_width = int(crop.get("image_width") or 0)
                     crop_height = int(crop.get("image_height") or 0)

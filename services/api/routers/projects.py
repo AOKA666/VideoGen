@@ -8,7 +8,7 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from services.store import PROJECTS_DIR, load_db, project_dir, save_db
+from services.store import load_db, project_dir, projects_dir, save_db
 from services.history_workflow_service import (
     STEP_LABELS,
     generate_history_step,
@@ -118,7 +118,7 @@ def list_projects():
         item["shot_count"] = shot_counts.get(str(project.get("id")), 0)
         item["archived"] = bool(project.get("archived", False))
         item["has_export"] = (
-            PROJECTS_DIR / str(project.get("id")) / "exports" / "package" / "export_verification.json"
+            projects_dir() / str(project.get("id")) / "exports" / "package" / "export_verification.json"
         ).exists()
         projects.append(item)
     return {"projects": projects}
@@ -206,7 +206,7 @@ def get_project(project_id: str):
     shots = [s for s in db["shots"] if s["project_id"] == project_id]
     if project.get("status") == "shots_ready":
         completed = sum(1 for shot in shots if shot.get("status") in {
-            "ai_generated", "prompt_ready", "uploaded", "matched",
+            "ai_generated", "prompt_ready",
         })
         if (
             project.get("generation_total") != len(shots)
@@ -221,6 +221,7 @@ def get_project(project_id: str):
     generated_assets = [
         a for a in db.get("generated_assets", [])
         if a.get("project_id") == project_id
+        and a.get("asset_source") == "ai_generated"
         and (not a.get("local_path") or Path(str(a.get("local_path"))).exists())
     ]
     return {
@@ -571,12 +572,12 @@ def delete_project(project_id: str):
 
     db["projects"] = [p for p in db["projects"] if p["id"] != project_id]
     db["shots"] = [s for s in db["shots"] if s.get("project_id") != project_id]
-    db["project_assets"] = [pa for pa in db.get("project_assets", []) if pa.get("project_id") != project_id]
     db["generated_assets"] = [ga for ga in db.get("generated_assets", []) if ga.get("project_id") != project_id]
     save_db(db)
 
-    target = (PROJECTS_DIR / project_id).resolve()
-    if target.exists() and PROJECTS_DIR.resolve() in target.parents:
+    project_root = projects_dir().resolve()
+    target = (project_root / project_id).resolve()
+    if target.exists() and project_root in target.parents:
         shutil.rmtree(target)
 
     return {"status": "deleted", "project_id": project_id}

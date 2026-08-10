@@ -15,7 +15,7 @@ Nginx 会拒绝访问 `/storage/db.json`、内部日志和隐藏文件。API 容
 - Docker Engine 与 Docker Compose v2
 - Git、curl、tar
 - 能访问 GitHub、npm、PyPI 及业务使用的第三方 API
-- 建议至少预留足够的 CPU、内存和临时磁盘用于 FFmpeg；实际规格按单次素材大小压测后确定
+- 建议至少预留足够的 CPU、内存和临时磁盘用于 FFmpeg 与图片生成结果；实际规格按项目规模压测后确定
 
 ## 首次部署
 
@@ -58,8 +58,6 @@ docker compose --env-file .env.production -f compose.production.yml -f compose.t
 
 没有 Access 保护时，不得把 VideoGen 暴露到公网；当前应用本身没有登录鉴权。
 
-> Cloudflare 对单次请求体大小有限制，具体上限取决于账号方案。`ASSET_UPLOAD_MAX_MB=2048` 只代表应用侧上限，并不保证 2GB 文件能经过 Tunnel。正式环境应按 Cloudflare 实际限制设置该值；更大的视频需要改为 R2 直传或分片上传。
-
 ## 发布
 
 ```bash
@@ -77,11 +75,10 @@ git pull --ff-only
 
 1. 首页、`/api/health` 正常。
 2. `/storage/db.json` 和 `/api/system/logs` 从公网返回 404。
-3. 项目列表和素材库可读写，容器重启后仍保留。
-4. R2 上传、读取、同步正常。
-5. 完成一次文案改写、配音、字幕、封面、MP4 导出与下载。
-6. 中文标题和字幕字体正常。
-7. Cloudflare Access 未登录时无法进入站点。
+3. 项目列表、AI 图片和背景音乐在容器重启后仍保留。
+4. 完成一次文案改写、AI 提示词/出图、配音、字幕、封面、MP4 导出与下载。
+5. 中文标题和字幕字体正常。
+6. Cloudflare Access 未登录时无法进入站点。
 
 ## 备份
 
