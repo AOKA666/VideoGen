@@ -27,6 +27,7 @@ from services.text_service import (  # noqa: E402
     normalize_storyboard_model_provider,
     split_script_into_storyboards,
 )
+from services.storyboard_style import sanitize_storyboard_visual_prompt  # noqa: E402
 
 
 class ImagePromptTests(unittest.TestCase):
@@ -159,12 +160,12 @@ class ImagePromptTests(unittest.TestCase):
     def test_seedream_prompt_uses_unified_song_court_ink_style(self) -> None:
         prompt = build_image_prompt({"visual_need": "大殿中武将双手呈上无字奏章"})
 
-        self.assertTrue(prompt.startswith("9:16竖屏，新国风宋式水墨工笔"))
+        self.assertTrue(prompt.startswith("9:16竖屏，新国风宋式工笔画"))
         self.assertIn("古绢泛黄宣纸底色", prompt)
-        self.assertIn("无强烈明暗对比", prompt)
+        self.assertNotIn("无强烈明暗对比", prompt)
         self.assertNotIn("殿内柔光", prompt)
         self.assertNotIn("古朴木质立柱", prompt)
-        self.assertIn("人物为中国古风", prompt)
+        self.assertNotIn("人物为中国古风", prompt)
         self.assertIn("纯手绘国画质感，无厚涂油画笔触，无CG塑料感", prompt)
         self.assertIn("画面全程无任何文字、字幕、水印、logo", prompt)
         self.assertIn("具体画面：大殿中武将双手呈上无字奏章", prompt)
@@ -172,6 +173,29 @@ class ImagePromptTests(unittest.TestCase):
         self.assertNotIn("人物外貌", prompt)
         self.assertNotIn("档案老照片", prompt)
         self.assertEqual("1440x2560", storyboard_image_size())
+
+    def test_storyboard_planner_uses_the_same_new_style_as_image_generation(self) -> None:
+        prompt = _build_storyboard_plan_prompt("第一段。第二段。")
+
+        self.assertIn("新国风宋式工笔画", prompt)
+        self.assertNotIn("新国风宋式水墨工笔", prompt)
+        self.assertIn("尤其禁止写入", prompt)
+        self.assertIn("写实油画风", prompt)
+        self.assertIn("电影感", prompt)
+
+    def test_conflicting_model_style_descriptions_are_removed(self) -> None:
+        prompt = sanitize_storyboard_visual_prompt(
+            "武将站在宫门前，写实油画风格，冷灰色调，电影感构图，强烈光影。"
+        )
+
+        self.assertEqual("武将站在宫门前。", prompt)
+
+        final_prompt = build_image_prompt({
+            "visual_need": "武将站在宫门前，写实历史画风，真实摄影质感，高对比度。",
+        })
+        self.assertIn("具体画面：武将站在宫门前。", final_prompt)
+        self.assertNotIn("写实历史画风", final_prompt)
+        self.assertNotIn("真实摄影质感", final_prompt)
 
     def test_seedream_prompt_does_not_expose_visual_design_instructions(self) -> None:
         prompt = build_image_prompt({"visual_need": "实验室或者戈壁滩上的科学家"})

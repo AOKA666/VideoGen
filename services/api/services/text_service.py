@@ -12,6 +12,11 @@ from difflib import SequenceMatcher
 from functools import lru_cache
 from pathlib import Path
 
+from services.storyboard_style import (
+    STORYBOARD_STYLE_PROMPT,
+    sanitize_storyboard_visual_prompt,
+)
+
 try:
     import jieba
 except ImportError:  # Keyword overlap is diagnostic only; rewriting must still work without jieba.
@@ -2285,13 +2290,7 @@ def is_meaningful_shot_text(text: str) -> bool:
 SHOT_VISUALS_BATCH_SIZE = 9
 LOGGER = logging.getLogger(__name__)
 
-STORYBOARD_STYLE_GUIDANCE = (
-    "9:16竖屏，新国风宋式水墨工笔，古绢泛黄宣纸底色，传统国画白描线条，"
-    "淡墨晕染肌理，低饱和赭石暖金配色，无强烈明暗对比，"
-    "人物线条细腻流畅，画面庄重肃穆，构图居中均衡，"
-    "纯手绘国画质感，无厚涂油画笔触，无CG塑料感，画面全程无任何文字、字幕、"
-    "水印、logo，干净留白古画氛围感"
-)
+STORYBOARD_STYLE_GUIDANCE = STORYBOARD_STYLE_PROMPT
 
 
 NESTED_STORYBOARD_MARKER = re.compile(
@@ -2319,6 +2318,8 @@ def _build_storyboard_plan_prompt(full_script: str) -> str:
 {STORYBOARD_STYLE_GUIDANCE}
 
 所有分镜画面中都禁止出现任何可读文字，包括标题、字幕、书名、牌匾文字、奏章文字、纸张文字、屏幕文字、印章文字、标语、logo和水印。需要出现书籍、匾额、信件、奏章或屏幕时，只表现无字外观，不要描述任何文字内容。
+
+具体图片提示词只描述人物、场景、动作、表情、时代物件和构图，不要另加画风、媒介、色调或光影风格。尤其禁止写入“写实油画风”“写实历史画风”“冷灰色调”“电影感”“强烈光影”“高对比度”“真实摄影质感”等与统一画风冲突的描述。
 
 每个分镜的图片提示词只能描述一个明确瞬间和一个构图，禁止在一条提示词中继续拆分子分镜，禁止输出“分镜6-1”“镜头一/镜头二”或多幅画面方案。
 
@@ -2379,9 +2380,9 @@ def _parse_storyboard_plan(content: str) -> list[dict[str, str]]:
         narration = narration.strip("“”\"'")
         end_quote = str(end_quote_match.group(1) if end_quote_match else "").strip()
         end_quote = end_quote.strip("“”\"'")
-        image_prompt = re.sub(
+        image_prompt = sanitize_storyboard_visual_prompt(re.sub(
             r"\s+", " ", str(prompt_match.group(1) if prompt_match else "")
-        ).strip()
+        ))
         if _contains_nested_storyboards(image_prompt):
             image_prompt = ""
         if shot_index and (narration or end_quote):
@@ -2553,6 +2554,8 @@ def _build_shot_visuals_prompt(shot_items: list[dict], full_script: str) -> str:
 
 所有画面都禁止出现任何可读文字。书籍、匾额、信件、奏章、纸张和屏幕只能呈现无字外观，不要在图片提示词中设计标题、字幕、书名、标语、logo或水印。
 
+统一画面风格由程序自动添加：{STORYBOARD_STYLE_GUIDANCE}。每条提示词只写具体人物、场景、动作、表情、时代物件和构图，不要重复或另加画风、媒介、色调、光影风格。尤其禁止写入“写实油画风”“写实历史画风”“冷灰色调”“电影感”“强烈光影”“高对比度”“真实摄影质感”等冲突描述。
+
 每条图片提示词只能描述一个明确瞬间和一个构图，禁止继续拆分子分镜，禁止输出“分镜6-1”“镜头一/镜头二”或多幅画面方案。
 
 按分镜编号顺序逐条写出图片提示词，能清楚区分每个分镜即可。直接输出结果，不要返回 JSON，也不要解释创作过程。""".strip()
@@ -2578,7 +2581,7 @@ def _parse_storyboard_prompt_lines(
             "",
             match.group(2),
         )
-        image_prompt = re.sub(r"\s+", " ", image_prompt).strip()
+        image_prompt = sanitize_storyboard_visual_prompt(image_prompt)
         if image_prompt and not _contains_nested_storyboards(image_prompt):
             parsed[shot_id] = image_prompt
     if parsed:
@@ -2590,7 +2593,7 @@ def _parse_storyboard_prompt_lines(
     ids = [str(item) for item in (expected_ids or [])]
     if len(ids) == 1 and raw:
         prompt = re.sub(r"^\s*(?:图片)?提示词\s*[：:]\s*", "", raw)
-        prompt = re.sub(r"\s+", " ", prompt).strip()
+        prompt = sanitize_storyboard_visual_prompt(prompt)
         if prompt and not _contains_nested_storyboards(prompt):
             return {ids[0]: prompt}
         return {}
@@ -2602,7 +2605,7 @@ def _parse_storyboard_prompt_lines(
     ]
     if ids and len(blocks) == len(ids):
         return {
-            shot_id: re.sub(r"\s+", " ", prompt).strip()
+            shot_id: sanitize_storyboard_visual_prompt(prompt)
             for shot_id, prompt in zip(ids, blocks)
             if not _contains_nested_storyboards(prompt)
         }

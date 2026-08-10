@@ -22,6 +22,10 @@ from uuid import uuid4
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from services.store import public_url
+from services.storyboard_style import (
+    STORYBOARD_STYLE_PROMPT,
+    sanitize_storyboard_visual_prompt,
+)
 
 
 STORYBOARD_SEEDREAM_MODEL = "doubao-seedream-4-0-250828"
@@ -29,14 +33,6 @@ STORYBOARD_OPENAI_MODEL = "gpt-image-2"
 STORYBOARD_IMAGE_SIZE = "1440x2560"
 OPENAI_FAST_IMAGE_SIZE = "720x1280"
 IMAGE_GENERATION_PROVIDERS = {"seedream", "openai"}
-
-SONG_COURT_STYLE_PROMPT = (
-    "9:16竖屏，新国风宋式工笔画，古绢泛黄宣纸底色，"
-    "传统国画白描线条，淡墨晕染肌理，低饱和赭石暖金配色，"
-    "线条细腻流畅，画面清晰，构图居中均衡，"
-    "纯手绘国画质感，无厚涂油画笔触，无CG塑料感，"
-    "画面全程无任何文字、字幕、水印、logo，干净留白古画氛围感；"
-)
 
 def generate_svg_placeholder(path: Path, shot: dict) -> str:
     prompt = build_image_prompt(shot)
@@ -65,10 +61,10 @@ def generate_svg_placeholder(path: Path, shot: dict) -> str:
 
 
 def build_image_prompt(shot: dict) -> str:
-    visual_need = str(shot.get("visual_need") or "").strip()
+    visual_need = sanitize_storyboard_visual_prompt(shot.get("visual_need"))
     if not visual_need or visual_need == "待AI生成画面描述":
         raise ValueError("DeepSeek did not return an image prompt for this shot")
-    return f"{SONG_COURT_STYLE_PROMPT}具体画面：{visual_need}"
+    return f"{STORYBOARD_STYLE_PROMPT}；具体画面：{visual_need}"
 
 
 def ark_endpoint() -> str:
