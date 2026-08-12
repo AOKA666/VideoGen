@@ -15,6 +15,7 @@ API_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(API_ROOT))
 
 from routers.shots import _generate_ai_images, ai_image_concurrency  # noqa: E402
+from services.store import db_write_transaction  # noqa: E402
 
 
 class ShotAiConcurrencyTests(unittest.TestCase):
@@ -84,6 +85,34 @@ class ShotAiConcurrencyTests(unittest.TestCase):
         project = state["projects"][0]
         self.assertEqual("shots_ready", project["status"])
         self.assertEqual(4, project["generation_completed"])
+
+    def test_batch_and_manual_generation_share_the_same_database_transaction(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        def hold_transaction():
+            with db_write_transaction():
+                entered.set()
+                release.wait(timeout=2)
+
+        holder = threading.Thread(target=hold_transaction)
+        holder.start()
+        self.assertTrue(entered.wait(timeout=1))
+
+        acquired = threading.Event()
+
+        def wait_for_transaction():
+            with db_write_transaction():
+                acquired.set()
+
+        waiter = threading.Thread(target=wait_for_transaction)
+        waiter.start()
+        time.sleep(0.05)
+        self.assertFalse(acquired.is_set())
+        release.set()
+        holder.join(timeout=1)
+        waiter.join(timeout=1)
+        self.assertTrue(acquired.is_set())
 
 
 if __name__ == "__main__":

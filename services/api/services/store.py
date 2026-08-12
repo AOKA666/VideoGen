@@ -5,6 +5,7 @@ import os
 import re
 import threading
 import time
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +33,13 @@ _DB_CACHE_MTIME_NS: int | None = None
 _STORAGE_INITIALIZED = False
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 _SHOT_FILE_PATTERN = re.compile(r"^shot_(\d+)\.(?:png|jpe?g|webp)$", re.IGNORECASE)
+
+
+@contextmanager
+def db_write_transaction():
+    """Serialize a complete load/modify/save database transaction."""
+    with _DB_LOCK:
+        yield
 
 
 def configure_storage(path: str | Path) -> None:

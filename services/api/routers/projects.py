@@ -8,7 +8,7 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from services.store import load_db, project_dir, projects_dir, save_db
+from services.store import db_write_transaction, load_db, project_dir, projects_dir, save_db
 from services.history_workflow_service import (
     STEP_LABELS,
     generate_history_step,
@@ -199,24 +199,28 @@ def delete_promotion_book(title: str):
 
 @router.get("/{project_id}")
 def get_project(project_id: str):
-    db = load_db()
-    project = next((p for p in db["projects"] if p["id"] == project_id), None)
-    if not project:
-        raise HTTPException(404, "Project not found")
-    shots = [s for s in db["shots"] if s["project_id"] == project_id]
-    if project.get("status") == "shots_ready":
+    with db_write_transaction():
+        db = load_db()
+        project = next((p for p in db["projects"] if p["id"] == project_id), None)
+        if not project:
+            raise HTTPException(404, "Project not found")
+        shots = [s for s in db["shots"] if s["project_id"] == project_id]
         completed = sum(1 for shot in shots if shot.get("status") in {
-            "ai_generated", "prompt_ready",
+            "ai_generated", "prompt_ready", "no_image",
         })
-        if (
+        generation_finished = bool(shots) and completed == len(shots)
+        if project.get("status") in {"shots_ready", "generating_images"} and (
             project.get("generation_total") != len(shots)
             or project.get("generation_completed") != completed
-            or (completed == len(shots) and project.get("generation_stage") != "done")
+            or (generation_finished and project.get("generation_stage") != "done")
         ):
             project["generation_total"] = len(shots)
             project["generation_completed"] = completed
-            if completed == len(shots):
+            if generation_finished:
+                project["status"] = "shots_ready"
                 project["generation_stage"] = "done"
+                project["current_shot_index"] = None
+                project["current_generation_message"] = ""
             save_db(db)
     generated_assets = [
         a for a in db.get("generated_assets", [])

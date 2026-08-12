@@ -29,7 +29,7 @@ from services.generation_service import (
     write_timeline,
     normalize_cover_title_positions,
 )
-from services.store import load_db, project_dir, public_url, save_db
+from services.store import db_write_transaction, load_db, project_dir, public_url, save_db
 from services.text_service import generate_publish_assistant, generate_viral_title
 
 router = APIRouter(prefix="/api/projects", tags=["generation"])
@@ -245,7 +245,7 @@ def convert_generated_image_grayscale(project_id: str, asset_id: str):
     except Exception as exc:
         raise HTTPException(500, f"Convert image to grayscale failed: {exc}") from exc
     # Concurrent conversions must not save stale DB snapshots over each other.
-    with GENERATED_IMAGE_SAVE_LOCK:
+    with GENERATED_IMAGE_SAVE_LOCK, db_write_transaction():
         db = load_db()
         asset, path = _generated_image(db, project_id, asset_id)
         asset["is_grayscale"] = True
@@ -347,7 +347,7 @@ def generate_image(project_id: str, shot_id: str, payload: ImageGenerationPayloa
         raise HTTPException(502, str(exc)) from exc
     prompt = result["prompt"]
     generated_id = str(uuid4())
-    with GENERATED_IMAGE_SAVE_LOCK:
+    with GENERATED_IMAGE_SAVE_LOCK, db_write_transaction():
         # Reload after the slow AI request. Other image generations or prompt
         # recognition may have completed while this request was in flight; using
         # the pre-request snapshot here would silently overwrite their changes.

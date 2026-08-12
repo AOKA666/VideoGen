@@ -9,7 +9,7 @@ from uuid import uuid4
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 
 from services.generation_service import build_image_prompt, generate_ai_image, generated_image_extension
-from services.store import load_db, project_dir, public_url, save_db
+from services.store import db_write_transaction, load_db, project_dir, public_url, save_db
 from services.text_service import ai_generate_shot_visuals, generate_shots
 
 router = APIRouter(prefix="/api/projects", tags=["shots"])
@@ -37,106 +37,105 @@ def _generate_one_ai_image(
     return generated_shot, out, result
 
 
+def _save_completed_ai_image(
+    project_id: str,
+    run_id: str,
+    generated_shot: dict,
+    result: dict | None,
+    out: object | None,
+    generation_error: Exception | None,
+    completed: int,
+    total: int,
+    failed: int,
+) -> bool:
+    db = load_db()
+    project = next((p for p in db["projects"] if p["id"] == project_id), None)
+    shot_id = generated_shot["id"]
+    shot = next((s for s in db["shots"] if s.get("id") == shot_id), None)
+    if not project or project.get("shot_generation_run_id") != run_id:
+        return False
+    if generation_error is not None:
+        if shot:
+            shot["status"] = "no_image"
+            shot["image_generation_error"] = str(generation_error)[:500]
+            shot["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        project["generation_error"] = f"{failed} 个分镜 AI 图片生成失败"
+    elif shot and result is not None and out is not None:
+        generated_id = str(uuid4())
+        db.setdefault("generated_assets", []).append({
+            "id": generated_id, "project_id": project_id, "shot_id": shot_id,
+            "type": "image", "asset_source": "ai_generated",
+            "prompt": result["prompt"], "provider": result.get("provider"),
+            "model": result.get("model"), "image_size": result.get("image_size"),
+            "remote_url": result.get("remote_url"), "seed": result.get("seed"),
+            "file_url": public_url(out), "local_path": str(out), "status": "success",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        shot.update({
+            "selected_asset_id": generated_id, "asset_source": "ai_generated",
+            "image_prompt": result["prompt"], "status": "ai_generated",
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        })
+    project.update({
+        "generation_stage": "generating_ai_images", "generation_completed": completed,
+        "generation_total": total, "current_shot_index": generated_shot.get("shot_index"),
+        "current_generation_message": f"正在并发生成 AI 图片：{completed}/{total}",
+        "ai_image_concurrency": ai_image_concurrency(total),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    })
+    save_db(db)
+    return True
+
+
 def _generate_ai_images(
     project_id: str,
     run_id: str,
     shots: list[dict],
     image_generation_provider: str = "seedream",
 ) -> None:
-    """Generate and select one AI image for every newly created shot."""
+    """Generate concurrently while committing every result atomically."""
     total = len(shots)
     failed = 0
-    completed = 0
     executor = ThreadPoolExecutor(
         max_workers=ai_image_concurrency(total),
         thread_name_prefix=f"ai-image-{project_id[:8]}",
     )
     futures = {
-        executor.submit(
-            _generate_one_ai_image,
-            project_id,
-            generated_shot,
-            image_generation_provider,
-        ): generated_shot
-        for generated_shot in shots
+        executor.submit(_generate_one_ai_image, project_id, shot, image_generation_provider): shot
+        for shot in shots
     }
     try:
-        completed_futures = as_completed(futures)
-        for future in completed_futures:
+        for completed, future in enumerate(as_completed(futures), start=1):
             generated_shot = futures[future]
-            completed += 1
-            shot_id = generated_shot["id"]
-            result = None
-            out = None
-            generation_error = None
+            result = out = generation_error = None
             try:
                 _, out, result = future.result()
             except Exception as exc:
                 generation_error = exc
-
-            # Network/image work runs concurrently. Database mutations stay on
-            # this coordinator thread so completed workers cannot overwrite one
-            # another's project progress or generated-assets records.
-            db = load_db()
-            project = next((p for p in db["projects"] if p["id"] == project_id), None)
-            shot = next((s for s in db["shots"] if s.get("id") == shot_id), None)
-            if not project or project.get("shot_generation_run_id") != run_id:
+                failed += 1
+            with db_write_transaction():
+                is_current_run = _save_completed_ai_image(
+                    project_id, run_id, generated_shot, result, out,
+                    generation_error, completed, total, failed,
+                )
+            if not is_current_run:
                 for pending in futures:
                     pending.cancel()
                 return
-            if generation_error is not None:
-                failed += 1
-                if shot:
-                    shot["status"] = "no_image"
-                    shot["image_generation_error"] = str(generation_error)[:500]
-                    shot["updated_at"] = datetime.now().isoformat(timespec="seconds")
-                project["generation_error"] = f"{failed} 个分镜 AI 图片生成失败"
-            elif shot and result is not None and out is not None:
-                generated_id = str(uuid4())
-                db.setdefault("generated_assets", []).append({
-                    "id": generated_id,
-                    "project_id": project_id,
-                    "shot_id": shot_id,
-                    "type": "image",
-                    "asset_source": "ai_generated",
-                    "prompt": result["prompt"],
-                    "provider": result.get("provider"),
-                    "model": result.get("model"),
-                    "image_size": result.get("image_size"),
-                    "remote_url": result.get("remote_url"),
-                    "seed": result.get("seed"),
-                    "file_url": public_url(out),
-                    "local_path": str(out),
-                    "status": "success",
-                    "created_at": datetime.now().isoformat(timespec="seconds"),
-                })
-                shot["selected_asset_id"] = generated_id
-                shot["asset_source"] = "ai_generated"
-                shot["image_prompt"] = result["prompt"]
-                shot["status"] = "ai_generated"
-                shot["updated_at"] = datetime.now().isoformat(timespec="seconds")
-            project["generation_stage"] = "generating_ai_images"
-            project["generation_completed"] = completed
-            project["generation_total"] = total
-            project["current_shot_index"] = generated_shot.get("shot_index")
-            project["current_generation_message"] = f"正在并发生成 AI 图片：{completed}/{total}"
-            project["ai_image_concurrency"] = ai_image_concurrency(total)
-            project["updated_at"] = datetime.now().isoformat(timespec="seconds")
-            save_db(db)
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
 
-    db = load_db()
-    project = next((p for p in db["projects"] if p["id"] == project_id), None)
-    if project and project.get("shot_generation_run_id") == run_id:
-        project["status"] = "shots_ready"
-        project["generation_stage"] = "done"
-        project["generation_completed"] = total
-        project["generation_total"] = total
-        project["current_shot_index"] = None
-        project["current_generation_message"] = ""
-        project["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        save_db(db)
+    with db_write_transaction():
+        db = load_db()
+        project = next((p for p in db["projects"] if p["id"] == project_id), None)
+        if project and project.get("shot_generation_run_id") == run_id:
+            project.update({
+                "status": "shots_ready", "generation_stage": "done",
+                "generation_completed": total, "generation_total": total,
+                "current_shot_index": None, "current_generation_message": "",
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            })
+            save_db(db)
 
 
 def _save_image_prompts(project: dict, shots: list[dict], now: str) -> None:
