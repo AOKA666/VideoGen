@@ -112,7 +112,9 @@ def export_package(project_id: str):
         generated = next(
             (
                 item for item in db["generated_assets"]
-                if item["id"] == selected_id and item.get("asset_source") == "ai_generated"
+                if item["id"] == selected_id
+                and item.get("project_id") == project_id
+                and item.get("shot_id") == shot.get("id")
             ),
             None,
         ) if selected_id else None

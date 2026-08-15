@@ -354,15 +354,14 @@ def select_generated_image(project_id: str, shot_id: str, payload: dict):
             if item.get("id") == asset_id
             and item.get("project_id") == project_id
             and item.get("shot_id") == shot_id
-            and item.get("asset_source") == "ai_generated"
         ),
         None,
     )
     if asset_id and not asset:
-        raise HTTPException(404, "AI-generated image not found")
+        raise HTTPException(404, "Storyboard image not found")
 
     shot["selected_asset_id"] = asset_id
-    shot["asset_source"] = "ai_generated" if asset_id else None
+    shot["asset_source"] = asset.get("asset_source") if asset else None
     shot["status"] = "ai_generated" if asset_id else "no_image"
     shot["updated_at"] = datetime.now().isoformat(timespec="seconds")
     save_db(db)

@@ -117,22 +117,26 @@ class ImagePromptTests(unittest.TestCase):
         self.assertEqual("随后把事实交给真正能处理的人。", result[1]["voice_text"])
         self.assertEqual("最后事情解决了。", result[2]["voice_text"])
 
-    def test_generate_shots_uses_deepseek_storyboard_boundaries_and_prompts(self) -> None:
+    def test_generate_shots_realigns_prompts_after_storyboard_boundaries_are_final(self) -> None:
         plan = [
-            {"shot_index": index, "voice_text": f"第{index}段。", "visual_need": f"第{index}幅具体画面"}
+            {"shot_index": index, "voice_text": f"第{index}段。", "visual_need": f"错位的第{index}幅画面"}
             for index in range(1, 7)
         ]
         with patch("services.text_service.ai_generate_storyboard_plan", return_value=plan), patch(
-            "services.text_service.ai_generate_shot_visuals"
-        ) as legacy_visuals:
+            "services.text_service.ai_generate_shot_visuals",
+            return_value={
+                str(index): {"visual_need": f"与第{index}段对应的画面"}
+                for index in range(1, 7)
+            },
+        ) as aligned_visuals:
             shots = generate_shots("".join(item["voice_text"] for item in plan))
 
-        legacy_visuals.assert_not_called()
+        aligned_visuals.assert_called_once()
         self.assertEqual(6, len(shots))
         self.assertEqual("第1段。", shots[0]["voice_text"])
-        self.assertEqual("第6幅具体画面", shots[5]["visual_need"])
+        self.assertEqual("与第6段对应的画面", shots[5]["visual_need"])
 
-    def test_generate_shots_regenerates_only_invalid_visuals(self) -> None:
+    def test_generate_shots_requires_realigned_visuals_for_every_shot(self) -> None:
         plan = [
             {"shot_index": index, "voice_text": f"第{index}段。", "visual_need": f"第{index}幅具体画面"}
             for index in range(1, 7)
@@ -140,14 +144,17 @@ class ImagePromptTests(unittest.TestCase):
         plan[5]["visual_need"] = ""
         with patch("services.text_service.ai_generate_storyboard_plan", return_value=plan), patch(
             "services.text_service.ai_generate_shot_visuals",
-            return_value={"6": {"visual_need": "单一的第6幅具体画面"}},
+            return_value={
+                str(index): {"visual_need": f"重新对齐的第{index}幅具体画面"}
+                for index in range(1, 7)
+            },
         ) as regenerate_visuals:
             shots = generate_shots("".join(item["voice_text"] for item in plan))
 
         requested_shots = regenerate_visuals.call_args.args[0]
-        self.assertEqual([6], [shot["shot_index"] for shot in requested_shots])
-        self.assertEqual("第1幅具体画面", shots[0]["visual_need"])
-        self.assertEqual("单一的第6幅具体画面", shots[5]["visual_need"])
+        self.assertEqual(list(range(1, 7)), [shot["shot_index"] for shot in requested_shots])
+        self.assertEqual("重新对齐的第1幅具体画面", shots[0]["visual_need"])
+        self.assertEqual("重新对齐的第6幅具体画面", shots[5]["visual_need"])
 
     def test_local_narration_fallback_honors_ai_selected_shot_count(self) -> None:
         script = "".join(f"第{index}段讲述一个转折。" for index in range(1, 20))

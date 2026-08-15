@@ -34,6 +34,13 @@ from services.text_service import generate_publish_assistant, generate_viral_tit
 
 router = APIRouter(prefix="/api/projects", tags=["generation"])
 GENERATED_IMAGE_SAVE_LOCK = threading.Lock()
+STORYBOARD_UPLOAD_MAX_BYTES = 20 * 1024 * 1024
+STORYBOARD_UPLOAD_MAX_PIXELS = 40_000_000
+STORYBOARD_UPLOAD_FORMATS = {
+    "JPEG": (".jpg", "RGB"),
+    "PNG": (".png", "RGBA"),
+    "WEBP": (".webp", "RGBA"),
+}
 
 
 class VoicePayload(BaseModel):
@@ -103,11 +110,48 @@ def _refresh_image_metadata(asset: dict, path: Path, operation: str) -> None:
 
 def _normalize_image_format(path: Path) -> None:
     with Image.open(path) as source:
-        image = source.convert("RGBA" if path.suffix.lower() == ".png" else "RGB")
+        supports_alpha = path.suffix.lower() in {".png", ".webp"}
+        has_alpha = "A" in source.getbands() or "transparency" in source.info
+        image = source.convert("RGBA" if supports_alpha and has_alpha else "RGB")
         image.load()
-    save_format = "PNG" if path.suffix.lower() == ".png" else "JPEG"
-    save_options = {"quality": 95} if save_format == "JPEG" else {}
+    save_format = {".png": "PNG", ".webp": "WEBP"}.get(path.suffix.lower(), "JPEG")
+    save_options = {"quality": 95} if save_format in {"JPEG", "WEBP"} else {}
     image.save(path, format=save_format, **save_options)
+
+
+def _store_storyboard_upload(file: UploadFile, target_stem: Path) -> tuple[Path, int, int]:
+    temporary_path = target_stem.with_suffix(".upload")
+    temporary_path.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    try:
+        with temporary_path.open("wb") as output:
+            while chunk := file.file.read(1024 * 1024):
+                written += len(chunk)
+                if written > STORYBOARD_UPLOAD_MAX_BYTES:
+                    raise ValueError("图片不能超过 20 MB")
+                output.write(chunk)
+        if not written:
+            raise ValueError("上传的图片为空")
+
+        with Image.open(temporary_path) as source:
+            image_format = str(source.format or "").upper()
+            if image_format not in STORYBOARD_UPLOAD_FORMATS:
+                raise ValueError("仅支持 JPG、PNG、WEBP 图片")
+            source.load()
+            image = ImageOps.exif_transpose(source)
+            width, height = image.size
+            if width <= 0 or height <= 0 or width * height > STORYBOARD_UPLOAD_MAX_PIXELS:
+                raise ValueError("图片尺寸无效或像素总数超过 4000 万")
+            suffix, alpha_mode = STORYBOARD_UPLOAD_FORMATS[image_format]
+            has_alpha = "A" in image.getbands() or "transparency" in image.info
+            image = image.convert(alpha_mode if has_alpha else "RGB")
+
+        target = target_stem.with_suffix(suffix)
+        save_options = {"quality": 95} if image_format in {"JPEG", "WEBP"} else {"optimize": True}
+        image.save(target, format=image_format, **save_options)
+        return target, width, height
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _crop_square(path: Path) -> None:
@@ -278,7 +322,7 @@ def crop_selected_images(project_id: str):
             ),
             None,
         )
-        if not asset or asset.get("asset_source") != "ai_generated":
+        if not asset:
             skipped += 1
             continue
         path = Path(str(asset.get("local_path") or ""))
@@ -392,6 +436,56 @@ def generate_image(project_id: str, shot_id: str, payload: ImageGenerationPayloa
         "image_size": result.get("image_size"),
         "status": "success",
     }
+
+
+@router.post("/{project_id}/shots/{shot_id}/upload-image")
+def upload_shot_image(project_id: str, shot_id: str, file: UploadFile = File(...)):
+    db = load_db()
+    shot = next((s for s in db["shots"] if s["project_id"] == project_id and s["id"] == shot_id), None)
+    if not shot:
+        raise HTTPException(404, "Shot not found")
+
+    asset_id = str(uuid4())
+    original_name = Path(file.filename or "storyboard-image").name
+    target_stem = project_dir(project_id) / "images" / "uploads" / f"shot_{shot['shot_index']:03d}_{asset_id}"
+    try:
+        target, width, height = _store_storyboard_upload(file, target_stem)
+    except Exception as exc:
+        for candidate in target_stem.parent.glob(f"{target_stem.name}.*"):
+            candidate.unlink(missing_ok=True)
+        raise HTTPException(400, f"分镜图片上传失败：{exc}") from exc
+
+    now = datetime.now().isoformat(timespec="seconds")
+    with GENERATED_IMAGE_SAVE_LOCK, db_write_transaction():
+        db = load_db()
+        shot = next((s for s in db["shots"] if s["project_id"] == project_id and s["id"] == shot_id), None)
+        if not shot:
+            target.unlink(missing_ok=True)
+            raise HTTPException(404, "Shot not found after image upload")
+        asset = {
+            "id": asset_id,
+            "project_id": project_id,
+            "shot_id": shot_id,
+            "type": "image",
+            "file_type": "image",
+            "file_name": original_name,
+            "asset_source": "uploaded",
+            "provider": "user_upload",
+            "width": width,
+            "height": height,
+            "file_size": target.stat().st_size,
+            "file_url": public_url(target),
+            "local_path": str(target),
+            "status": "success",
+            "created_at": now,
+        }
+        db.setdefault("generated_assets", []).append(asset)
+        shot["selected_asset_id"] = asset_id
+        shot["asset_source"] = "uploaded"
+        shot["status"] = "ai_generated"
+        shot["updated_at"] = now
+        save_db(db)
+    return {"status": "success", "shot": shot, "asset": asset}
 
 
 @router.post("/{project_id}/generate-voice")

@@ -225,7 +225,7 @@ def get_project(project_id: str):
     generated_assets = [
         a for a in db.get("generated_assets", [])
         if a.get("project_id") == project_id
-        and a.get("asset_source") == "ai_generated"
+        and a.get("asset_source") in {"ai_generated", "uploaded"}
         and (not a.get("local_path") or Path(str(a.get("local_path"))).exists())
     ]
     return {

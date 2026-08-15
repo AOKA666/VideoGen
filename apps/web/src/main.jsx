@@ -316,6 +316,7 @@ function App() {
   const [processingImage, setProcessingImage] = useState('');
   const [grayscaleProcessingIds, setGrayscaleProcessingIds] = useState(new Set());
   const [generatingShotIds, setGeneratingShotIds] = useState(new Set());
+  const [uploadingShotIds, setUploadingShotIds] = useState(new Set());
   const [recognizingShotIds, setRecognizingShotIds] = useState(new Set());
   const [imagePromptEditors, setImagePromptEditors] = useState({});
   const [materialSourceStrategy, setMaterialSourceStrategy] = useState('ai_only');
@@ -1070,6 +1071,42 @@ function App() {
     }
   }
 
+  async function uploadShotImage(shotId, file) {
+    if (!file) return;
+    const hasSupportedType = ['image/jpeg', 'image/png', 'image/webp'].includes(file.type);
+    const hasSupportedExtension = /\.(?:jpe?g|png|webp)$/i.test(file.name || '');
+    if (!hasSupportedType && !hasSupportedExtension) {
+      setMessage('仅支持 JPG、PNG、WEBP 图片');
+      return;
+    }
+    if (file.size > 20 * 1024 * 1024) {
+      setMessage('分镜图片不能超过 20 MB');
+      return;
+    }
+    const data = new FormData();
+    data.append('file', file, file.name);
+    closeImagePromptEditor(shotId);
+    setUploadingShotIds((current) => new Set(current).add(shotId));
+    setMessage('分镜图片上传中，可继续处理其他镜头');
+    try {
+      const result = await request(`/api/projects/${projectId}/shots/${shotId}/upload-image`, {
+        method: 'POST',
+        body: data,
+      });
+      setShots((current) => current.map((shot) => (shot.id === shotId ? result.shot : shot)));
+      setGeneratedAssets((current) => [...current, result.asset]);
+      setMessage(`镜头 ${result.shot.shot_index} 图片上传完成并已选中`);
+    } catch (err) {
+      setMessage(`分镜图片上传失败：${err.message}`);
+    } finally {
+      setUploadingShotIds((current) => {
+        const next = new Set(current);
+        next.delete(shotId);
+        return next;
+      });
+    }
+  }
+
   async function setProjectArchived(item, archived) {
     const result = await run(archived ? '归档项目' : '恢复项目', () => request(`/api/projects/${item.id}/script`, {
       method: 'PATCH',
@@ -1206,7 +1243,7 @@ function App() {
   }
 
   async function selectAsset(shotId, assetId) {
-    const result = await run('选择 AI 图片', () => request(`/api/projects/${projectId}/shots/${shotId}/asset`, {
+    const result = await run('选择分镜图片', () => request(`/api/projects/${projectId}/shots/${shotId}/asset`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ asset_id: assetId }),
@@ -2046,6 +2083,8 @@ function App() {
                   processingImage={processingImage}
                   grayscaleProcessingIds={grayscaleProcessingIds}
                   generatingShotIds={generatingShotIds}
+                  uploadingShotIds={uploadingShotIds}
+                  onUploadImage={(file) => uploadShotImage(shot.id, file)}
                   onRemoveWatermark={(assetId) => processGeneratedImage(assetId, 'remove-watermark')}
                   onGrayscale={(assetId) => processGeneratedImage(assetId, 'grayscale')}
                 />
@@ -2115,6 +2154,8 @@ function App() {
                     processingImage={processingImage}
                     grayscaleProcessingIds={grayscaleProcessingIds}
                     generatingShotIds={generatingShotIds}
+                    uploadingShotIds={uploadingShotIds}
+                    onUploadImage={(file) => uploadShotImage(shot.id, file)}
                     onRemoveWatermark={(assetId) => processGeneratedImage(assetId, 'remove-watermark')}
                     onGrayscale={(assetId) => processGeneratedImage(assetId, 'grayscale')}
                   />
@@ -2783,6 +2824,8 @@ function ShotCard({
   processingImage,
   grayscaleProcessingIds,
   generatingShotIds,
+  uploadingShotIds,
+  onUploadImage,
   onRemoveWatermark,
   onGrayscale,
 }) {
@@ -2792,6 +2835,7 @@ function ShotCard({
     if (!editingVoiceText) setVoiceTextDraft(shot.voice_text || '');
   }, [shot.voice_text, editingVoiceText]);
   const isGeneratingImage = generatingShotIds.has(shot.id);
+  const isUploadingImage = uploadingShotIds.has(shot.id);
   const visibleAssets = [...assets]
     .sort((a, b) => (b.id === selectedAssetId ? 1 : 0) - (a.id === selectedAssetId ? 1 : 0))
     .slice(0, 2);
@@ -2875,6 +2919,13 @@ function ShotCard({
               <small>{imageProviderLabel} 正在绘制 9:16 竖屏图片，请稍候</small>
             </div>
           )}
+          {isUploadingImage && (
+            <div className="ai-generating-overlay upload-image-overlay">
+              <ImagePlus size={26} />
+              <strong>图片上传中</strong>
+              <small>正在检查并保存这张分镜图片</small>
+            </div>
+          )}
           {visibleAssets.map((item) => (
             <div
               className={`${item.id === selectedAssetId ? 'image-choice selected' : 'image-choice'} ${grayscaleProcessingIds.has(item.id) ? 'converting-grayscale' : ''}`.trim()}
@@ -2939,8 +2990,8 @@ function ShotCard({
           ))}
           {Array.from({ length: placeholders }).map((_, index) => (
             <div className="ai-image-placeholder" key={`placeholder-${index}`}>
-              <strong>暂无 AI 图片</strong>
-              <small>可编辑提示词后调用 {imageProviderLabel} 生成</small>
+              <strong>暂无分镜图片</strong>
+              <small>可上传本地图片，或调用 {imageProviderLabel} 生成</small>
             </div>
           ))}
         </div>
@@ -2948,10 +2999,23 @@ function ShotCard({
           <button
             className={isGeneratingImage ? 'ai-generate-button active' : 'ai-generate-button'}
             onClick={onOpenImagePrompt}
-            disabled={isGeneratingImage}
+            disabled={isGeneratingImage || isUploadingImage}
           >
             <Wand2 size={18} /> {isGeneratingImage ? 'AI 生成中' : imagePrompt !== undefined ? '编辑提示词中' : 'AI 出图'}
           </button>
+          <label className={isGeneratingImage || isUploadingImage ? 'button-like disabled' : 'button-like'}>
+            <ImagePlus size={18} /> {isUploadingImage ? '上传中…' : '上传图片'}
+            <input
+              type="file"
+              accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
+              disabled={isGeneratingImage || isUploadingImage}
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                event.target.value = '';
+                if (file) onUploadImage?.(file);
+              }}
+            />
+          </label>
         </div>
       </div>
     </article>

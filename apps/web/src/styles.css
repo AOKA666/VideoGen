@@ -1999,9 +1999,33 @@ h3 { font-size: 16px; line-height: 1.48; }
 }
 .shot-bottom-actions {
   display: grid;
-  grid-template-columns: minmax(0, 1fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
 }
+.shot-bottom-actions .button-like {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 8px 12px;
+  border: 1px solid #c5ccc4;
+  border-radius: 7px;
+  color: #33434b;
+  background: #fff;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.shot-bottom-actions .button-like:hover { border-color: var(--brand); color: var(--brand); }
+.shot-bottom-actions .button-like.disabled { opacity: .55; cursor: not-allowed; }
+.shot-bottom-actions .button-like input { display: none; }
+.upload-image-overlay {
+  border-color: rgba(36, 103, 91, .42);
+  color: #174f46;
+  background: rgba(222, 242, 236, .92);
+}
+.upload-image-overlay small { color: #3f6d65; }
 .ai-image-placeholder {
   position: relative;
   display: grid;

@@ -2552,6 +2552,8 @@ def _build_shot_visuals_prompt(shot_items: list[dict], full_script: str) -> str:
 分镜旁白：
 {json.dumps(shot_items, ensure_ascii=False)}
 
+每条图片提示词必须只描绘同一编号“voice_text”中出现的人物、事件或核心意象，不得挪用前一镜或后一镜的内容。先逐条核对编号与旁白，再输出对应提示词。
+
 所有画面都禁止出现任何可读文字。书籍、匾额、信件、奏章、纸张和屏幕只能呈现无字外观，不要在图片提示词中设计标题、字幕、书名、标语、logo或水印。
 
 统一画面风格由程序自动添加：{STORYBOARD_STYLE_GUIDANCE}。每条提示词只写具体人物、场景、动作、表情、时代物件和构图，不要重复或另加画风、媒介、色调、光影风格。尤其禁止写入“写实油画风”“写实历史画风”“冷灰色调”“电影感”“强烈光影”“高对比度”“真实摄影质感”等冲突描述。
@@ -3191,18 +3193,19 @@ def generate_shots(
         })
         cursor += duration
 
-    missing_visuals = [shot for shot in shots if not shot["visual_need"]]
-    if missing_visuals:
-        visuals = ai_generate_shot_visuals(missing_visuals, script, model_provider=provider)
-        for shot in missing_visuals:
-            visual = visuals.get(str(shot["shot_index"]))
-            if not visual or not visual.get("visual_need"):
-                raise RuntimeError(f"{provider} did not return shot {shot['shot_index']}")
-            shot["visual_need"] = visual["visual_need"]
-            shot["object_tags"] = visual.get("object_tags") or []
-            shot["required_object"] = shot["object_tags"]
-            shot["scene_tags"] = visual.get("scene_tags") or []
-            shot["required_scene"] = shot["scene_tags"]
-            shot["keywords"] = visual.get("keywords") or []
+    # The planning response decides the narration boundaries. Generate visuals
+    # only after those exact, lossless narration chunks exist so an image from
+    # a neighbouring planned section cannot be attached to the wrong shot.
+    visuals = ai_generate_shot_visuals(shots, script, model_provider=provider)
+    for shot in shots:
+        visual = visuals.get(str(shot["shot_index"]))
+        if not visual or not visual.get("visual_need"):
+            raise RuntimeError(f"{provider} did not return shot {shot['shot_index']}")
+        shot["visual_need"] = visual["visual_need"]
+        shot["object_tags"] = visual.get("object_tags") or []
+        shot["required_object"] = shot["object_tags"]
+        shot["scene_tags"] = visual.get("scene_tags") or []
+        shot["required_scene"] = shot["scene_tags"]
+        shot["keywords"] = visual.get("keywords") or []
 
     return shots
