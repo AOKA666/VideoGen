@@ -3193,10 +3193,18 @@ def generate_shots(
         })
         cursor += duration
 
-    # The planning response decides the narration boundaries. Generate visuals
-    # only after those exact, lossless narration chunks exist so an image from
-    # a neighbouring planned section cannot be attached to the wrong shot.
-    visuals = ai_generate_shot_visuals(shots, script, model_provider=provider)
+    # The planning response decides the narration boundaries. Generate each
+    # visual in an isolated request containing only that shot's final narration.
+    # Sending the whole script and all shot rows in one request allowed models
+    # to shift a good visual into the following row and accumulate visible lag.
+    visuals: dict[str, dict] = {}
+    for shot in shots:
+        shot_visuals = ai_generate_shot_visuals(
+            [shot],
+            str(shot["voice_text"]),
+            model_provider=provider,
+        )
+        visuals.update(shot_visuals)
     for shot in shots:
         visual = visuals.get(str(shot["shot_index"]))
         if not visual or not visual.get("visual_need"):
@@ -3207,5 +3215,11 @@ def generate_shots(
         shot["scene_tags"] = visual.get("scene_tags") or []
         shot["required_scene"] = shot["scene_tags"]
         shot["keywords"] = visual.get("keywords") or []
+        LOGGER.info(
+            "storyboard visual aligned shot=%s voice=%r prompt=%r",
+            shot["shot_index"],
+            str(shot["voice_text"])[:100],
+            str(shot["visual_need"])[:140],
+        )
 
     return shots

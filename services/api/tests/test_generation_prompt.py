@@ -122,16 +122,19 @@ class ImagePromptTests(unittest.TestCase):
             {"shot_index": index, "voice_text": f"第{index}段。", "visual_need": f"错位的第{index}幅画面"}
             for index in range(1, 7)
         ]
+        def aligned_visual(shot_items, full_script, model_provider="deepseek"):
+            shot = shot_items[0]
+            self.assertEqual(shot["voice_text"], full_script)
+            return {str(shot["shot_index"]): {
+                "visual_need": f"与第{shot['shot_index']}段对应的画面",
+            }}
+
         with patch("services.text_service.ai_generate_storyboard_plan", return_value=plan), patch(
-            "services.text_service.ai_generate_shot_visuals",
-            return_value={
-                str(index): {"visual_need": f"与第{index}段对应的画面"}
-                for index in range(1, 7)
-            },
+            "services.text_service.ai_generate_shot_visuals", side_effect=aligned_visual,
         ) as aligned_visuals:
             shots = generate_shots("".join(item["voice_text"] for item in plan))
 
-        aligned_visuals.assert_called_once()
+        self.assertEqual(6, aligned_visuals.call_count)
         self.assertEqual(6, len(shots))
         self.assertEqual("第1段。", shots[0]["voice_text"])
         self.assertEqual("与第6段对应的画面", shots[5]["visual_need"])
@@ -142,16 +145,18 @@ class ImagePromptTests(unittest.TestCase):
             for index in range(1, 7)
         ]
         plan[5]["visual_need"] = ""
+        def realigned_visual(shot_items, full_script, model_provider="deepseek"):
+            shot = shot_items[0]
+            return {str(shot["shot_index"]): {
+                "visual_need": f"重新对齐的第{shot['shot_index']}幅具体画面",
+            }}
+
         with patch("services.text_service.ai_generate_storyboard_plan", return_value=plan), patch(
-            "services.text_service.ai_generate_shot_visuals",
-            return_value={
-                str(index): {"visual_need": f"重新对齐的第{index}幅具体画面"}
-                for index in range(1, 7)
-            },
+            "services.text_service.ai_generate_shot_visuals", side_effect=realigned_visual,
         ) as regenerate_visuals:
             shots = generate_shots("".join(item["voice_text"] for item in plan))
 
-        requested_shots = regenerate_visuals.call_args.args[0]
+        requested_shots = [call.args[0][0] for call in regenerate_visuals.call_args_list]
         self.assertEqual(list(range(1, 7)), [shot["shot_index"] for shot in requested_shots])
         self.assertEqual("重新对齐的第1幅具体画面", shots[0]["visual_need"])
         self.assertEqual("重新对齐的第6幅具体画面", shots[5]["visual_need"])

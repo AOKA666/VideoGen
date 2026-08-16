@@ -294,7 +294,6 @@ def regenerate_shot_image_prompt(
     if not shot:
         raise HTTPException(404, "Shot not found")
 
-    full_script = project.get("rewritten_script") or project.get("raw_script") or ""
     model_provider = str(
         storyboard_model_provider
         or project.get("storyboard_model_provider")
@@ -303,7 +302,7 @@ def regenerate_shot_image_prompt(
     project["storyboard_model_provider"] = model_provider
     result = ai_generate_shot_visuals(
         [shot],
-        full_script,
+        str(shot.get("voice_text") or ""),
         model_provider=model_provider,
     ).get(str(shot.get("shot_index")))
     if not result:
