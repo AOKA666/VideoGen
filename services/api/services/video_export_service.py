@@ -14,6 +14,7 @@ from services.settings_service import configured_jianying_directory
 
 SUBTITLE_RGB_COLOR = (1.0, 1.0, 1.0)
 SUBTITLE_JIANYING_BORDER_WIDTH = 70.0
+SUBTITLE_JIANYING_FONT_SIZE = 20.0
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 SUBTITLE_FONT_FILE = PROJECT_ROOT / "assets" / "DouyinSansBold.otf"
 SUBTITLE_FONT_NAME = "Douyin Sans"
@@ -297,11 +298,11 @@ def create_jianying_native_draft(
         draft.Timerange(0, 1_000_000),
         font=jianying_subtitle_font,
         style=draft.TextStyle(
-            size=15,
+            size=SUBTITLE_JIANYING_FONT_SIZE,
             bold=True,
             color=SUBTITLE_RGB_COLOR,
             align=1,
-            auto_wrapping=False,
+            auto_wrapping=True,
         ),
         border=draft.TextBorder(
             color=(0.0, 0.0, 0.0),

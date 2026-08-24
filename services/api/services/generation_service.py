@@ -1164,7 +1164,7 @@ def _split_clause_by_words(clause: str, max_hanzi: int) -> list[str]:
     return [chunk for chunk in chunks if chunk]
 
 
-def split_subtitle_text(text: str, max_hanzi: int = 9) -> list[str]:
+def split_subtitle_text(text: str, max_hanzi: int = 6) -> list[str]:
     text = re.sub(r"\s+", "", str(text or "")).strip()
     if not text:
         return []
@@ -1235,7 +1235,7 @@ def _timed_export_subtitle_chunks(timing: dict, max_hanzi: int) -> list[dict]:
     return subtitles
 
 
-def build_export_subtitles(shots: list[dict], max_hanzi: int = 9) -> list[dict]:
+def build_export_subtitles(shots: list[dict], max_hanzi: int = 6) -> list[dict]:
     subtitles: list[dict] = []
     for shot in shots:
         exact_timings = shot.get("subtitle_timings") or []
@@ -1300,7 +1300,7 @@ def _normalize_export_subtitle_timings(subtitles: list[dict]) -> list[dict]:
     return normalized
 
 
-def generate_export_srt(shots: list[dict], max_hanzi: int = 9) -> str:
+def generate_export_srt(shots: list[dict], max_hanzi: int = 6) -> str:
     blocks = []
     for idx, subtitle in enumerate(build_export_subtitles(shots, max_hanzi=max_hanzi), 1):
         start = format_srt_time(subtitle["start_time"])
