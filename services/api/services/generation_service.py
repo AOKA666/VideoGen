@@ -1309,6 +1309,14 @@ def generate_export_srt(shots: list[dict], max_hanzi: int = 6) -> str:
     return "\n\n".join(blocks) + "\n"
 
 
+def generate_export_subtitle_txt(shots: list[dict], max_hanzi: int = 6) -> str:
+    lines = [
+        str(subtitle["text"]).replace("\r", "").replace("\n", "")
+        for subtitle in build_export_subtitles(shots, max_hanzi=max_hanzi)
+    ]
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
 def generate_srt(shots: list[dict]) -> str:
     blocks = []
     for idx, shot in enumerate(shots, 1):

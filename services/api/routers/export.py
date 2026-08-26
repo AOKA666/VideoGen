@@ -14,6 +14,7 @@ from PIL import Image, ImageOps
 from services.generation_service import (
     build_export_subtitles,
     generate_export_srt,
+    generate_export_subtitle_txt,
     write_timeline,
 )
 from services.store import load_db, project_dir, public_url
@@ -95,6 +96,7 @@ def export_package(project_id: str):
             writer.writerow({k: shot.get(k) for k in writer.fieldnames})
     export_subtitles = build_export_subtitles(shots)
     (export_dir / "subtitles.srt").write_text(generate_export_srt(shots), encoding="utf-8")
+    (export_dir / "subtitles.txt").write_text(generate_export_subtitle_txt(shots), encoding="utf-8")
     (export_dir / "export_subtitles.json").write_text(
         json.dumps(export_subtitles, ensure_ascii=False, indent=2),
         encoding="utf-8",

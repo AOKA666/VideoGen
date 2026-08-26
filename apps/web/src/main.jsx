@@ -2468,7 +2468,7 @@ function App() {
         {tab === 'export' && (
           <section className="band result">
             <h2>结果导出</h2>
-            <p>导出内容包括按镜头编号的图片、配音字幕素材包和剪映草稿。</p>
+            <p>导出内容包括按镜头编号的图片、配音、SRT 字幕、每行最多 6 个字的 TXT 字幕和剪映草稿。</p>
             {project.audio_url && (
               <div className="export-voice-preview">
                 <audio
