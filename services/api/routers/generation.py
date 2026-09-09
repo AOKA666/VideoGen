@@ -549,7 +549,7 @@ def update_voice_settings(project_id: str, payload: VoiceSettingsPayload):
         raise HTTPException(404, "Project not found")
     if not project.get("audio_url"):
         raise HTTPException(400, "Voice audio has not been generated")
-    volume = max(0.0, min(2.0, float(payload.volume)))
+    volume = max(0.0, min(3.0, float(payload.volume)))
     project["voice_volume"] = round(volume, 3)
     project["updated_at"] = datetime.now().isoformat(timespec="seconds")
     save_db(db)

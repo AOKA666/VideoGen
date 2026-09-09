@@ -241,7 +241,7 @@ def create_jianying_native_draft(
                 audio_material,
                 draft.Timerange(0, audio_duration_us),
                 source_timerange=draft.Timerange(0, audio_duration_us),
-                volume=max(0.0, min(float(voice_volume), 2.0)),
+                volume=max(0.0, min(float(voice_volume), 3.0)),
             ),
             "voice",
         )

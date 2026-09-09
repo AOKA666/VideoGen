@@ -14,7 +14,7 @@ from routers.generation import VoiceSettingsPayload, update_voice_settings  # no
 
 
 class VoiceVolumeGainTests(unittest.TestCase):
-    def test_voice_settings_accept_gain_above_one_and_cap_it_at_two(self) -> None:
+    def test_voice_settings_accept_gain_above_one_and_cap_it_at_three(self) -> None:
         state = {
             "projects": [{"id": "project-1", "audio_url": "/audio/voice.mp3"}],
         }
@@ -31,10 +31,10 @@ class VoiceVolumeGainTests(unittest.TestCase):
         ):
             result = update_voice_settings("project-1", VoiceSettingsPayload(volume=1.75))
             self.assertEqual(1.75, result["volume"])
-            result = update_voice_settings("project-1", VoiceSettingsPayload(volume=3.0))
+            result = update_voice_settings("project-1", VoiceSettingsPayload(volume=4.0))
 
-        self.assertEqual(2.0, result["volume"])
-        self.assertEqual(2.0, state["projects"][0]["voice_volume"])
+        self.assertEqual(3.0, result["volume"])
+        self.assertEqual(3.0, state["projects"][0]["voice_volume"])
 
 if __name__ == "__main__":
     unittest.main()

@@ -18,7 +18,7 @@ const IMAGE_GENERATION_PROVIDER_LABELS = {
   seedream: 'Seedream',
   openai: 'OpenAI',
 };
-const MAX_VOICE_VOLUME_PERCENT = 200;
+const MAX_VOICE_VOLUME_PERCENT = 300;
 const DEFAULT_COVER_TITLE_POSITIONS = {
   line1: { x: 0.5, y: 0.18, font_size: 124 },
   line2: { x: 0.5, y: 0.25, font_size: 124 },
@@ -321,7 +321,7 @@ function App() {
   const [imagePromptEditors, setImagePromptEditors] = useState({});
   const [materialSourceStrategy, setMaterialSourceStrategy] = useState('ai_only');
   const [storyboardModelProvider, setStoryboardModelProvider] = useState('deepseek');
-  const [imageGenerationProvider, setImageGenerationProvider] = useState('seedream');
+  const [imageGenerationProvider, setImageGenerationProvider] = useState('openai');
   const [voiceType, setVoiceType] = useState(VOICE_OPTIONS[0].value);
   const [speechRate, setSpeechRate] = useState(0);
   const [voicePreviewUrl, setVoicePreviewUrl] = useState('');
@@ -448,7 +448,7 @@ function App() {
       if (hydratedProjectSettingsRef.current !== id) {
         hydratedProjectSettingsRef.current = id;
         setStoryboardModelProvider(projectData.project.storyboard_model_provider || 'deepseek');
-        setImageGenerationProvider(projectData.project.image_generation_provider || 'seedream');
+        setImageGenerationProvider(projectData.project.image_generation_provider || 'openai');
       }
     } else {
       setProject(null);
@@ -2323,7 +2323,7 @@ function App() {
                   <button type="button" className="primary" disabled={busy} onClick={saveVoiceVolume}>
                     <Save size={18} /> 保存配音音量
                   </button>
-                  <small>播放后拖动滑块可实时试听 0%–200% 的音量变化；剪映草稿会使用相同增益。</small>
+                  <small>播放后拖动滑块可实时试听 0%–300% 的音量变化；剪映草稿会使用相同增益。</small>
                 </div>
               )}
 
@@ -2722,7 +2722,7 @@ function SpeechRateSelect({ value, onChange }) {
   );
 }
 
-function StoryboardProgress({ progress, project, imageGenerationProvider = 'seedream' }) {
+function StoryboardProgress({ progress, project, imageGenerationProvider = 'openai' }) {
   const generating = ['generating_shots', 'generating_images'].includes(project?.status);
   const promptOnly = project?.material_source_strategy === 'prompt_only';
   const label = progress.total
@@ -2809,7 +2809,7 @@ function ShotCard({
   assets = [],
   selectedAssetId,
   project,
-  imageGenerationProvider = 'seedream',
+  imageGenerationProvider = 'openai',
   onSelect,
   onPreview,
   imagePrompt,

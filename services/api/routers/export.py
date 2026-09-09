@@ -180,7 +180,7 @@ def export_package(project_id: str):
         source_music = None
     music_start_sec = float(project.get("background_music_start_sec") or 0)
     music_volume = float(project.get("background_music_volume") or 0.2)
-    voice_volume = max(0.0, min(float(project.get("voice_volume", 1.0)), 2.0))
+    voice_volume = max(0.0, min(float(project.get("voice_volume", 1.0)), 3.0))
     if source_music:
         music_copy = export_dir / f"background_music_source{source_music.suffix.lower()}"
         shutil.copy2(source_music, music_copy)

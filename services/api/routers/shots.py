@@ -91,7 +91,7 @@ def _generate_ai_images(
     project_id: str,
     run_id: str,
     shots: list[dict],
-    image_generation_provider: str = "seedream",
+    image_generation_provider: str = "openai",
 ) -> None:
     """Generate concurrently while committing every result atomically."""
     total = len(shots)
@@ -157,7 +157,7 @@ def _generate_project_shots(
     run_id: str,
     material_source_strategy: str,
     storyboard_model_provider: str = "deepseek",
-    image_generation_provider: str = "seedream",
+    image_generation_provider: str = "openai",
 ) -> None:
     db = load_db()
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
@@ -215,7 +215,7 @@ def create_shots(
         pattern="^(minimax|deepseek|openai)$",
     ),
     image_generation_provider: str = Query(
-        "seedream",
+        "openai",
         pattern="^(seedream|openai)$",
     ),
 ):

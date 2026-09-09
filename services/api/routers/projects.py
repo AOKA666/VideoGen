@@ -147,7 +147,7 @@ def create_project(payload: ProjectCreate):
         "promotion_book_title": promotion_book_title,
         "history_model_provider": "minimax",
         "storyboard_model_provider": "deepseek",
-        "image_generation_provider": "seedream",
+        "image_generation_provider": "openai",
         "status": "created",
         "archived": False,
         "created_at": now,

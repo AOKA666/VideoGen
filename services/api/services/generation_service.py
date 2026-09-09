@@ -103,7 +103,7 @@ def generated_image_extension(provider: str) -> str:
 
 
 def normalize_image_generation_provider(value: object) -> str:
-    provider = str(value or "seedream").strip().lower()
+    provider = str(value or "openai").strip().lower()
     if provider not in IMAGE_GENERATION_PROVIDERS:
         raise ValueError("image generation provider must be seedream or openai")
     return provider

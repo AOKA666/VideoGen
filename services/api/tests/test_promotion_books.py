@@ -59,6 +59,7 @@ class PromotionBookTests(unittest.TestCase):
             ))
 
         self.assertEqual("历史深处的民国", result["project"]["promotion_book_title"])
+        self.assertEqual("openai", result["project"]["image_generation_provider"])
         save_db.assert_called_once_with(db)
 
     def test_frontend_has_editable_history_book_select(self) -> None:
