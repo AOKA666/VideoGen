@@ -29,7 +29,7 @@ for ($taskPort = 8000; $taskPort -le 8010; $taskPort++) {
     try {
         $health = Invoke-RestMethod -Uri "$url/api/health" -TimeoutSec 2
         $media = Invoke-RestMethod -Uri "$url/api/media" -TimeoutSec 5
-        if ($health.status -eq "ok" -and $health.api_version -eq 12 -and $null -ne $media.templates) {
+        if ($health.status -eq "ok" -and $health.api_version -eq 16 -and $null -ne $media.templates) {
             Start-Process $url
             exit 0
         }

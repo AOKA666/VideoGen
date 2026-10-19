@@ -1,4 +1,5 @@
 ﻿import React, { useState } from 'react';
+import { ProductLibrary } from './ProductWorkflow';
 
 const API = import.meta.env.VITE_API_URL ?? (import.meta.env.DEV ? 'http://127.0.0.1:8000' : '');
 async function api(path, options = {}) {
@@ -9,7 +10,49 @@ async function api(path, options = {}) {
 }
 const seconds = value => `${Number(value || 0).toFixed(3)} 秒`;
 
-export function MediaLibrary({ media, reload, onError }) {
+export function MediaLibrary({
+  media,
+  reload,
+  onError,
+  libraryTab = 'normal',
+  onLibraryTabChange,
+  project,
+  projectId,
+  busy,
+  onProjectRefresh,
+}) {
+  return <section className="band media-workspace">
+    <div className="media-subtabs" role="tablist" aria-label="素材分类">
+      <button
+        type="button"
+        role="tab"
+        aria-selected={libraryTab === 'normal'}
+        className={libraryTab === 'normal' ? 'selected' : ''}
+        onClick={() => onLibraryTabChange?.('normal')}
+      >普通素材</button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={libraryTab === 'product'}
+        className={libraryTab === 'product' ? 'selected' : ''}
+        onClick={() => onLibraryTabChange?.('product')}
+      >带货素材</button>
+    </div>
+    {libraryTab === 'product'
+      ? <ProductLibrary
+          media={media}
+          reload={reload}
+          onError={onError}
+          project={project}
+          projectId={projectId}
+          busy={busy}
+          onProjectRefresh={onProjectRefresh}
+        />
+      : <NormalMediaLibrary media={media} reload={reload} onError={onError} />}
+  </section>;
+}
+
+function NormalMediaLibrary({ media, reload, onError }) {
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState('');
   async function upload(files) {
@@ -25,13 +68,13 @@ export function MediaLibrary({ media, reload, onError }) {
     setUploading(false); setProgress('');
     if (failures.length) onError(failures.join('；'));
   }
-  return <section className="band media-workspace">
-    <div className="media-heading"><div><h2>视频素材库</h2><p>上传后自动读取时长，所有项目都可以随机取用这些视频。</p></div>
+  return <>
+    <div className="media-heading"><div><h2>普通素材</h2><p>上传后自动读取时长，所有项目都可以随机取用这些视频作为主画面。</p></div>
       <label className="media-upload">{uploading ? '上传中…' : '上传视频'}<input aria-label="上传视频" type="file" accept=".mp4,.mov,.mkv,.webm,.avi,.m4v" multiple disabled={uploading} onChange={event => { upload(event.target.files); event.target.value = ''; }} /></label>
     </div>
     <p>{media.videos.length} 个素材 · 总时长 {seconds(media.videos.reduce((sum, item) => sum + item.duration_sec, 0))} · 单个文件最大 1 GB</p>
     {progress && <p role="status">{progress}</p>}
-    {!media.videos.length && <div className="media-empty">还没有视频素材。上传视频后，即可按配音时长自动拼接。</div>}
+    {!media.videos.length && <div className="media-empty">还没有普通素材。上传视频后，即可按配音时长自动拼接主画面。</div>}
     <div className="media-grid">{media.videos.map(item => <article className="media-card" key={item.id}>
       <video controls preload="metadata" src={`${API}${item.file_url}`} />
       <strong title={item.file_name}>{item.file_name}</strong><p>{seconds(item.duration_sec)} · {item.width} × {item.height}</p>
@@ -40,7 +83,7 @@ export function MediaLibrary({ media, reload, onError }) {
         try { await api(`/api/media/videos/${item.id}`, { method: 'DELETE' }); await reload(); } catch (error) { onError(error.message); }
       }}>删除素材</button>
     </article>)}</div>
-  </section>;
+  </>;
 }
 
 export function TemplatePicker({ templates, value, onChange, reload, onError }) {
@@ -58,4 +101,3 @@ export function TemplatePicker({ templates, value, onChange, reload, onError }) 
     <small>素材保持原比例居中，放入模板中部区域；素材原声静音，使用所选配音。</small>
   </div>;
 }
-

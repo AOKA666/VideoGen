@@ -25,8 +25,10 @@ from services.generation_service import (
     normalize_image_generation_provider,
     generated_image_extension,
     generate_export_srt,
+    marker_start_sec,
     narration_shot,
     remove_watermark_with_seedream,
+    strip_product_marker,
     synthesize_volcengine_tts,
     synthesize_project_voice,
     write_timeline,
@@ -511,7 +513,9 @@ def _generate_video_library_voice(project: dict, payload: VoicePayload | None) -
 def _generate_video_library_voice_unlocked(project: dict, payload: VoicePayload | None) -> dict:
     """Narrate the whole script in one voice track and match clips to its duration."""
     project_id = project["id"]
-    script = str(project.get("rewritten_script") or project.get("raw_script") or "").strip()
+    raw_script = str(project.get("rewritten_script") or project.get("raw_script") or "").strip()
+    script, marker_present, marker_offset = strip_product_marker(raw_script)
+    script = script.strip()
     if not script:
         raise HTTPException(400, "请先输入文案")
     audio_source = (
@@ -562,6 +566,9 @@ def _generate_video_library_voice_unlocked(project: dict, payload: VoicePayload 
         "end_time": result["duration_sec"],
         "subtitle_timings": result.get("subtitle_timings") or [],
     })
+    start_sec = marker_start_sec(
+        script, marker_offset, result["duration_sec"], result.get("subtitle_timings") or [],
+    )
     shots = assemble_clips(assets, result["duration_sec"], project_id)
     srt_path = base / "subtitles" / "subtitles.srt"
     srt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -578,6 +585,19 @@ def _generate_video_library_voice_unlocked(project: dict, payload: VoicePayload 
         if not current:
             raise HTTPException(404, "Project not found")
         db["shots"] = [s for s in db["shots"] if s["project_id"] != project_id] + shots
+        placement = dict(current.get("product_placement") or {})
+        placement.setdefault("items", [])
+        placement.setdefault("transition_sec", 0.5)
+        placement.setdefault("fade_sec", 0.3)
+        placement.setdefault("pip_box", {"x": 0.62, "y": 0.31, "w": 0.34, "h": 0.22})
+        placement.update({
+            "marker_present": marker_present,
+            "marker_offset": marker_offset,
+            "start_sec": start_sec,
+            "start_sec_stale": False,
+            "enabled": bool(marker_present and start_sec is not None and placement["items"]),
+            "updated_at": now,
+        })
         current.update({
             "audio_url": public_url(out),
             "audio_path": str(out),
@@ -588,7 +608,9 @@ def _generate_video_library_voice_unlocked(project: dict, payload: VoicePayload 
             "speech_rate": int(speech_rate) if speech_rate is not None else int(current.get("speech_rate") or 0),
             "voice_style": result.get("voice_type") or current.get("voice_type"),
             "voice_volume": float(current.get("voice_volume") or 1.0),
+            "narration_script": script,
             "narration_subtitle_timings": narration["subtitle_timings"],
+            "product_placement": placement,
             "voice_timeline_url": public_url(timeline_path),
             "subtitle_url": public_url(srt_path),
             "status": "voice_ready",
@@ -687,7 +709,10 @@ def preview_voice(project_id: str, payload: VoicePayload | None = None):
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
         raise HTTPException(404, "Project not found")
-    sentence = _first_script_sentence(project.get("rewritten_script") or project.get("raw_script") or "")
+    preview_text, _, _ = strip_product_marker(
+        project.get("rewritten_script") or project.get("raw_script") or ""
+    )
+    sentence = _first_script_sentence(preview_text)
     if not sentence:
         raise HTTPException(400, "No script content available for voice preview")
     try:
@@ -712,7 +737,10 @@ def generate_title(project_id: str):
     if not project:
         raise HTTPException(404, "Project not found")
 
-    script = str(project.get("rewritten_script") or project.get("raw_script") or "").strip()
+    script, _, _ = strip_product_marker(
+        project.get("rewritten_script") or project.get("raw_script") or ""
+    )
+    script = script.strip()
     if not script:
         raise HTTPException(400, "No script content available for title generation")
 

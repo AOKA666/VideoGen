@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -130,6 +132,168 @@ def _transform_y_for_visual_y(visual_y: float) -> float:
     return (half - visual_y) / half
 
 
+def _pip_geometry(width: int, height: int, box: dict) -> tuple[float, float, float]:
+    """Return (uniform scale, transform_x, transform_y) for a normalized PIP box."""
+    def number(key: str, fallback: float) -> float:
+        try:
+            value = float(box.get(key, fallback))
+        except (TypeError, ValueError):
+            return fallback
+        return value if math.isfinite(value) else fallback
+
+    x = max(0.0, min(number("x", 0.0), 1.0))
+    y = max(0.0, min(number("y", 0.0), 1.0))
+    w = max(0.01, min(number("w", 0.4), 1.0 - x))
+    h = max(0.01, min(number("h", 0.3), 1.0 - y))
+    box_width = max(1, round(w * JIANYING_CANVAS_WIDTH))
+    box_height = max(1, round(h * JIANYING_CANVAS_HEIGHT))
+    center_x = (x + w / 2) * JIANYING_CANVAS_WIDTH
+    center_y = (y + h / 2) * JIANYING_CANVAS_HEIGHT
+    scale = _clip_window_scale(width, height, box_width, box_height)
+    transform_x = (center_x - JIANYING_CANVAS_WIDTH / 2) / (JIANYING_CANVAS_WIDTH / 2)
+    transform_y = (JIANYING_CANVAS_HEIGHT / 2 - center_y) / (JIANYING_CANVAS_HEIGHT / 2)
+    return scale, transform_x, transform_y
+
+
+def _add_product_placement_track(
+    script, draft, placement: dict | None, clip_relative_index: int,
+    materials_dir: Path, audio_duration_us: int,
+) -> dict | None:
+    """Add a PIP track above the base clips, with looping and dissolve transitions."""
+    items = (placement or {}).get("items") or []
+    if not items:
+        return None
+    try:
+        start_us = round(float(placement.get("start_sec") or 0) * 1_000_000)
+    except (TypeError, ValueError):
+        start_us = 0
+    start_us = min(max(start_us, 0), audio_duration_us)
+    if audio_duration_us - start_us < 500_000:
+        return None
+
+    track_name = "products"
+    script.add_track(
+        draft.TrackType.video, track_name,
+        relative_index=clip_relative_index + 1,
+    )
+    product_dir = materials_dir / "products"
+    product_dir.mkdir(parents=True, exist_ok=True)
+    copied: dict[Path, Path] = {}
+    records = []
+    cursor = start_us
+    try:
+        fade_us = round(float(placement.get("fade_sec") or 0.3) * 1_000_000)
+        transition_us = round(float(placement.get("transition_sec") or 0.5) * 1_000_000)
+    except (TypeError, ValueError):
+        fade_us, transition_us = 300_000, 500_000
+    fade_us = max(0, fade_us)
+
+    for item in items:
+        remaining = min(
+            round(float(item.get("duration_sec") or 0) * 1_000_000),
+            audio_duration_us - cursor,
+        )
+        if remaining <= 0:
+            break
+        source = Path(str(item.get("path") or "")).resolve()
+        if not source.is_file():
+            raise ValueError(f"带货素材文件不存在：{source.name}")
+        if source not in copied:
+            target = product_dir / f"{uuid4().hex}{source.suffix.lower()}"
+            shutil.copy2(source, target)
+            copied[source] = target
+        material = draft.VideoMaterial(str(copied[source]))
+        scale, transform_x, transform_y = _pip_geometry(
+            material.width, material.height,
+            item.get("pip_box") or placement.get("pip_box") or {},
+        )
+        clip_settings = draft.ClipSettings(
+            scale_x=scale,
+            scale_y=scale,
+            transform_x=transform_x,
+            transform_y=transform_y,
+        )
+
+        fill_duration = bool(item.get("fill_duration", True))
+        if material.material_type == "video":
+            if material.duration <= 0:
+                raise ValueError(f"无法读取带货视频时长：{source.name}")
+            if not fill_duration:
+                # Without "撑满时长", never stretch beyond the source video.
+                remaining = min(remaining, material.duration)
+            source_duration_us = (
+                material.duration
+                if fill_duration and remaining > material.duration
+                else min(remaining, material.duration)
+            )
+        else:
+            source_duration_us = remaining
+        if remaining <= 0:
+            break
+        segment = draft.VideoSegment(
+            material,
+            draft.Timerange(cursor, remaining),
+            source_timerange=draft.Timerange(0, source_duration_us),
+            volume=0.0,
+            clip_settings=clip_settings,
+        )
+        records.append({"segments": [segment], "duration_us": remaining})
+        cursor += remaining
+
+    try:
+        crossfade = getattr(draft.TransitionType, "叠化")
+    except AttributeError:
+        crossfade = None
+    if crossfade is not None:
+        for index in range(len(records) - 1):
+            previous = records[index]
+            following = records[index + 1]
+            previous_segment = previous["segments"][-1]
+            following_segment = following["segments"][0]
+            duration_us = min(
+                transition_us,
+                previous["duration_us"] // 2,
+                following["duration_us"] // 2,
+                previous_segment.target_timerange.duration // 2,
+                following_segment.target_timerange.duration // 2,
+            )
+            if duration_us >= 100_000:
+                previous_segment.add_transition(crossfade, duration=duration_us)
+
+    if records and fade_us > 0:
+        first = records[0]["segments"][0]
+        first_duration = first.target_timerange.duration
+        fade_in = min(fade_us, first_duration // 2)
+        if fade_in > 0:
+            first.clip_settings = deepcopy(first.clip_settings)
+            first.clip_settings.alpha = 0.0
+            first.add_keyframe(draft.KeyframeProperty.alpha, 0, 0.0)
+            first.add_keyframe(draft.KeyframeProperty.alpha, fade_in, 1.0)
+
+        last = records[-1]["segments"][-1]
+        last_duration = last.target_timerange.duration
+        fade_out = min(fade_us, last_duration // 2)
+        if fade_out > 0:
+            last.add_keyframe(draft.KeyframeProperty.alpha, max(last_duration - fade_out, 0), 1.0)
+            last.add_keyframe(draft.KeyframeProperty.alpha, max(last_duration - 1, 0), 0.0)
+
+    # Add segments only after transitions/keyframes are attached, so the script
+    # registers the transition material along with each segment.
+    for record in records:
+        for segment in record["segments"]:
+            script.add_segment(segment, track_name)
+
+    return {
+        "track": track_name,
+        "item_count": len(records),
+        "segment_count": sum(len(record["segments"]) for record in records),
+        "start_sec": round(start_us / 1_000_000, 3),
+        "end_sec": round(cursor / 1_000_000, 3),
+        "transition_sec": round(transition_us / 1_000_000, 3),
+        "fade_sec": round(fade_us / 1_000_000, 3),
+    }
+
+
 def _jianying_title_geometry(line1: str, line2: str) -> dict[str, float]:
     """Keep calibrated Jianying title geometry independent of cover font changes."""
     return {
@@ -212,6 +376,7 @@ def create_jianying_native_draft(
     animate_scenes: bool = True,
     clip_window: tuple[int, int, int, int] | None = None,
     subtitle_transform_y: float = -0.43,
+    product_placement: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     try:
         import pyJianYingDraft as draft
@@ -268,9 +433,10 @@ def create_jianying_native_draft(
             "background",
         )
     clip_track = "clips" if background_template_path else "video"
+    clip_relative_index = 1 if background_template_path else 0
     script.add_track(
         draft.TrackType.video, clip_track,
-        relative_index=1 if background_template_path else 0,
+        relative_index=clip_relative_index,
     )
     zoom_animation = getattr(draft.GroupAnimationType, "\u7f29\u653e")
     for (start_sec, duration_sec), scene_path in zip(display_ranges, local_scenes):
@@ -293,6 +459,11 @@ def create_jianying_native_draft(
         if animate_scenes:
             segment.add_animation(zoom_animation, duration=duration_us)
         script.add_segment(segment, clip_track)
+
+    product_report = _add_product_placement_track(
+        script, draft, product_placement, clip_relative_index,
+        materials_dir, audio_duration_us,
+    )
 
     if audio_duration_us > 0:
         script.add_segment(
@@ -437,4 +608,5 @@ def create_jianying_native_draft(
         ),
         "copied_scenes": copy_scenes,
         "animated_scenes": animate_scenes,
+        "product_placement": product_report,
     }

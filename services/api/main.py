@@ -13,7 +13,7 @@ load_env_local()
 store.ensure_storage()
 
 # Bump when routes change so start-local.ps1 does not reuse an outdated backend process.
-API_VERSION = 12
+API_VERSION = 16
 
 app = FastAPI(title="AI Video Draft API")
 

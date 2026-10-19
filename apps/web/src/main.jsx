@@ -5,6 +5,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import './styles.css';
 import { MediaLibrary, TemplatePicker } from './MediaWorkflow';
+import { ProductPlacementPanel } from './ProductWorkflow';
 
 const API = import.meta.env.VITE_API_URL ?? (import.meta.env.DEV ? 'http://127.0.0.1:8000' : '');
 const DEFAULT_PROMOTION_BOOK = '《国之脊梁》';
@@ -20,6 +21,7 @@ const IMAGE_GENERATION_PROVIDER_LABELS = {
   openai: 'OpenAI',
 };
 const MAX_VOICE_VOLUME_PERCENT = 300;
+const PRODUCT_MARKER = '【带货开始】';
 const DEFAULT_COVER_TITLE_POSITIONS = {
   line1: { x: 0.5, y: 0.18, font_size: 124 },
   line2: { x: 0.5, y: 0.25, font_size: 124 },
@@ -76,7 +78,9 @@ async function writeClipboardText(text) {
 }
 
 function scriptCharacterCount(value) {
-  return Array.from(stripScriptParagraphNumbers(value).replace(/\s+/g, '')).length;
+  return Array.from(
+    stripScriptParagraphNumbers(value).replaceAll(PRODUCT_MARKER, '').replace(/\s+/g, ''),
+  ).length;
 }
 
 function formatPromotionBookTitle(value) {
@@ -304,7 +308,8 @@ function CoverTitleEditor({ imageUrl, line1, line2, positions, maskOpacity, onCh
 }
 
 function App() {
-  const [media, setMedia] = useState({ videos: [], templates: [] });
+  const [media, setMedia] = useState({ videos: [], products: [], templates: [] });
+  const [libraryTab, setLibraryTab] = useState('normal');
   const [backgroundTemplateId, setBackgroundTemplateId] = useState('daodejing');
   async function refreshMedia() { const data = await request('/api/media'); setMedia(data); }
   useEffect(() => { refreshMedia().catch(error => setMessage(error.message)); }, []);
@@ -377,6 +382,7 @@ function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(
     () => window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === 'true',
   );
+  const scriptTextareaRef = useRef(null);
   const coverInputRef = useRef(null);
   const musicInputRef = useRef(null);
   const musicPreviewRef = useRef(null);
@@ -1345,6 +1351,23 @@ function App() {
     }
   }
 
+  function insertProductMarker() {
+    if (rawScriptDraft.includes(PRODUCT_MARKER)) {
+      setMessage(`文案中已有${PRODUCT_MARKER}标记，不能重复插入`);
+      return;
+    }
+    const textarea = scriptTextareaRef.current;
+    const start = textarea?.selectionStart ?? rawScriptDraft.length;
+    const end = textarea?.selectionEnd ?? start;
+    const next = rawScriptDraft.slice(0, start) + PRODUCT_MARKER + rawScriptDraft.slice(end);
+    setRawScriptDraft(next);
+    window.requestAnimationFrame(() => {
+      textarea?.focus();
+      const cursor = start + PRODUCT_MARKER.length;
+      textarea?.setSelectionRange(cursor, cursor);
+    });
+  }
+
   async function copyProjectScript() {
     const text = project?.raw_script || '';
     if (!text) {
@@ -1925,6 +1948,7 @@ function App() {
 
   const workflowBusy = busy || ['video_generating', 'video_rendering', 'generating_shots', 'generating_images'].includes(project?.status);
   const workflowMessage = (() => {
+    if (creationStatus.active) return creationStatus.label || '处理中…';
     if (project?.status === 'video_generating') return '正在生成配音并匹配视频素材';
     if (project?.status === 'video_rendering') {
       const progress = project.render_progress;
@@ -2393,7 +2417,19 @@ function App() {
           </div>
         </header>
 
-        {tab === 'library' && <MediaLibrary media={media} reload={refreshMedia} onError={setMessage} />}
+        {tab === 'library' && (
+          <MediaLibrary
+            media={media}
+            reload={refreshMedia}
+            onError={setMessage}
+            libraryTab={libraryTab}
+            onLibraryTabChange={setLibraryTab}
+            project={project}
+            projectId={projectId}
+            busy={busy}
+            onProjectRefresh={() => refreshProject(projectId)}
+          />
+        )}
         {tab === 'projects' && (
           <section className="band">
             <ProjectManager
@@ -2436,6 +2472,13 @@ function App() {
               <span>标题 <b>{project.title_line1 ? `${project.title_line1} / ${project.title_line2 || '—'}` : '未填写'}</b></span>
               <span>背景音乐 <b>{project.background_music_name || '未选择'}</b></span>
               <span>封面 <b>{project.cover_url ? '已生成' : '未生成'}</b></span>
+              <span>带货画面 <b>{(() => {
+                const placement = project.product_placement || {};
+                const count = (placement.items || []).length;
+                return count
+                  ? `${count} 个 · 从 ${Number(placement.start_sec || 0).toFixed(1)} 秒开始`
+                  : '未配置';
+              })()}</b></span>
             </div>
             {project.audio_url && (
               <div className="export-voice-preview">
@@ -2466,6 +2509,15 @@ function App() {
                 <div><small>标题第二行</small><b>{project.title_line2 || '未填写'}</b></div>
               </div>
             </section>
+            <ProductPlacementPanel
+              key={project.id}
+              project={project}
+              projectId={projectId}
+              media={media}
+              busy={busy}
+              onProjectRefresh={() => refreshProject(projectId)}
+              onError={setMessage}
+            />
             <details
               className="vlib-export-settings"
               open={settingsOpen}
@@ -2481,6 +2533,11 @@ function App() {
             </details>
             <small className="vlib-settings-hint">修改配音音量、标题、音乐或封面后，请先点击对应的保存/生成按钮，再导出。</small>
             <div className="export-actions">
+              <button type="button" onClick={() => {
+                setLibraryTab('product');
+                setTab('library');
+                refreshMedia().catch(error => setMessage(error.message));
+              }}><ImagePlus size={18} /> 管理带货素材库</button>
               <button type="button" onClick={openExportFolder}><FolderOpen size={18} /> 打开导出文件夹</button>
               <button className="primary" onClick={exportPackage} disabled={busy || !project.audio_url}><Archive size={18} /> 导出剪映草稿</button>
             </div>
@@ -2570,7 +2627,17 @@ function App() {
                         <h3>视频文案</h3>
                         <span className="script-character-count">{scriptCharacterCount(rawScriptDraft)} 字</span>
                       </div>
-                      <textarea className="create-script-textarea" required value={rawScriptDraft} onChange={event => setRawScriptDraft(event.target.value)} placeholder="输入或粘贴视频文案，然后在下方配置配音、音乐和封面" aria-label="视频文案" />
+                      <textarea ref={scriptTextareaRef} className="create-script-textarea" required value={rawScriptDraft} onChange={event => setRawScriptDraft(event.target.value)} placeholder="输入或粘贴视频文案，然后在下方配置配音、音乐和封面" aria-label="视频文案" />
+                      <div className="script-marker-row">
+                        <button type="button" onClick={insertProductMarker} disabled={rawScriptDraft.includes(PRODUCT_MARKER)}>
+                          插入{PRODUCT_MARKER}
+                        </button>
+                        <small>
+                          {rawScriptDraft.includes(PRODUCT_MARKER)
+                            ? '已插入：从该位置开始叠加带货画中画；标记不会朗读，也不会出现在字幕中。'
+                            : '把光标放到需要开始展示带货画面的位置，再点击插入。'}
+                        </small>
+                      </div>
                       <TemplatePicker templates={media.templates} value={backgroundTemplateId} onChange={setBackgroundTemplateId} reload={refreshMedia} onError={setMessage} />
                     </section>
                     <section className="create-card">{renderVoiceSettings('create')}</section>

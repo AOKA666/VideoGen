@@ -27,6 +27,8 @@ DEFAULT_DB: dict[str, Any] = {
     "promotion_books_catalog_initialized": True,
     "ai_script_people_history": {},
     "video_library_presets": [],
+    "product_library": [],
+    "product_placement_presets": [],
 }
 _DB_LOCK = threading.RLock()
 _DB_CACHE: dict[str, Any] | None = None
@@ -184,6 +186,15 @@ def ensure_storage() -> None:
             asset["local_path"] = str(current_path)
             asset["file_url"] = public_url(current_path)
             changed = True
+        for product in data.get("product_library", []):
+            product_path = str(product.get("local_path") or "")
+            if not product_path:
+                continue
+            current_product_path = _current_storage_path(product_path)
+            if current_product_path.exists() and str(current_product_path) != product_path:
+                product["local_path"] = str(current_product_path)
+                product["file_url"] = public_url(current_product_path)
+                changed = True
         for preset in data.get("video_library_presets", []):
             cover_path = str(preset.get("cover_source_path") or "")
             if not cover_path:

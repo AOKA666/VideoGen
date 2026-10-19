@@ -1240,17 +1240,104 @@ def _timed_export_subtitle_chunks(timing: dict, max_hanzi: int) -> list[dict]:
 
 
 VIDEO_LIBRARY_SUBTITLE_MAX_HANZI = 9
+PRODUCT_MARKER = "【带货开始】"
+
+
+def strip_product_marker(text: str) -> tuple[str, bool, int]:
+    """Remove all placement markers and return the spoken-character offset of the first one."""
+    raw = str(text or "")
+    index = raw.find(PRODUCT_MARKER)
+    if index < 0:
+        return raw, False, -1
+    clean = raw.replace(PRODUCT_MARKER, "")
+    offset = len(alignment_text(raw[:index]))
+    return clean, True, offset
+
+
+def marker_time_from_timings(offset: int, timings: list[dict], duration: float) -> float:
+    """Map a spoken-character offset to seconds using chunk-level subtitle timings."""
+    if offset <= 0:
+        return 0.0
+    seen = 0
+    ordered = sorted(
+        (item for item in (timings or []) if str(item.get("text") or "").strip()),
+        key=lambda item: float(item.get("start_time") or 0),
+    )
+    for timing in ordered:
+        count = len(alignment_text(str(timing.get("text") or "")))
+        if count <= 0:
+            continue
+        if offset <= seen + count:
+            start = float(timing.get("start_time") or 0)
+            end = float(timing.get("end_time") or start)
+            return start + (end - start) * (offset - seen) / count
+        seen += count
+    return max(float(duration or 0), 0.0)
+
+
+def marker_time_by_weight(text: str, offset: int, duration: float,
+                          max_hanzi: int = VIDEO_LIBRARY_SUBTITLE_MAX_HANZI) -> float:
+    """Approximate the marker time when the audio has no word/chunk timings."""
+    if offset <= 0:
+        return 0.0
+    chunks = split_subtitle_text(text, max_hanzi=max_hanzi)
+    weights = [max(chinese_char_count(chunk), 1) for chunk in chunks]
+    total_weight = sum(weights) or 1
+    seen_chars = 0
+    elapsed_weight = 0
+    for chunk, weight in zip(chunks, weights):
+        count = len(alignment_text(chunk))
+        if count and offset <= seen_chars + count:
+            start = duration * elapsed_weight / total_weight
+            end = duration * (elapsed_weight + weight) / total_weight
+            return start + (end - start) * (offset - seen_chars) / count
+        seen_chars += count
+        elapsed_weight += weight
+    return max(float(duration or 0), 0.0)
+
+
+def marker_start_sec(text: str, offset: int, duration: float,
+                     subtitle_timings: list[dict] | None = None) -> float | None:
+    try:
+        total_duration = float(duration or 0)
+    except (TypeError, ValueError):
+        return None
+    if offset is None or offset < 0 or total_duration <= 0:
+        return None
+    if subtitle_timings and any(str(item.get("text") or "").strip() for item in subtitle_timings):
+        value = marker_time_from_timings(offset, subtitle_timings, total_duration)
+    else:
+        value = marker_time_by_weight(text, offset, total_duration)
+    return round(max(0.0, min(value, total_duration)), 3)
+
+
+def strip_marker_from_timings(timings: list[dict]) -> list[dict]:
+    cleaned = []
+    for timing in timings or []:
+        text = str(timing.get("text") or "").replace(PRODUCT_MARKER, "")
+        if text.strip():
+            cleaned.append({**timing, "text": text})
+    return cleaned
 
 
 def narration_shot(project: dict) -> dict:
     """The video-library workflow narrates the whole script as one continuous track."""
+    stored = str(project.get("narration_script") or "")
+    if stored:
+        script = stored.replace(PRODUCT_MARKER, "")
+    else:
+        script, _, _ = strip_product_marker(
+            str(project.get("rewritten_script") or project.get("raw_script") or "")
+        )
     return {
         "id": "narration",
         "shot_index": 1,
-        "voice_text": str(project.get("rewritten_script") or project.get("raw_script") or ""),
+        "voice_text": script,
         "start_time": 0.0,
         "end_time": float(project.get("audio_duration_sec") or 0),
-        "subtitle_timings": project.get("narration_subtitle_timings") or [],
+        "subtitle_timings": strip_marker_from_timings(
+            project.get("narration_subtitle_timings") or []
+        ),
     }
 
 

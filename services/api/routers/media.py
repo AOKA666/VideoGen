@@ -8,24 +8,51 @@ from pathlib import Path
 from uuid import uuid4
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from PIL import Image, ImageOps
 
 from services.store import assets_dir, db_write_transaction, load_db, project_dir, public_url, save_db
 from services.generation_service import (
     build_export_subtitles,
     generate_export_srt,
+    strip_product_marker,
     synthesize_project_voice,
 )
 from services.media_service import AUDIO_SUFFIXES, assemble_clips, probe_audio, probe_video, render_video
+from services.product_placement_service import normalize_product_placement
 
 router = APIRouter(prefix="/api", tags=["media"])
 ACTIVE: set[str] = set()
 LOCK = threading.Lock()
 
+VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+PRODUCT_VIDEO_MAX_BYTES = 1024 * 1024 * 1024
+PRODUCT_IMAGE_MAX_BYTES = 20 * 1024 * 1024
+PRODUCT_IMAGE_MAX_PIXELS = 40_000_000
+
 
 class AssemblePayload(BaseModel):
     audio_source: str | None = None
+
+
+class ProductPipBox(BaseModel):
+    x: float = 0.62
+    y: float = 0.31
+    w: float = 0.34
+    h: float = 0.22
+
+
+class ProductPlacementItem(BaseModel):
+    asset_id: str
+    duration_sec: float = 3.0
+    pip_box: ProductPipBox | None = None
+
+
+class ProductPlacementPayload(BaseModel):
+    items: list[ProductPlacementItem] = Field(default_factory=list)
+    transition_sec: float = 0.5
+    pip_box: ProductPipBox = Field(default_factory=ProductPipBox)
 
 
 def templates() -> list[dict]:
@@ -65,8 +92,12 @@ def write_upload(file: UploadFile, target: Path, limit: int):
 
 @router.get("/media")
 def list_media():
-    return {"videos": [a for a in load_db().get("video_library", []) if Path(a["local_path"]).is_file()],
-            "templates": templates()}
+    db = load_db()
+    return {
+        "videos": [a for a in db.get("video_library", []) if Path(a["local_path"]).is_file()],
+        "products": [a for a in db.get("product_library", []) if Path(a["local_path"]).is_file()],
+        "templates": templates(),
+    }
 
 
 @router.post("/media/videos")
@@ -110,6 +141,122 @@ def delete_video(asset_id: str):
         if target.is_relative_to((assets_dir() / "videos").resolve()):
             target.unlink(missing_ok=True)
     return {"status": "deleted"}
+
+
+@router.post("/media/products")
+def upload_product(file: UploadFile = File(...)):
+    suffix = Path(file.filename or "").suffix.lower()
+    identifier = str(uuid4())
+    temporary = None
+    target = None
+    try:
+        if suffix in VIDEO_SUFFIXES:
+            root = assets_dir() / "product_library" / "videos"
+            root.mkdir(parents=True, exist_ok=True)
+            target = root / (identifier + suffix)
+            write_upload(file, target, PRODUCT_VIDEO_MAX_BYTES)
+            metadata = probe_video(target)
+            item = {
+                "id": identifier,
+                "media_type": "video",
+                "file_name": Path(file.filename or "带货视频").name,
+                "local_path": str(target),
+                "file_url": public_url(target),
+                "file_size": target.stat().st_size,
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                **metadata,
+            }
+        elif suffix in IMAGE_SUFFIXES:
+            root = assets_dir() / "product_library" / "images"
+            root.mkdir(parents=True, exist_ok=True)
+            temporary = root / (identifier + ".upload")
+            target = root / (identifier + ".png")
+            write_upload(file, temporary, PRODUCT_IMAGE_MAX_BYTES)
+            with Image.open(temporary) as source:
+                if source.width * source.height > PRODUCT_IMAGE_MAX_PIXELS:
+                    raise ValueError("图片像素不能超过 4000 万")
+                image = ImageOps.exif_transpose(source).convert("RGBA")
+                width, height = image.size
+                image.save(target, format="PNG", optimize=True)
+            item = {
+                "id": identifier,
+                "media_type": "image",
+                "file_name": Path(file.filename or "带货图片").name,
+                "local_path": str(target),
+                "file_url": public_url(target),
+                "file_size": target.stat().st_size,
+                "width": width,
+                "height": height,
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        else:
+            raise ValueError("支持 MP4/MOV/MKV/WEBM/AVI/M4V 视频，或 PNG/JPG/WEBP 图片")
+        with db_write_transaction():
+            db = load_db()
+            db.setdefault("product_library", []).append(item)
+            save_db(db)
+        return item
+    except Exception as exc:
+        if target:
+            target.unlink(missing_ok=True)
+        raise HTTPException(400, f"带货素材上传失败：{exc}") from exc
+    finally:
+        if temporary:
+            temporary.unlink(missing_ok=True)
+
+
+@router.delete("/media/products/{asset_id}")
+def delete_product(asset_id: str):
+    with db_write_transaction():
+        db = load_db()
+        if any(
+            item.get("asset_id") == asset_id
+            for project in db.get("projects", [])
+            for item in ((project.get("product_placement") or {}).get("items") or [])
+        ):
+            raise HTTPException(409, "带货素材已被项目使用，暂时不能删除")
+        if any(
+            item.get("asset_id") == asset_id
+            for preset in db.get("product_placement_presets", [])
+            for item in (preset.get("items") or [])
+        ):
+            raise HTTPException(409, "带货素材已被带货预设使用，暂时不能删除")
+        asset = next((item for item in db.get("product_library", []) if item.get("id") == asset_id), None)
+        if not asset:
+            raise HTTPException(404, "带货素材不存在")
+        db["product_library"] = [
+            item for item in db.get("product_library", []) if item.get("id") != asset_id
+        ]
+        save_db(db)
+        target = Path(asset["local_path"]).resolve()
+        if target.is_relative_to((assets_dir() / "product_library").resolve()):
+            target.unlink(missing_ok=True)
+    return {"status": "deleted"}
+
+
+@router.patch("/projects/{project_id}/product-placement")
+def update_product_placement(project_id: str, payload: ProductPlacementPayload):
+    db = load_db()
+    project = get_project(db, project_id)
+    try:
+        placement = normalize_product_placement(
+            db,
+            project,
+            [item.model_dump() for item in payload.items],
+            payload.transition_sec,
+            payload.pip_box.model_dump(),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    now = datetime.now().isoformat(timespec="seconds")
+    placement["updated_at"] = now
+    with db_write_transaction():
+        current_db = load_db()
+        current = get_project(current_db, project_id)
+        current["product_placement"] = placement
+        current["updated_at"] = now
+        save_db(current_db)
+    return {"status": "saved", "product_placement": placement}
 
 
 @router.post("/media/templates")
@@ -157,7 +304,8 @@ def generate_worker(project_id: str, audio_source: str = "tts"):
         base = project_dir(project_id)
         voice_dir = base / "voice"
         voice_dir.mkdir(exist_ok=True)
-        voice_shot = {"id": "narration", "shot_index": 1, "voice_text": project["raw_script"]}
+        narration_script, _, _ = strip_product_marker(project["raw_script"])
+        voice_shot = {"id": "narration", "shot_index": 1, "voice_text": narration_script}
         if audio_source == "upload":
             audio = Path(project.get("uploaded_audio_path") or "")
             if not audio.is_file():
@@ -304,8 +452,9 @@ def render_project(project_id: str):
             subtitle_timings = json.loads(timeline.read_text(encoding="utf-8")).get("subtitle_timings") or []
         except (OSError, ValueError):
             subtitle_timings = []
+    narration_script, _, _ = strip_product_marker(p.get("raw_script", ""))
     narration = {
-        "id": "narration", "shot_index": 1, "voice_text": p.get("raw_script", ""),
+        "id": "narration", "shot_index": 1, "voice_text": narration_script,
         "start_time": 0, "end_time": p["audio_duration_sec"], "subtitle_timings": subtitle_timings,
     }
     subtitles = build_export_subtitles([narration], max_hanzi=9)

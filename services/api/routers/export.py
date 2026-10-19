@@ -21,6 +21,7 @@ from services.generation_service import (
     write_timeline,
 )
 from services.media_service import assemble_clips
+from services.product_placement_service import resolve_product_overlays
 from services.store import db_write_transaction, load_db, project_dir, public_url, save_db
 from services.video_export_service import (
     _transform_y_for_visual_y,
@@ -117,18 +118,16 @@ def _export_video_library_draft(db: dict, project: dict) -> dict:
     (export_dir / "storyboard.json").write_text(
         json.dumps(shots, ensure_ascii=False, indent=2), encoding="utf-8",
     )
+    narration = narration_shot(project)
+    srt_content = generate_export_srt(
+        [narration], max_hanzi=VIDEO_LIBRARY_SUBTITLE_MAX_HANZI,
+    )
     srt_source = base / "subtitles" / "subtitles.srt"
-    if not srt_source.is_file():
-        srt_source.parent.mkdir(parents=True, exist_ok=True)
-        srt_source.write_text(
-            generate_export_srt(
-                [narration_shot(project)], max_hanzi=VIDEO_LIBRARY_SUBTITLE_MAX_HANZI,
-            ),
-            encoding="utf-8",
-        )
-    shutil.copy2(srt_source, export_dir / "subtitles.srt")
+    srt_source.parent.mkdir(parents=True, exist_ok=True)
+    srt_source.write_text(srt_content, encoding="utf-8")
+    (export_dir / "subtitles.srt").write_text(srt_content, encoding="utf-8")
     (export_dir / "timeline.json").write_text(
-        json.dumps(narration_shot(project), ensure_ascii=False, indent=2), encoding="utf-8",
+        json.dumps(narration, ensure_ascii=False, indent=2), encoding="utf-8",
     )
     cover_source = base / "cover" / "cover.png"
     if cover_source.exists():
@@ -156,6 +155,18 @@ def _export_video_library_draft(db: dict, project: dict) -> dict:
             export_dir / f"background_music_source{source_music.suffix.lower()}",
         )
 
+    try:
+        product_items, product_report = resolve_product_overlays(db, project, duration)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    product_payload = {
+        "items": product_items,
+        "start_sec": product_report.get("start_sec"),
+        "transition_sec": product_report.get("transition_sec", 0.5),
+        "fade_sec": product_report.get("fade_sec", 0.3),
+        "pip_box": product_report.get("pip_box"),
+    } if product_items else None
+
     subtitle_transform_y = _transform_y_for_visual_y(VIDEO_LIBRARY_SUBTITLE_VISUAL_Y)
     try:
         draft_report = create_jianying_native_draft(
@@ -179,6 +190,7 @@ def _export_video_library_draft(db: dict, project: dict) -> dict:
             animate_scenes=False,
             clip_window=VIDEO_LIBRARY_CLIP_WINDOW,
             subtitle_transform_y=subtitle_transform_y,
+            product_placement=product_payload,
         )
     except Exception as exc:
         raise HTTPException(500, f"Failed to generate export deliverables: {exc}") from exc
@@ -196,7 +208,33 @@ def _export_video_library_draft(db: dict, project: dict) -> dict:
         "scene_media": "video",
         "clip_window": VIDEO_LIBRARY_CLIP_WINDOW,
         "subtitle_transform_y": round(subtitle_transform_y, 4),
-        "external_media_references": [str(path.resolve()) for path in scene_paths],
+        "product_placement": {
+            "enabled": bool(product_items),
+            "marker_present": bool(product_report.get("marker_present")),
+            "start_sec": product_report.get("start_sec"),
+            "start_sec_stale": bool(product_report.get("start_sec_stale")),
+            "items": [
+                {
+                    "asset_id": item["asset_id"],
+                    "media_type": item["media_type"],
+                    "requested_duration_sec": item["requested_duration_sec"],
+                    "effective_duration_sec": item["duration_sec"],
+                    "source_path": item["path"],
+                    "fill_duration": item.get("fill_duration", True),
+                    "source_duration_sec": item.get("source_duration_sec"),
+                    "pip_box": item.get("pip_box"),
+                }
+                for item in product_items
+            ],
+            "transition_sec": product_report.get("transition_sec"),
+            "fade_sec": product_report.get("fade_sec"),
+            "pip_box": product_report.get("pip_box"),
+            "truncated": bool(product_report.get("truncated")),
+        },
+        "external_media_references": (
+            [str(path.resolve()) for path in scene_paths]
+            + [item["path"] for item in product_items]
+        ),
         "portable_zip": False,
     }
     (export_dir / "export_verification.json").write_text(

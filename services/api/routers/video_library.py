@@ -14,7 +14,17 @@ from fastapi.responses import StreamingResponse
 from PIL import Image, ImageOps
 from pydantic import BaseModel
 
-from services.generation_service import normalize_cover_title_positions, synthesize_volcengine_tts
+from services.generation_service import (
+    normalize_cover_title_positions,
+    strip_product_marker,
+    synthesize_volcengine_tts,
+)
+from services.product_placement_service import (
+    MAX_ITEM_DURATION_SEC,
+    MAX_ITEMS,
+    MIN_ITEM_DURATION_SEC,
+    normalize_pip_box,
+)
 from services.store import assets_dir, db_write_transaction, load_db, public_url, save_db
 from services.text_service import generate_viral_title
 
@@ -34,6 +44,21 @@ class VoicePreviewPayload(BaseModel):
     text: str = ""
     voice_type: str | None = None
     speech_rate: int | None = None
+
+
+class PlacementPresetItem(BaseModel):
+    asset_id: str
+    duration_sec: float = 3.0
+    fill_duration: bool = True
+    pip_box: dict | None = None
+
+
+class PlacementPresetPayload(BaseModel):
+    name: str
+    preset_id: str | None = None
+    items: list[PlacementPresetItem] = []
+    transition_sec: float = 0.5
+    pip_box: dict | None = None
 
 
 def preset_dir() -> Path:
@@ -248,9 +273,95 @@ def delete_preset(preset_id: str):
     return {"status": "deleted", "preset_id": preset_id}
 
 
+@router.get("/placement-presets")
+def list_placement_presets():
+    presets = sorted(
+        load_db().get("product_placement_presets", []),
+        key=lambda item: str(item.get("updated_at") or ""),
+        reverse=True,
+    )
+    return {"presets": presets}
+
+
+@router.post("/placement-presets")
+def upsert_placement_preset(payload: PlacementPresetPayload):
+    name = str(payload.name or "").strip()
+    if not name:
+        raise HTTPException(400, "请填写带货预设名称")
+    if len(name) > 60:
+        raise HTTPException(400, "带货预设名称不能超过 60 个字")
+    if len(payload.items) > MAX_ITEMS:
+        raise HTTPException(400, f"带货预设最多 {MAX_ITEMS} 个素材")
+
+    db = load_db()
+    assets = {item.get("id"): item for item in db.get("product_library", [])}
+    default_box = normalize_pip_box(payload.pip_box)
+    items = []
+    for index, item in enumerate(payload.items):
+        asset = assets.get(str(item.asset_id or ""))
+        if not asset:
+            raise HTTPException(400, f"第 {index + 1} 个带货素材不存在")
+        duration = max(MIN_ITEM_DURATION_SEC, min(float(item.duration_sec or 0), MAX_ITEM_DURATION_SEC))
+        source_duration = float(asset.get("duration_sec") or 0)
+        if asset.get("media_type") == "video" and source_duration > 0 and not item.fill_duration:
+            duration = min(duration, source_duration)
+        items.append({
+            "asset_id": asset["id"],
+            "duration_sec": round(duration, 3),
+            "fill_duration": bool(item.fill_duration),
+            "pip_box": normalize_pip_box(item.pip_box or default_box),
+        })
+
+    existing = None
+    if payload.preset_id:
+        existing = next(
+            (item for item in db.get("product_placement_presets", [])
+             if item.get("id") == payload.preset_id),
+            None,
+        )
+        if not existing:
+            raise HTTPException(404, "带货预设不存在")
+    identifier = payload.preset_id or str(uuid4())
+    now = datetime.now().isoformat(timespec="seconds")
+    record = {
+        "id": identifier,
+        "name": name,
+        "items": items,
+        "transition_sec": round(max(0.0, min(float(payload.transition_sec or 0), 2.0)), 3),
+        "pip_box": default_box,
+        "created_at": (existing or {}).get("created_at") or now,
+        "updated_at": now,
+    }
+    with db_write_transaction():
+        current_db = load_db()
+        rows = current_db.setdefault("product_placement_presets", [])
+        if existing:
+            index = next(i for i, item in enumerate(rows) if item.get("id") == identifier)
+            rows[index] = record
+        else:
+            rows.append(record)
+        save_db(current_db)
+    return {"status": "success", "preset": record}
+
+
+@router.delete("/placement-presets/{preset_id}")
+def delete_placement_preset(preset_id: str):
+    with db_write_transaction():
+        db = load_db()
+        rows = db.get("product_placement_presets", [])
+        if not any(item.get("id") == preset_id for item in rows):
+            raise HTTPException(404, "带货预设不存在")
+        db["product_placement_presets"] = [
+            item for item in rows if item.get("id") != preset_id
+        ]
+        save_db(db)
+    return {"status": "deleted", "preset_id": preset_id}
+
+
 @router.post("/title-preview")
 def title_preview(payload: TitlePreviewPayload):
-    script = str(payload.script or "").strip()
+    script, _, _ = strip_product_marker(str(payload.script or ""))
+    script = script.strip()
     if not script:
         raise HTTPException(400, "请先输入文案")
     if len(script) > 50_000:
