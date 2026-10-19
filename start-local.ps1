@@ -21,15 +21,21 @@ if ($needsBuild) {
     if ($LASTEXITCODE -ne 0) { throw "Frontend build failed" }
 }
 
-$running = $false
-try {
-    $health = Invoke-RestMethod -Uri "$url/api/health" -TimeoutSec 2
-    $running = $health.status -eq "ok"
-} catch {}
-
-if ($running) {
-    throw "VideoGen backend is already running on port 8000. Close the existing backend window first."
+# Reuse a compatible backend, or select a free port without stopping another service.
+for ($taskPort = 8000; $taskPort -le 8010; $taskPort++) {
+    $url = "http://127.0.0.1:$taskPort"
+    $listener = Get-NetTCPConnection -LocalPort $taskPort -State Listen -ErrorAction SilentlyContinue
+    if (-not $listener) { break }
+    try {
+        $health = Invoke-RestMethod -Uri "$url/api/health" -TimeoutSec 2
+        $media = Invoke-RestMethod -Uri "$url/api/media" -TimeoutSec 5
+        if ($health.status -eq "ok" -and $health.api_version -eq 12 -and $null -ne $media.templates) {
+            Start-Process $url
+            exit 0
+        }
+    } catch {}
 }
+if ($taskPort -gt 8010) { throw "No free VideoGen port in 8000-8010." }
 
 $browserJob = Start-Job -ArgumentList $url -ScriptBlock {
     param($targetUrl)
@@ -49,7 +55,7 @@ Write-Host "VideoGen backend is running at $url"
 Write-Host "Close this window or press Ctrl+C to stop the backend."
 try {
     Push-Location (Join-Path $root "services\api")
-    & $python -m uvicorn main:app --host 127.0.0.1 --port 8000
+    & $python -m uvicorn main:app --host 127.0.0.1 --port $taskPort
     if ($LASTEXITCODE -ne 0) { throw "VideoGen backend exited with code $LASTEXITCODE" }
 } finally {
     Pop-Location

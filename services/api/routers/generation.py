@@ -17,23 +17,29 @@ from PIL import Image, ImageOps
 from pydantic import BaseModel
 
 from services.generation_service import (
+    VIDEO_LIBRARY_SUBTITLE_MAX_HANZI,
+    audio_duration,
     build_image_prompt,
     compose_uploaded_cover,
     generate_ai_image,
     normalize_image_generation_provider,
     generated_image_extension,
     generate_export_srt,
+    narration_shot,
     remove_watermark_with_seedream,
     synthesize_volcengine_tts,
     synthesize_project_voice,
     write_timeline,
     normalize_cover_title_positions,
 )
-from services.store import db_write_transaction, load_db, project_dir, public_url, save_db
+from services.media_service import assemble_clips, normalize_audio
+from services.store import assets_dir, db_write_transaction, load_db, project_dir, public_url, save_db
 from services.text_service import generate_publish_assistant, generate_viral_title
 
 router = APIRouter(prefix="/api/projects", tags=["generation"])
 GENERATED_IMAGE_SAVE_LOCK = threading.Lock()
+VIDEO_LIBRARY_VOICE_LOCK = threading.Lock()
+VIDEO_LIBRARY_VOICE_ACTIVE: set[str] = set()
 STORYBOARD_UPLOAD_MAX_BYTES = 20 * 1024 * 1024
 STORYBOARD_UPLOAD_MAX_PIXELS = 40_000_000
 STORYBOARD_UPLOAD_FORMATS = {
@@ -46,6 +52,7 @@ STORYBOARD_UPLOAD_FORMATS = {
 class VoicePayload(BaseModel):
     voice_type: str | None = None
     speech_rate: int | None = None
+    audio_source: str | None = None
 
 
 class VoiceSettingsPayload(BaseModel):
@@ -488,12 +495,130 @@ def upload_shot_image(project_id: str, shot_id: str, file: UploadFile = File(...
     return {"status": "success", "shot": shot, "asset": asset}
 
 
+def _generate_video_library_voice(project: dict, payload: VoicePayload | None) -> dict:
+    project_id = project["id"]
+    with VIDEO_LIBRARY_VOICE_LOCK:
+        if project_id in VIDEO_LIBRARY_VOICE_ACTIVE:
+            raise HTTPException(409, "配音正在生成中，请稍候")
+        VIDEO_LIBRARY_VOICE_ACTIVE.add(project_id)
+    try:
+        return _generate_video_library_voice_unlocked(project, payload)
+    finally:
+        with VIDEO_LIBRARY_VOICE_LOCK:
+            VIDEO_LIBRARY_VOICE_ACTIVE.discard(project_id)
+
+
+def _generate_video_library_voice_unlocked(project: dict, payload: VoicePayload | None) -> dict:
+    """Narrate the whole script in one voice track and match clips to its duration."""
+    project_id = project["id"]
+    script = str(project.get("rewritten_script") or project.get("raw_script") or "").strip()
+    if not script:
+        raise HTTPException(400, "请先输入文案")
+    audio_source = (
+        payload.audio_source if payload and payload.audio_source else project.get("audio_source")
+    ) or "tts"
+    if audio_source not in {"tts", "upload"}:
+        raise HTTPException(400, "音频来源无效")
+    voice_type = (
+        payload.voice_type if payload and payload.voice_type else project.get("voice_type")
+    ) or None
+    speech_rate = (
+        payload.speech_rate if payload and payload.speech_rate is not None
+        else project.get("speech_rate")
+    )
+    assets = [
+        asset for asset in load_db().get("video_library", [])
+        if Path(asset.get("local_path") or "").is_file()
+    ]
+    if not assets:
+        raise HTTPException(400, "请先到素材库上传视频")
+    base = project_dir(project_id)
+    out = base / "audio" / "main_voice.mp3"
+    narration = {"id": "narration", "shot_index": 1, "voice_text": script}
+    if audio_source == "upload":
+        uploaded = Path(project.get("uploaded_audio_path") or "")
+        if not uploaded.is_file():
+            raise HTTPException(400, "请先上传音频")
+        try:
+            normalize_audio(uploaded, out)
+            duration = audio_duration(out)
+        except Exception as exc:
+            raise HTTPException(502, f"音频处理失败：{exc}") from exc
+        result = {
+            "duration_sec": duration, "subtitle_timings": [], "audio_format": "mp3",
+            "provider": "uploaded_audio", "voice_type": project.get("voice_type"),
+            "timestamp_provider": "duration_weighted",
+        }
+    else:
+        try:
+            result = synthesize_project_voice(
+                out, [narration], voice_type, speech_rate,
+                max_hanzi=VIDEO_LIBRARY_SUBTITLE_MAX_HANZI,
+            )
+        except Exception as exc:
+            raise HTTPException(502, str(exc)) from exc
+    narration.update({
+        "start_time": 0.0,
+        "end_time": result["duration_sec"],
+        "subtitle_timings": result.get("subtitle_timings") or [],
+    })
+    shots = assemble_clips(assets, result["duration_sec"], project_id)
+    srt_path = base / "subtitles" / "subtitles.srt"
+    srt_path.parent.mkdir(parents=True, exist_ok=True)
+    srt_path.write_text(
+        generate_export_srt([narration], max_hanzi=VIDEO_LIBRARY_SUBTITLE_MAX_HANZI),
+        encoding="utf-8",
+    )
+    timeline_path = base / "audio" / "voice_timeline.json"
+    timeline_path.write_text(json.dumps(narration, ensure_ascii=False, indent=2), encoding="utf-8")
+    now = datetime.now().isoformat(timespec="seconds")
+    with db_write_transaction():
+        db = load_db()
+        current = next((p for p in db["projects"] if p["id"] == project_id), None)
+        if not current:
+            raise HTTPException(404, "Project not found")
+        db["shots"] = [s for s in db["shots"] if s["project_id"] != project_id] + shots
+        current.update({
+            "audio_url": public_url(out),
+            "audio_path": str(out),
+            "audio_duration_sec": round(float(result["duration_sec"]), 3),
+            "audio_format": "mp3",
+            "audio_source": audio_source,
+            "voice_type": result.get("voice_type") or voice_type or current.get("voice_type"),
+            "speech_rate": int(speech_rate) if speech_rate is not None else int(current.get("speech_rate") or 0),
+            "voice_style": result.get("voice_type") or current.get("voice_type"),
+            "voice_volume": float(current.get("voice_volume") or 1.0),
+            "narration_subtitle_timings": narration["subtitle_timings"],
+            "voice_timeline_url": public_url(timeline_path),
+            "subtitle_url": public_url(srt_path),
+            "status": "voice_ready",
+            "render_url": None,
+            "generation_error": "",
+            "updated_at": now,
+        })
+        save_db(db)
+    return {
+        "audio_url": public_url(out),
+        "audio_format": "mp3",
+        "voice_type": result.get("voice_type"),
+        "provider": result.get("provider"),
+        "duration_sec": result["duration_sec"],
+        "voice_timeline_url": public_url(timeline_path),
+        "subtitle_url": public_url(srt_path),
+        "alignment_method": result.get("alignment_method"),
+        "timestamp_provider": result.get("timestamp_provider"),
+        "shot_count": len(shots),
+    }
+
+
 @router.post("/{project_id}/generate-voice")
 def generate_voice(project_id: str, payload: VoicePayload | None = None):
     db = load_db()
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
         raise HTTPException(404, "Project not found")
+    if project.get("workflow_type") == "video_library":
+        return _generate_video_library_voice(project, payload)
     shots = sorted([s for s in db["shots"] if s["project_id"] == project_id], key=lambda s: s["shot_index"])
     if not shots:
         raise HTTPException(400, "No shots")
@@ -651,6 +776,7 @@ def generate_cover(
     file: UploadFile | None = File(None),
     title_positions: str = Form(""),
     mask_opacity: float = Form(0.35),
+    preset_id: str = Form(""),
 ):
     db = load_db()
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
@@ -677,6 +803,16 @@ def generate_cover(
                 upload_path.unlink(missing_ok=True)
                 raise ValueError("Uploaded image must not exceed 20 MB")
             upload_path.replace(source_path)
+        elif preset_id:
+            preset = next(
+                (item for item in db.get("video_library_presets", []) if item.get("id") == preset_id),
+                None,
+            )
+            preset_source = Path(str((preset or {}).get("cover_source_path") or ""))
+            presets_root = (assets_dir() / "presets").resolve()
+            if not preset_source.is_file() or not preset_source.resolve().is_relative_to(presets_root):
+                raise ValueError("Preset cover image is unavailable")
+            shutil.copy2(preset_source, source_path)
         if not source_path.is_file():
             raise ValueError("Please upload an image file")
         try:
@@ -781,10 +917,32 @@ def update_music_settings(project_id: str, payload: MusicSettingsPayload):
 @router.post("/{project_id}/generate-subtitles")
 def generate_subtitles(project_id: str):
     db = load_db()
+    project = next((p for p in db["projects"] if p["id"] == project_id), None)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    srt_path = project_dir(project_id) / "subtitles" / "subtitles.srt"
+    if project.get("workflow_type") == "video_library":
+        if float(project.get("audio_duration_sec") or 0) <= 0:
+            raise HTTPException(400, "请先生成配音")
+        narration = narration_shot(project)
+        srt_path.parent.mkdir(parents=True, exist_ok=True)
+        srt_path.write_text(
+            generate_export_srt([narration], max_hanzi=VIDEO_LIBRARY_SUBTITLE_MAX_HANZI),
+            encoding="utf-8",
+        )
+        timeline_path = project_dir(project_id) / "subtitles" / "timeline.json"
+        timeline_path.write_text(json.dumps(narration, ensure_ascii=False, indent=2), encoding="utf-8")
+        with db_write_transaction():
+            current_db = load_db()
+            current = next((p for p in current_db["projects"] if p["id"] == project_id), None)
+            if current:
+                current["subtitle_url"] = public_url(srt_path)
+                current["updated_at"] = datetime.now().isoformat(timespec="seconds")
+                save_db(current_db)
+        return {"subtitle_url": public_url(srt_path), "timeline_url": public_url(timeline_path)}
     shots = sorted([s for s in db["shots"] if s["project_id"] == project_id], key=lambda s: s["shot_index"])
     if not shots:
         raise HTTPException(400, "No shots")
-    srt_path = project_dir(project_id) / "subtitles" / "subtitles.srt"
     srt_path.write_text(generate_export_srt(shots), encoding="utf-8")
     timeline_path = project_dir(project_id) / "subtitles" / "timeline.json"
     write_timeline(timeline_path, shots)

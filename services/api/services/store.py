@@ -26,6 +26,7 @@ DEFAULT_DB: dict[str, Any] = {
     "promotion_books": ["女性人物传记", "历史深处的民国", "国之脊梁"],
     "promotion_books_catalog_initialized": True,
     "ai_script_people_history": {},
+    "video_library_presets": [],
 }
 _DB_LOCK = threading.RLock()
 _DB_CACHE: dict[str, Any] | None = None
@@ -169,6 +170,10 @@ def ensure_storage() -> None:
             if key not in data:
                 data[key] = default
                 changed = True
+        for project in data.get("projects", []):
+            if project.get("status") in {"video_generating", "video_rendering"}:
+                project.update({"status": "video_failed", "generation_error": "服务重启中断了任务，请重新生成或合成视频"})
+                changed = True
         for asset in data.get("generated_assets", []):
             local_path = asset.get("local_path")
             if not local_path:
@@ -179,6 +184,19 @@ def ensure_storage() -> None:
             asset["local_path"] = str(current_path)
             asset["file_url"] = public_url(current_path)
             changed = True
+        for preset in data.get("video_library_presets", []):
+            cover_path = str(preset.get("cover_source_path") or "")
+            if not cover_path:
+                continue
+            current_cover = _current_storage_path(cover_path)
+            if not current_cover.exists():
+                preset["cover_source_path"] = ""
+                preset["cover_source_url"] = ""
+                changed = True
+            elif str(current_cover) != cover_path:
+                preset["cover_source_path"] = str(current_cover)
+                preset["cover_source_url"] = public_url(current_cover)
+                changed = True
         stale_asset_ids = {
             item.get("id")
             for item in data.get("generated_assets", [])

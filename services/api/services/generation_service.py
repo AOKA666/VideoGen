@@ -998,10 +998,10 @@ def _official_timestamp_words(sentences: list[dict]) -> list[dict]:
     return words
 
 
-def _weighted_subtitle_timeline(shots: list[dict], duration: float) -> list[dict]:
+def _weighted_subtitle_timeline(shots: list[dict], duration: float, max_hanzi: int = 6) -> list[dict]:
     entries = []
     for shot in shots:
-        for index, text in enumerate(split_subtitle_text(shot.get("voice_text", "")) or [shot.get("voice_text", "")], 1):
+        for index, text in enumerate(split_subtitle_text(shot.get("voice_text", ""), max_hanzi=max_hanzi) or [shot.get("voice_text", "")], 1):
             punctuation = text[-1:] if text else ""
             pause_weight = 2.2 if punctuation in "。！？!?" else 1.35 if punctuation in "，；;：" else 0
             entries.append({
@@ -1027,13 +1027,14 @@ def _weighted_subtitle_timeline(shots: list[dict], duration: float) -> list[dict
     return entries
 
 
-def align_voice_to_script(path: Path, shots: list[dict], duration: float, sentences: list[dict]) -> dict:
+def align_voice_to_script(path: Path, shots: list[dict], duration: float, sentences: list[dict],
+                          max_hanzi: int = 6) -> dict:
     words = _official_timestamp_words(sentences)
 
     full_text = "".join(str(shot.get("voice_text") or "") for shot in shots)
     characters = _character_timeline_from_words(words, full_text, duration) if words else []
     if not characters:
-        subtitle_timings = _weighted_subtitle_timeline(shots, duration)
+        subtitle_timings = _weighted_subtitle_timeline(shots, duration, max_hanzi=max_hanzi)
         alignment_method = "duration_weighted"
     else:
         subtitle_timings = []
@@ -1048,7 +1049,7 @@ def align_voice_to_script(path: Path, shots: list[dict], duration: float, senten
             shot_chars = characters[character_cursor:character_cursor + shot_char_count]
             character_cursor += shot_char_count
             local_cursor = 0
-            for subtitle_index, subtitle_text in enumerate(split_subtitle_text(shot_text) or [shot_text], 1):
+            for subtitle_index, subtitle_text in enumerate(split_subtitle_text(shot_text, max_hanzi=max_hanzi) or [shot_text], 1):
                 subtitle_count = len(alignment_text(subtitle_text))
                 subtitle_chars = shot_chars[local_cursor:local_cursor + subtitle_count]
                 local_cursor += subtitle_count
@@ -1080,7 +1081,8 @@ def align_voice_to_script(path: Path, shots: list[dict], duration: float, senten
     }
 
 
-def synthesize_project_voice(path: Path, shots: list[dict], voice_type: str | None = None, speech_rate: int | None = None) -> dict:
+def synthesize_project_voice(path: Path, shots: list[dict], voice_type: str | None = None,
+                             speech_rate: int | None = None, max_hanzi: int = 6) -> dict:
     legacy_chunk_dir = path.parent / "voice_chunks"
     if legacy_chunk_dir.exists():
         shutil.rmtree(legacy_chunk_dir)
@@ -1094,7 +1096,9 @@ def synthesize_project_voice(path: Path, shots: list[dict], voice_type: str | No
     response = synthesize_volcengine_tts(full_text, voice_type, speech_rate)
     path.write_bytes(response["audio"])
     final_duration = audio_duration(path)
-    alignment = align_voice_to_script(path, shots, final_duration, response.get("sentences") or [])
+    alignment = align_voice_to_script(
+        path, shots, final_duration, response.get("sentences") or [], max_hanzi=max_hanzi,
+    )
     return {
         "audio_format": "mp3",
         "voice_type": voice_type or volc_tts_voice(),
@@ -1233,6 +1237,21 @@ def _timed_export_subtitle_chunks(timing: dict, max_hanzi: int) -> list[dict]:
             "hanzi_count": chinese_char_count(chunk_text),
         })
     return subtitles
+
+
+VIDEO_LIBRARY_SUBTITLE_MAX_HANZI = 9
+
+
+def narration_shot(project: dict) -> dict:
+    """The video-library workflow narrates the whole script as one continuous track."""
+    return {
+        "id": "narration",
+        "shot_index": 1,
+        "voice_text": str(project.get("rewritten_script") or project.get("raw_script") or ""),
+        "start_time": 0.0,
+        "end_time": float(project.get("audio_duration_sec") or 0),
+        "subtitle_timings": project.get("narration_subtitle_timings") or [],
+    }
 
 
 def build_export_subtitles(shots: list[dict], max_hanzi: int = 6) -> list[dict]:

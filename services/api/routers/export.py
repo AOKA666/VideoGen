@@ -6,22 +6,30 @@ import os
 import re
 import shutil
 import zipfile
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from PIL import Image, ImageOps
 
 from services.generation_service import (
+    VIDEO_LIBRARY_SUBTITLE_MAX_HANZI,
     build_export_subtitles,
     generate_export_srt,
     generate_export_subtitle_txt,
+    narration_shot,
     write_timeline,
 )
-from services.store import load_db, project_dir, public_url
+from services.media_service import assemble_clips
+from services.store import db_write_transaction, load_db, project_dir, public_url, save_db
 from services.video_export_service import (
+    _transform_y_for_visual_y,
     create_jianying_native_draft,
     jianying_drafts_root,
 )
+
+VIDEO_LIBRARY_CLIP_WINDOW = (0, 589, 1080, 742)
+VIDEO_LIBRARY_SUBTITLE_VISUAL_Y = 1180
 
 router = APIRouter(prefix="/api/projects", tags=["export"])
 
@@ -63,12 +71,161 @@ def open_draft_folder(project_id: str):
     return {"path": str(target.resolve())}
 
 
+def _export_video_library_draft(db: dict, project: dict) -> dict:
+    """Export the video-library workflow as a Jianying draft: template + clips + voice + music."""
+    project_id = project["id"]
+    base = project_dir(project_id)
+    audio = Path(project.get("audio_path") or "")
+    if not audio.is_file():
+        audio = base / "audio" / "main_voice.mp3"
+    if not audio.is_file():
+        raise HTTPException(400, "请先生成配音")
+    duration = float(project.get("audio_duration_sec") or 0)
+    if duration <= 0:
+        raise HTTPException(400, "配音时长无效，请重新生成配音")
+
+    shots = sorted([s for s in db["shots"] if s["project_id"] == project_id], key=lambda s: s["shot_index"])
+    if not shots or any(not Path(s.get("local_path") or "").is_file() for s in shots):
+        assets = [
+            asset for asset in db.get("video_library", [])
+            if Path(asset.get("local_path") or "").is_file()
+        ]
+        if not assets:
+            raise HTTPException(400, "请先到素材库上传视频")
+        shots = assemble_clips(assets, duration, project_id)
+        with db_write_transaction():
+            current_db = load_db()
+            current_db["shots"] = [
+                s for s in current_db["shots"] if s["project_id"] != project_id
+            ] + shots
+            save_db(current_db)
+    scene_paths = [Path(s["local_path"]) for s in shots]
+
+    from routers.media import templates  # Local import avoids a router import cycle.
+    template = next(
+        (item for item in templates() if item["id"] == project.get("background_template_id")),
+        None,
+    )
+    if not template or not Path(template["local_path"]).is_file():
+        raise HTTPException(400, "背景模板不存在")
+
+    export_dir = base / "exports" / "package"
+    if export_dir.exists():
+        shutil.rmtree(export_dir)
+    export_dir.mkdir(parents=True, exist_ok=True)
+    (export_dir / "raw_script.txt").write_text(project.get("raw_script", ""), encoding="utf-8")
+    (export_dir / "storyboard.json").write_text(
+        json.dumps(shots, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    srt_source = base / "subtitles" / "subtitles.srt"
+    if not srt_source.is_file():
+        srt_source.parent.mkdir(parents=True, exist_ok=True)
+        srt_source.write_text(
+            generate_export_srt(
+                [narration_shot(project)], max_hanzi=VIDEO_LIBRARY_SUBTITLE_MAX_HANZI,
+            ),
+            encoding="utf-8",
+        )
+    shutil.copy2(srt_source, export_dir / "subtitles.srt")
+    (export_dir / "timeline.json").write_text(
+        json.dumps(narration_shot(project), ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    cover_source = base / "cover" / "cover.png"
+    if cover_source.exists():
+        shutil.copy2(cover_source, export_dir / "cover.png")
+    copied_audio = export_dir / "main_voice.mp3"
+    shutil.copy2(audio, copied_audio)
+
+    music_preset = next(
+        (
+            item for item in db.get("music_library", [])
+            if item.get("id") == project.get("background_music_id")
+        ),
+        None,
+    )
+    source_music_value = str((music_preset or {}).get("local_path") or "").strip()
+    source_music = Path(source_music_value) if source_music_value else None
+    if source_music is not None and not source_music.is_file():
+        source_music = None
+    music_start_sec = float(project.get("background_music_start_sec") or 0)
+    music_volume = float(project.get("background_music_volume") or 0.2)
+    voice_volume = max(0.0, min(float(project.get("voice_volume", 1.0)), 3.0))
+    if source_music:
+        shutil.copy2(
+            source_music,
+            export_dir / f"background_music_source{source_music.suffix.lower()}",
+        )
+
+    subtitle_transform_y = _transform_y_for_visual_y(VIDEO_LIBRARY_SUBTITLE_VISUAL_Y)
+    try:
+        draft_report = create_jianying_native_draft(
+            export_dir / "jianying_draft",
+            project["name"],
+            shots,
+            scene_paths,
+            copied_audio,
+            export_dir / "subtitles.srt",
+            cover_source if cover_source.exists() else None,
+            title_line1=project.get("title_line1", ""),
+            title_line2=project.get("title_line2", ""),
+            background_music_path=source_music,
+            background_music_start_sec=music_start_sec,
+            background_music_volume=music_volume,
+            music_crossfade_sec=1.0,
+            voice_volume=voice_volume,
+            background_template_path=Path(template["local_path"]),
+            scene_media="video",
+            copy_scenes=False,
+            animate_scenes=False,
+            clip_window=VIDEO_LIBRARY_CLIP_WINDOW,
+            subtitle_transform_y=subtitle_transform_y,
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to generate export deliverables: {exc}") from exc
+
+    verification = {
+        "output": "draft",
+        "jianying": draft_report,
+        "background_music": ({
+            "source": source_music.name,
+            "source_start_sec": music_start_sec,
+            "volume": music_volume,
+            "crossfade_sec": 1.0,
+        } if source_music else None),
+        "voice_volume": voice_volume,
+        "scene_media": "video",
+        "clip_window": VIDEO_LIBRARY_CLIP_WINDOW,
+        "subtitle_transform_y": round(subtitle_transform_y, 4),
+        "external_media_references": [str(path.resolve()) for path in scene_paths],
+        "portable_zip": False,
+    }
+    (export_dir / "export_verification.json").write_text(
+        json.dumps(verification, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    now = datetime.now().isoformat(timespec="seconds")
+    with db_write_transaction():
+        current_db = load_db()
+        current = next((p for p in current_db["projects"] if p["id"] == project_id), None)
+        if current:
+            current.update({"status": "draft_ready", "last_export_at": now, "updated_at": now})
+            save_db(current_db)
+    return {
+        "output": "draft",
+        "download_url": None,
+        "zip_file_name": "",
+        "export_folder": str((base / "exports").resolve()),
+        "verification": verification,
+    }
+
+
 @router.post("/{project_id}/export/package")
 def export_package(project_id: str):
     db = load_db()
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
         raise HTTPException(404, "Project not found")
+    if project.get("workflow_type") == "video_library":
+        return _export_video_library_draft(db, project)
     shots = sorted([s for s in db["shots"] if s["project_id"] == project_id], key=lambda s: s["shot_index"])
     if not shots:
         raise HTTPException(400, "No shots")

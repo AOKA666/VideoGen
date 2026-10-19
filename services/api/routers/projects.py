@@ -61,6 +61,14 @@ class ProjectCreate(BaseModel):
     voice_style: str = "沉稳男声"
     video_ratio: str = "9:16"
     promotion_book_title: str | None = None
+    workflow_type: str = "legacy"
+    background_template_id: str = "daodejing"
+    voice_type: str = "S_6Sd6jOE42"
+    speech_rate: int = 0
+
+
+class BulkDeletePayload(BaseModel):
+    project_ids: list[str] = []
 
 
 class ScriptUpdate(BaseModel):
@@ -138,6 +146,10 @@ def create_project(payload: ProjectCreate):
         "id": project_id,
         "name": payload.name or infer_title(payload.raw_script),
         "raw_script": payload.raw_script,
+        "workflow_type": payload.workflow_type,
+        "background_template_id": payload.background_template_id,
+        "voice_type": payload.voice_type,
+        "speech_rate": payload.speech_rate,
         "rewritten_script": "",
         "history_workflow": {},
         "content_type": payload.content_type,
@@ -567,12 +579,54 @@ def update_script(project_id: str, payload: ScriptUpdate):
     }
 
 
+@router.post("/bulk-delete")
+def bulk_delete_projects(payload: BulkDeletePayload):
+    ids = list(dict.fromkeys(
+        str(item).strip() for item in payload.project_ids if str(item).strip()
+    ))
+    if not ids:
+        raise HTTPException(400, "请选择要删除的项目")
+
+    skipped: list[dict[str, str]] = []
+    deleted_ids: list[str] = []
+    with db_write_transaction():
+        db = load_db()
+        by_id = {project["id"]: project for project in db["projects"]}
+        for project_id in ids:
+            project = by_id.get(project_id)
+            if not project:
+                skipped.append({"project_id": project_id, "reason": "项目不存在"})
+            elif project.get("status") in {"video_generating", "video_rendering"}:
+                skipped.append({"project_id": project_id, "reason": "视频正在处理中"})
+            else:
+                deleted_ids.append(project_id)
+        if deleted_ids:
+            deleted_set = set(deleted_ids)
+            db["projects"] = [p for p in db["projects"] if p["id"] not in deleted_set]
+            db["shots"] = [s for s in db["shots"] if s.get("project_id") not in deleted_set]
+            db["generated_assets"] = [
+                asset for asset in db.get("generated_assets", [])
+                if asset.get("project_id") not in deleted_set
+            ]
+            save_db(db)
+
+    project_root = projects_dir().resolve()
+    for project_id in deleted_ids:
+        target = (project_root / project_id).resolve()
+        if target.exists() and project_root in target.parents:
+            shutil.rmtree(target)
+    return {"status": "deleted", "deleted_ids": deleted_ids, "skipped": skipped}
+
+
 @router.delete("/{project_id}")
 def delete_project(project_id: str):
     db = load_db()
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
         raise HTTPException(404, "Project not found")
+
+    if project.get("status") in {"video_generating", "video_rendering"}:
+        raise HTTPException(409, "视频正在处理中，请完成后再删除项目")
 
     db["projects"] = [p for p in db["projects"] if p["id"] != project_id]
     db["shots"] = [s for s in db["shots"] if s.get("project_id") != project_id]

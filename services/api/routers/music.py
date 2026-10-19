@@ -118,6 +118,13 @@ def delete_music(music_id: str):
         project["background_music_volume"] = 0.2
         project["updated_at"] = now
         cleared_projects += 1
+    for preset in db.get("video_library_presets", []):
+        if preset.get("background_music_id") != music_id:
+            continue
+        preset["background_music_id"] = None
+        preset["background_music_start_sec"] = 0
+        preset["background_music_volume"] = 0.2
+        preset["updated_at"] = now
     save_db(db)
     return {
         "status": "deleted",

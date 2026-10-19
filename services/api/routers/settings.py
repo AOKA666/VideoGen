@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from services.settings_service import CONFIG_FILE, choose_directory, load_settings, save_settings
-from services.store import configure_storage, ensure_storage
+from services.store import configure_storage, ensure_storage, load_db
 
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
@@ -33,6 +33,11 @@ def get_settings():
 def select_directory(payload: DirectorySelectionPayload):
     if payload.kind not in {"project", "jianying"}:
         raise HTTPException(400, "Directory kind must be project or jianying")
+    if payload.kind == "project" and any(
+        project.get("status") in {"video_generating", "video_rendering"}
+        for project in load_db().get("projects", [])
+    ):
+        raise HTTPException(409, "视频正在处理中，请完成后再切换项目目录")
     settings = load_settings()
     key = "project_directory" if payload.kind == "project" else "jianying_drafts_directory"
     title = "选择 VideoGen 项目目录" if payload.kind == "project" else "选择剪映草稿目录"

@@ -13,8 +13,8 @@ from PIL import Image, ImageOps
 from services.settings_service import configured_jianying_directory
 
 SUBTITLE_RGB_COLOR = (1.0, 1.0, 1.0)
-SUBTITLE_JIANYING_BORDER_WIDTH = 70.0
-SUBTITLE_JIANYING_FONT_SIZE = 20.0
+SUBTITLE_JIANYING_BORDER_WIDTH = 40.0
+SUBTITLE_JIANYING_FONT_SIZE = 15.0
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 SUBTITLE_FONT_FILE = PROJECT_ROOT / "assets" / "DouyinSansBold.otf"
 SUBTITLE_FONT_NAME = "Douyin Sans"
@@ -107,10 +107,33 @@ def _shot_display_ranges(
     return ranges
 
 
+JIANYING_CANVAS_WIDTH = 1080
+JIANYING_CANVAS_HEIGHT = 1920
+# Jianying contains oversized material inside the canvas before applying clip.scale.
+JIANYING_SCALE_RELATIVE_TO_CANVAS_FIT = True
+
+
+def _clip_window_scale(width: int, height: int, window_width: int, window_height: int) -> float:
+    """Uniform scale that fits a material into a centered window of the 1080x1920 canvas."""
+    if width <= 0 or height <= 0 or window_width <= 0 or window_height <= 0:
+        return 1.0
+    base = (
+        min(JIANYING_CANVAS_WIDTH / width, JIANYING_CANVAS_HEIGHT / height)
+        if JIANYING_SCALE_RELATIVE_TO_CANVAS_FIT else 1.0
+    )
+    return min(window_width / (width * base), window_height / (height * base))
+
+
+def _transform_y_for_visual_y(visual_y: float) -> float:
+    """Convert a target canvas y coordinate into Jianying's half-canvas transform unit."""
+    half = JIANYING_CANVAS_HEIGHT / 2
+    return (half - visual_y) / half
+
+
 def _jianying_title_geometry(line1: str, line2: str) -> dict[str, float]:
     """Keep calibrated Jianying title geometry independent of cover font changes."""
     return {
-        "font_size": 20.0,
+        "font_size": 15.0,
         "line1_transform_y": 0.645,
         "line2_transform_y": 0.485,
     }
@@ -183,6 +206,12 @@ def create_jianying_native_draft(
     background_music_volume: float = 0.2,
     music_crossfade_sec: float = 1.0,
     voice_volume: float = 1.0,
+    background_template_path: Path | None = None,
+    scene_media: str = "image",
+    copy_scenes: bool = True,
+    animate_scenes: bool = True,
+    clip_window: tuple[int, int, int, int] | None = None,
+    subtitle_transform_y: float = -0.43,
 ) -> dict[str, Any]:
     try:
         import pyJianYingDraft as draft
@@ -207,8 +236,11 @@ def create_jianying_native_draft(
     audio_dir.mkdir(parents=True, exist_ok=True)
     local_scenes = []
     for path in scene_paths:
-        target = image_dir / path.name
-        shutil.copy2(path, target)
+        if copy_scenes:
+            target = image_dir / path.name
+            shutil.copy2(path, target)
+        else:
+            target = path
         local_scenes.append(target)
     local_audio = audio_dir / audio_path.name
     shutil.copy2(audio_path, local_audio)
@@ -219,21 +251,48 @@ def create_jianying_native_draft(
     local_subtitles = materials_dir / "subtitles.srt"
     shutil.copy2(subtitles_path, local_subtitles)
 
-    script.add_track(draft.TrackType.video, "video")
     script.add_track(draft.TrackType.audio, "voice")
     audio_material = draft.AudioMaterial(str(local_audio))
     audio_duration_us = audio_material.duration
     display_ranges = _shot_display_ranges(shots, audio_duration_us / 1_000_000)
+    if background_template_path:
+        script.add_track(draft.TrackType.video, "background")
+        background_target = image_dir / f"background{background_template_path.suffix.lower()}"
+        shutil.copy2(background_template_path, background_target)
+        script.add_segment(
+            draft.VideoSegment(
+                str(background_target),
+                draft.Timerange(0, max(audio_duration_us, 1)),
+                volume=0,
+            ),
+            "background",
+        )
+    clip_track = "clips" if background_template_path else "video"
+    script.add_track(
+        draft.TrackType.video, clip_track,
+        relative_index=1 if background_template_path else 0,
+    )
     zoom_animation = getattr(draft.GroupAnimationType, "\u7f29\u653e")
     for (start_sec, duration_sec), scene_path in zip(display_ranges, local_scenes):
         start_us = round(start_sec * 1_000_000)
-        duration_us = round(duration_sec * 1_000_000)
+        material = draft.VideoMaterial(str(scene_path))
+        duration_us = min(round(duration_sec * 1_000_000), material.duration)
+        if duration_us <= 0:
+            continue
+        clip_settings = None
+        if clip_window:
+            scale = _clip_window_scale(material.width, material.height, clip_window[2], clip_window[3])
+            clip_settings = draft.ClipSettings(scale_x=scale, scale_y=scale)
         segment = draft.VideoSegment(
-            str(scene_path),
+            material,
             draft.Timerange(start_us, duration_us),
+            source_timerange=draft.Timerange(0, duration_us),
+            volume=0,
+            clip_settings=clip_settings,
         )
-        segment.add_animation(zoom_animation, duration=duration_us)
-        script.add_segment(segment, "video")
+        if animate_scenes:
+            segment.add_animation(zoom_animation, duration=duration_us)
+        script.add_segment(segment, clip_track)
 
     if audio_duration_us > 0:
         script.add_segment(
@@ -284,19 +343,16 @@ def create_jianying_native_draft(
             target_start_us += max(target_duration_us - fade_us, 1)
             segment_index += 1
     # Keep subtitles and both title lines as editable Jianying text layers.
+    # 抖音美好体 is the Jianying name for the bundled Douyin Sans (Bold) family.
     try:
-        jianying_subtitle_font = draft.FontType.抖音美好体
+        jianying_text_font = draft.FontType.抖音美好体
     except AttributeError:
-        jianying_subtitle_font = None
-    try:
-        jianying_title_font = draft.FontType.飞扬行书
-    except AttributeError:
-        jianying_title_font = None
+        jianying_text_font = None
 
     subtitle_reference = draft.TextSegment(
         "字幕",
         draft.Timerange(0, 1_000_000),
-        font=jianying_subtitle_font,
+        font=jianying_text_font,
         style=draft.TextStyle(
             size=SUBTITLE_JIANYING_FONT_SIZE,
             bold=True,
@@ -308,7 +364,7 @@ def create_jianying_native_draft(
             color=(0.0, 0.0, 0.0),
             width=SUBTITLE_JIANYING_BORDER_WIDTH,
         ),
-        clip_settings=draft.ClipSettings(transform_y=-0.43),
+        clip_settings=draft.ClipSettings(transform_y=subtitle_transform_y),
     )
     script.import_srt(
         str(local_subtitles),
@@ -319,17 +375,13 @@ def create_jianying_native_draft(
 
     title_duration_us = max(audio_duration_us, 1)
     title_geometry = _jianying_title_geometry(title_line1, title_line2)
-    title_border = draft.TextBorder(
-        color=(0.0, 0.0, 0.0),
-        width=40.0,
-    )
     if title_line1:
         script.add_track(draft.TrackType.text, "title_line1")
         script.add_segment(
             draft.TextSegment(
                 title_line1,
                 draft.Timerange(0, title_duration_us),
-                font=jianying_title_font,
+                font=jianying_text_font,
                 style=draft.TextStyle(
                     size=title_geometry["font_size"],
                     bold=True,
@@ -337,7 +389,6 @@ def create_jianying_native_draft(
                     align=1,
                     auto_wrapping=False,
                 ),
-                border=title_border,
                 clip_settings=draft.ClipSettings(transform_y=title_geometry["line1_transform_y"]),
             ),
             "title_line1",
@@ -348,7 +399,7 @@ def create_jianying_native_draft(
             draft.TextSegment(
                 title_line2,
                 draft.Timerange(0, title_duration_us),
-                font=jianying_title_font,
+                font=jianying_text_font,
                 style=draft.TextStyle(
                     size=title_geometry["font_size"],
                     bold=True,
@@ -357,7 +408,6 @@ def create_jianying_native_draft(
                     align=1,
                     auto_wrapping=False,
                 ),
-                border=title_border,
                 clip_settings=draft.ClipSettings(transform_y=title_geometry["line2_transform_y"]),
             ),
             "title_line2",
@@ -380,4 +430,11 @@ def create_jianying_native_draft(
         "file_count": sum(1 for item in draft_path.rglob("*") if item.is_file()),
         "cover": cover_report,
         "background_music": bool(local_music),
+        "scene_media": scene_media,
+        "clip_window": clip_window,
+        "clip_scale_mode": (
+            "canvas_fit" if JIANYING_SCALE_RELATIVE_TO_CANVAS_FIT else "native_pixels"
+        ),
+        "copied_scenes": copy_scenes,
+        "animated_scenes": animate_scenes,
     }

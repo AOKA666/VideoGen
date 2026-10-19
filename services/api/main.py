@@ -5,12 +5,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from routers import export, generation, music, projects, settings, shots, system
+from routers import export, generation, music, projects, settings, shots, system, media, video_library
 from services.env import load_env_local
 from services import store
 
 load_env_local()
 store.ensure_storage()
+
+# Bump when routes change so start-local.ps1 does not reuse an outdated backend process.
+API_VERSION = 12
 
 app = FastAPI(title="AI Video Draft API")
 
@@ -29,6 +32,8 @@ app.include_router(music.router)
 app.include_router(export.router)
 app.include_router(system.router)
 app.include_router(settings.router)
+app.include_router(media.router)
+app.include_router(video_library.router)
 
 
 @app.get("/storage/{relative_path:path}", include_in_schema=False)
@@ -42,7 +47,7 @@ def read_storage_file(relative_path: str):
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "api_version": API_VERSION}
 
 
 WEB_DIST = Path(__file__).resolve().parents[2] / "apps" / "web" / "dist"

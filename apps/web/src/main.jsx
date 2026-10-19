@@ -4,6 +4,7 @@ import { Archive, Check, ChevronLeft, ChevronRight, Copy, Download, Eraser, Film
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import './styles.css';
+import { MediaLibrary, TemplatePicker } from './MediaWorkflow';
 
 const API = import.meta.env.VITE_API_URL ?? (import.meta.env.DEV ? 'http://127.0.0.1:8000' : '');
 const DEFAULT_PROMOTION_BOOK = '《国之脊梁》';
@@ -152,6 +153,12 @@ function splitScriptParagraphs(value) {
 }
 
 function projectStage(project) {
+  if (project?.workflow_type === 'video_library') {
+    const labels = {created: '等待配音', voice_ready: '配音已完成', draft_ready: '草稿已导出', video_generating: '处理中', video_ready: '处理中', video_rendering: '合成视频中', video_done: '视频已完成', video_failed: '处理失败'};
+    const done = project.has_export || ['draft_ready', 'video_done'].includes(project.status);
+    return { key: done ? 'done' : (['video_generating', 'video_rendering'].includes(project.status) ? 'active' : 'todo'), label: labels[project.status] || '等待配音' };
+  }
+
   const status = project?.status || 'created';
   const historyStep = Number(project?.history_workflow?.active_step || 0);
   const historyStatus = project?.history_workflow?.status || '';
@@ -297,6 +304,11 @@ function CoverTitleEditor({ imageUrl, line1, line2, positions, maskOpacity, onCh
 }
 
 function App() {
+  const [media, setMedia] = useState({ videos: [], templates: [] });
+  const [backgroundTemplateId, setBackgroundTemplateId] = useState('daodejing');
+  async function refreshMedia() { const data = await request('/api/media'); setMedia(data); }
+  useEffect(() => { refreshMedia().catch(error => setMessage(error.message)); }, []);
+
   const [tab, setTab] = useState('create');
   const [projects, setProjects] = useState([]);
   const [projectId, setProjectId] = useState('');
@@ -322,8 +334,10 @@ function App() {
   const [materialSourceStrategy, setMaterialSourceStrategy] = useState('ai_only');
   const [storyboardModelProvider, setStoryboardModelProvider] = useState('deepseek');
   const [imageGenerationProvider, setImageGenerationProvider] = useState('openai');
-  const [voiceType, setVoiceType] = useState(VOICE_OPTIONS[0].value);
+  const [voiceType, setVoiceType] = useState('S_6Sd6jOE42');
   const [speechRate, setSpeechRate] = useState(0);
+  const [audioSource, setAudioSource] = useState('tts');
+  const [audioFile, setAudioFile] = useState(null);
   const [voicePreviewUrl, setVoicePreviewUrl] = useState('');
   const [previewingVoice, setPreviewingVoice] = useState(false);
   const [voiceVolume, setVoiceVolume] = useState(100);
@@ -343,6 +357,13 @@ function App() {
   const [backgroundMusicId, setBackgroundMusicId] = useState('');
   const [backgroundMusicStart, setBackgroundMusicStart] = useState(0);
   const [backgroundMusicVolume, setBackgroundMusicVolume] = useState(20);
+  const [presets, setPresets] = useState([]);
+  const [selectedPresetId, setSelectedPresetId] = useState('');
+  const [presetName, setPresetName] = useState('');
+  const [coverPresetId, setCoverPresetId] = useState('');
+  const [coverPresetImageUrl, setCoverPresetImageUrl] = useState('');
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [creationStatus, setCreationStatus] = useState({ active: false, label: '', error: '', failedIndex: 0 });
   const [previewAsset, setPreviewAsset] = useState(null);
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [exportResult, setExportResult] = useState(null);
@@ -366,6 +387,11 @@ function App() {
   const playVoicePreviewAfterLoadRef = useRef(false);
   const playGeneratedVoiceAfterLoadRef = useRef(false);
   const hydratedProjectSettingsRef = useRef('');
+  const lastLoadedProjectIdRef = useRef('');
+  const lastCoverProjectIdRef = useRef('');
+  const creationInFlightRef = useRef(false);
+  const creationProjectIdRef = useRef('');
+  const creationDraftRef = useRef(null);
   const lastProjectStatusRef = useRef('');
   const rewrittenScriptDirtyRef = useRef(false);
   const paragraphSaveVersionRef = useRef(0);
@@ -430,20 +456,33 @@ function App() {
   }
 
   async function refreshAll(id = projectId) {
-    const [projectList, musicData, promotionBookData, projectData] = await Promise.all([
+    const [projectList, musicData, promotionBookData, projectData, presetData] = await Promise.all([
       request('/api/projects'),
       request('/api/music'),
       request('/api/projects/promotion-books'),
       id ? request(`/api/projects/${id}`) : Promise.resolve(null),
+      request('/api/video-library/presets'),
     ]);
     setProjects(projectList.projects);
     setMusicLibrary(musicData.music || []);
     setPromotionBooks(promotionBookData.books?.length ? promotionBookData.books : [DEFAULT_PROMOTION_BOOK]);
+    setPresets(presetData.presets || []);
     if (projectData) {
+      if (creationProjectIdRef.current && creationProjectIdRef.current !== id) {
+        setCreationStatus({ active: false, label: '', error: '', failedIndex: 0 });
+      }
       setProject(projectData.project);
       setShots(projectData.shots);
       setGeneratedAssets(projectData.generated_assets || []);
       setProjectId(id);
+      const isNewProject = lastLoadedProjectIdRef.current !== id;
+      lastLoadedProjectIdRef.current = id;
+      if (projectData.project.workflow_type === 'video_library') {
+        setTab('export');
+      } else if (isNewProject || ['create', 'settings', 'library', 'title', 'music', 'projects'].includes(tab)) {
+        // Opening a legacy project should land on its script instead of staying on the create page.
+        setTab('script');
+      }
       setHistoryBookTitle(formatPromotionBookTitle(projectData.project.promotion_book_title));
       if (hydratedProjectSettingsRef.current !== id) {
         hydratedProjectSettingsRef.current = id;
@@ -456,6 +495,7 @@ function App() {
       setGeneratedAssets([]);
       setProjectId('');
       hydratedProjectSettingsRef.current = '';
+      lastLoadedProjectIdRef.current = '';
     }
   }
 
@@ -463,6 +503,7 @@ function App() {
     if (!id) return;
     const data = await request(`/api/projects/${id}`);
     setProject(data.project);
+    setProjects(current => current.map(item => item.id === id ? { ...item, ...data.project, shot_count: data.shots.length } : item));
     setShots(data.shots);
     setGeneratedAssets(data.generated_assets || []);
   }
@@ -487,6 +528,7 @@ function App() {
       setAppSettings(data.settings || {});
       if (kind === 'project') {
         await refreshAll('');
+        await refreshMedia();
         setMessage('项目目录已切换');
       } else {
         setMessage('剪映草稿目录已保存');
@@ -522,12 +564,19 @@ function App() {
       setCoverImagePreviewUrl(objectUrl);
       return () => URL.revokeObjectURL(objectUrl);
     }
-    setCoverImagePreviewUrl(project?.cover_source_url ? `${API}${project.cover_source_url}` : '');
+    const projectCover = tab === 'create' ? '' : (project?.cover_source_url || '');
+    const fallback = coverPresetImageUrl || projectCover;
+    setCoverImagePreviewUrl(fallback ? `${API}${fallback}` : '');
     return undefined;
-  }, [coverImage, project?.cover_source_url]);
+  }, [coverImage, coverPresetImageUrl, project?.cover_source_url, tab]);
 
   useEffect(() => {
     if (!project) return;
+    if (lastCoverProjectIdRef.current !== (project.id || '')) {
+      lastCoverProjectIdRef.current = project.id || '';
+      setCoverPresetId('');
+      setCoverPresetImageUrl('');
+    }
     setProjectNameDraft(project.name || '');
     setTitleLine1(project.title_line1 || '');
     setTitleLine2(project.title_line2 || '');
@@ -542,6 +591,9 @@ function App() {
     setBackgroundMusicStart(Number(project.background_music_start_sec || 0));
     setBackgroundMusicVolume(Math.round(Number(project.background_music_volume ?? 0.2) * 100));
     setVoiceVolume(Math.round(Number(project.voice_volume ?? 1) * 100));
+    setAudioSource(project.audio_source === 'upload' ? 'upload' : 'tts');
+    if (project.voice_type) setVoiceType(project.voice_type);
+    if (project.speech_rate !== undefined && project.speech_rate !== null) setSpeechRate(Number(project.speech_rate));
     setHistoryBookTitle(formatPromotionBookTitle(project.promotion_book_title));
   }, [
     project?.id,
@@ -560,6 +612,9 @@ function App() {
     project?.background_music_start_sec,
     project?.background_music_volume,
     project?.voice_volume,
+    project?.audio_source,
+    project?.voice_type,
+    project?.speech_rate,
   ]);
 
   useEffect(() => {
@@ -640,20 +695,176 @@ function App() {
     lastProjectStatusRef.current = current;
   }, [project?.status, project?.generation_error, generationProgress.completed, generationProgress.total]);
 
+  async function generateVideoVoice(identifier, source, file) {
+    if (!identifier) return false;
+    if (source === 'upload') {
+      if (!file) { setMessage('请选择要上传的音频文件'); return false; }
+      const body = new FormData();
+      body.append('file', file);
+      const uploaded = await run('上传音频', () => request(`/api/projects/${identifier}/audio`, { method: 'POST', body }));
+      if (!uploaded) return false;
+    }
+    const voice = await run('生成配音', () => request(`/api/projects/${identifier}/generate-voice`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ voice_type: voiceType, speech_rate: speechRate, audio_source: source }),
+    }));
+    if (!voice) return false;
+    const subtitles = await run('生成字幕', () => request(`/api/projects/${identifier}/generate-subtitles`, { method: 'POST' }));
+    if (!subtitles) return false;
+    setVoiceAudioVersion(Date.now());
+    await refreshProject(identifier);
+    setMessage('配音与字幕已生成，可以继续调整音量');
+    return true;
+  }
+
+  async function applyCreationSettings(identifier, startIndex = 0) {
+    const draft = creationDraftRef.current || {
+      audioSource, audioFile, titleLine1, titleLine2,
+      backgroundMusicId, backgroundMusicStart, backgroundMusicVolume,
+      coverImage, coverPresetId, coverTitlePositions, coverMaskOpacity,
+      voiceType, speechRate, voiceVolume,
+    };
+    const steps = [];
+    if (draft.audioSource === 'upload') {
+      steps.push({
+        label: '上传音频',
+        run: async () => {
+          const body = new FormData();
+          body.append('file', draft.audioFile);
+          await request(`/api/projects/${identifier}/audio`, { method: 'POST', body });
+        },
+      });
+    }
+    steps.push({
+      label: '保存标题',
+      run: () => request(`/api/projects/${identifier}/script`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title_line1: draft.titleLine1.trim(), title_line2: draft.titleLine2.trim() }),
+      }),
+    });
+    if (draft.backgroundMusicId) {
+      steps.push({
+        label: '保存背景音乐',
+        run: () => request(`/api/projects/${identifier}/music-settings`, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            music_id: draft.backgroundMusicId,
+            start_sec: Number(draft.backgroundMusicStart) || 0,
+            volume: Math.max(0, Math.min(100, Number(draft.backgroundMusicVolume) || 0)) / 100,
+          }),
+        }),
+      });
+    }
+    if (draft.coverImage || draft.coverPresetId) {
+      steps.push({
+        label: '生成封面',
+        warningOnly: true,
+        run: async () => {
+          const body = new FormData();
+          if (draft.coverImage) body.append('file', draft.coverImage, draft.coverImage.name);
+          else body.append('preset_id', draft.coverPresetId);
+          body.append('title_positions', JSON.stringify(draft.coverTitlePositions));
+          body.append('mask_opacity', String(draft.coverMaskOpacity / 100));
+          await request(`/api/projects/${identifier}/generate-cover`, { method: 'POST', body });
+        },
+      });
+    }
+    steps.push({
+      label: '生成配音与字幕',
+      run: () => request(`/api/projects/${identifier}/generate-voice`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          voice_type: draft.voiceType, speech_rate: draft.speechRate, audio_source: draft.audioSource,
+        }),
+      }),
+    });
+    steps.push({
+      label: '保存配音音量',
+      run: () => request(`/api/projects/${identifier}/voice-settings`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ volume: Math.max(0, Math.min(300, Number(draft.voiceVolume) || 0)) / 100 }),
+      }),
+    });
+
+    const warnings = [];
+    for (let index = startIndex; index < steps.length; index += 1) {
+      const step = steps[index];
+      setCreationStatus({ active: true, label: `正在${step.label}…`, error: '', failedIndex: index });
+      try {
+        await step.run();
+      } catch (error) {
+        if (step.warningOnly) {
+          warnings.push(`${step.label}：${error.message}`);
+          continue;
+        }
+        setCreationStatus({ active: false, label: '', error: `${step.label}失败：${error.message}`, failedIndex: index });
+        await refreshAll(identifier);
+        setTab('export');
+        setSettingsOpen(true);
+        setMessage(`${step.label}失败：${error.message}`);
+        return false;
+      }
+    }
+    setCreationStatus({ active: false, label: '', error: '', failedIndex: 0 });
+    setVoiceAudioVersion(Date.now());
+    await refreshAll(identifier);
+    setTab('export');
+    setSettingsOpen(false);
+    setMessage(warnings.length ? `项目已创建，但有提示：${warnings.join('；')}` : '项目创建完成，可以导出剪映草稿');
+    return true;
+  }
+
   async function createProject(ev) {
     ev.preventDefault();
-    const form = new FormData(ev.currentTarget);
-    const payload = Object.fromEntries(form.entries());
-    payload.raw_script = rawScriptDraft;
-    const data = await run('创建项目', () => request('/api/projects', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }));
-    if (data?.project_id) {
-      setRawScriptDraft('');
-      await refreshAll(data.project_id);
-      setTab('script');
+    if (busy || creationInFlightRef.current) return;
+    if (!rawScriptDraft.trim()) { setMessage('请先输入文案'); return; }
+    if (!media.videos.length) { setMessage('请先到素材库上传视频'); return; }
+    if (!titleLine1.trim() || !titleLine2.trim()) { setMessage('请先填写两行标题'); return; }
+    if (audioSource === 'upload' && !audioFile) { setMessage('请选择要上传的音频文件'); return; }
+    creationDraftRef.current = {
+      audioSource, audioFile, titleLine1, titleLine2,
+      backgroundMusicId, backgroundMusicStart, backgroundMusicVolume,
+      coverImage, coverPresetId, coverTitlePositions, coverMaskOpacity,
+      voiceType, speechRate, voiceVolume,
+    };
+    creationInFlightRef.current = true;
+    creationProjectIdRef.current = '';
+    setBusy(true);
+    setCreationStatus({ active: true, label: '正在创建项目…', error: '', failedIndex: 0 });
+    try {
+      const data = await request('/api/projects', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ raw_script: rawScriptDraft.trim(), workflow_type: 'video_library',
+          background_template_id: backgroundTemplateId, voice_type: voiceType, speech_rate: speechRate, video_ratio: '9:16' }),
+      });
+      if (!data?.project_id) throw new Error('服务器未返回项目 ID');
+      creationProjectIdRef.current = data.project_id;
+      const created = await applyCreationSettings(data.project_id, 0);
+      if (created) {
+        creationDraftRef.current = null;
+        setRawScriptDraft('');
+        setAudioFile(null);
+        resetPerVideoDraft();
+      }
+    } catch (error) {
+      setCreationStatus({ active: false, label: '', error: `创建项目失败：${error.message}`, failedIndex: 0 });
+      setMessage(`创建项目失败：${error.message}`);
+    } finally {
+      creationInFlightRef.current = false;
+      setBusy(false);
+    }
+  }
+
+  async function retryCreation() {
+    const identifier = creationProjectIdRef.current;
+    if (!identifier || busy || creationInFlightRef.current) return;
+    creationInFlightRef.current = true;
+    setBusy(true);
+    try {
+      await applyCreationSettings(identifier, creationStatus.failedIndex || 0);
+    } finally {
+      creationInFlightRef.current = false;
+      setBusy(false);
     }
   }
 
@@ -1134,6 +1345,46 @@ function App() {
     }
   }
 
+  async function copyProjectScript() {
+    const text = project?.raw_script || '';
+    if (!text) {
+      setMessage('当前项目没有保存文案');
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      setMessage('项目文案已复制');
+    } catch {
+      setMessage('复制失败，请手动选择文案');
+    }
+  }
+
+  async function deleteProjects(ids) {
+    const unique = [...new Set(ids.filter(Boolean))];
+    if (!unique.length) return false;
+    if (!window.confirm(`确认删除选中的 ${unique.length} 个项目吗？项目文案、分镜、生成文件和导出包都会删除。`)) {
+      return false;
+    }
+    const result = await run('批量删除项目', () => request('/api/projects/bulk-delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project_ids: unique }),
+    }));
+    if (!result) return false;
+    if (unique.includes(projectId)) {
+      setTab('create');
+      await refreshAll('');
+    } else {
+      await refreshAll(projectId);
+    }
+    const deleted = result.deleted_ids?.length || 0;
+    const skipped = result.skipped?.length || 0;
+    setMessage(skipped
+      ? `已删除 ${deleted} 个项目，${skipped} 个未删除（正在处理或已不存在）`
+      : `已删除 ${deleted} 个项目`);
+    return true;
+  }
+
   async function regenerateShotImagePrompt(shotId) {
     setRecognizingShotIds((current) => new Set(current).add(shotId));
     setMessage('正在重新生成图片提示词，可继续处理其他分镜');
@@ -1269,16 +1520,27 @@ function App() {
     return true;
   }
 
-  async function previewVoice() {
+  async function previewVoice({ draft = false } = {}) {
     playVoicePreviewAfterLoadRef.current = true;
     setPreviewingVoice(true);
     setMessage('正在生成音色试听...');
+    if (draft && !rawScriptDraft.trim()) {
+      setPreviewingVoice(false);
+      playVoicePreviewAfterLoadRef.current = false;
+      setMessage('请先输入文案');
+      return;
+    }
     try {
-      const response = await fetch(`${API}/api/projects/${projectId}/voice-preview`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ voice_type: voiceType, speech_rate: speechRate }),
-      });
+      const response = await fetch(
+        draft ? `${API}/api/video-library/voice-preview` : `${API}/api/projects/${projectId}/voice-preview`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(draft
+            ? { script: rawScriptDraft, voice_type: voiceType, speech_rate: speechRate }
+            : { voice_type: voiceType, speech_rate: speechRate }),
+        },
+      );
       if (!response.ok) throw new Error(await response.text());
       const blob = await response.blob();
       const url = URL.createObjectURL(blob);
@@ -1296,8 +1558,8 @@ function App() {
   }
 
   async function generateCover(options = {}) {
-    if (!coverImage && !project?.cover_source_url) {
-      setMessage('请先上传一张人物图片');
+    if (!coverImage && !coverPresetId && !project?.cover_source_url) {
+      setMessage('请先上传一张人物图片或选择预设封面');
       return;
     }
     if (!titleLine1.trim() || !titleLine2.trim()) {
@@ -1310,6 +1572,7 @@ function App() {
     }
     const data = new FormData();
     if (coverImage) data.append('file', coverImage, coverImage.name);
+    else if (coverPresetId) data.append('preset_id', coverPresetId);
     data.append('title_positions', JSON.stringify(coverTitlePositions));
     data.append('mask_opacity', String(coverMaskOpacity / 100));
     const result = await run('生成视频封面', () => request(`/api/projects/${projectId}/generate-cover`, {
@@ -1317,6 +1580,8 @@ function App() {
       body: data,
     }));
     if (!result) return;
+    setCoverPresetId('');
+    setCoverPresetImageUrl('');
     await refreshAll(projectId);
     if (!options.silent) setMessage('9:16 视频封面生成完成');
     return true;
@@ -1394,6 +1659,7 @@ function App() {
   }
 
   async function saveMusicSettings(overrides = {}) {
+    if (!projectId) return;
     const musicId = overrides.musicId ?? backgroundMusicId;
     const startSec = overrides.startSec ?? backgroundMusicStart;
     const volumePercent = overrides.volumePercent ?? backgroundMusicVolume;
@@ -1412,7 +1678,7 @@ function App() {
     if (result) await refreshProject(projectId);
   }
 
-  async function uploadBackgroundMusic(file) {
+  async function uploadBackgroundMusic(file, { persist = Boolean(projectId) } = {}) {
     if (!file) return;
     const data = new FormData();
     data.append('file', file, file.name);
@@ -1425,11 +1691,13 @@ function App() {
     setMusicLibrary(musicData.music || []);
     setBackgroundMusicId(result.music.id);
     setBackgroundMusicStart(0);
-    await saveMusicSettings({
-      musicId: result.music.id,
-      startSec: 0,
-      volumePercent: backgroundMusicVolume,
-    });
+    if (persist) {
+      await saveMusicSettings({
+        musicId: result.music.id,
+        startSec: 0,
+        volumePercent: backgroundMusicVolume,
+      });
+    }
   }
 
   async function deleteBackgroundMusic() {
@@ -1446,6 +1714,106 @@ function App() {
     setBackgroundMusicId('');
     setBackgroundMusicStart(0);
     await refreshProject(projectId);
+    await refreshPresets();
+  }
+
+  async function refreshPresets() {
+    const data = await request('/api/video-library/presets');
+    setPresets(data.presets || []);
+  }
+
+  function applyPreset(preset) {
+    if (!preset) return;
+    setSelectedPresetId(preset.id || '');
+    setPresetName(preset.name || '');
+    if (preset.voice_type) setVoiceType(preset.voice_type);
+    setSpeechRate(Number(preset.speech_rate || 0));
+    setVoiceVolume(Math.round(Number(preset.voice_volume ?? 1) * 100));
+    if (preset.background_template_id) setBackgroundTemplateId(preset.background_template_id);
+    const music = musicLibrary.find((item) => item.id === preset.background_music_id);
+    setBackgroundMusicId(music ? music.id : '');
+    setBackgroundMusicStart(Number(preset.background_music_start_sec || 0));
+    setBackgroundMusicVolume(Math.round(Number(preset.background_music_volume ?? 0.2) * 100));
+    setCoverTitlePositions(normalizeCoverTitlePositions(preset.cover_title_positions));
+    setCoverMaskOpacity(Math.round(Number(preset.cover_mask_opacity ?? 0.35) * 100));
+    setCoverImage(null);
+    setCoverPresetId(preset.cover_available ? preset.id : '');
+    setCoverPresetImageUrl(preset.cover_available ? preset.cover_source_url : '');
+    setMessage(`已应用预设「${preset.name}」`);
+  }
+
+  async function savePreset({ overwrite = false } = {}) {
+    const name = presetName.trim();
+    if (!name) { setMessage('请填写预设名称'); return; }
+    const data = new FormData();
+    data.append('name', name);
+    if (overwrite && selectedPresetId) data.append('preset_id', selectedPresetId);
+    data.append('voice_type', voiceType);
+    data.append('speech_rate', String(speechRate));
+    data.append('voice_volume', String(voiceVolume / 100));
+    data.append('background_template_id', backgroundTemplateId);
+    data.append('background_music_id', backgroundMusicId || '');
+    data.append('background_music_start_sec', String(backgroundMusicStart));
+    data.append('background_music_volume', String(backgroundMusicVolume / 100));
+    data.append('cover_title_positions', JSON.stringify(coverTitlePositions));
+    data.append('cover_mask_opacity', String(coverMaskOpacity / 100));
+    if (coverImage) data.append('file', coverImage, coverImage.name);
+    else if (coverPresetId) data.append('cover_source_preset_id', coverPresetId);
+    const result = await run('保存预设', () => request('/api/video-library/presets', {
+      method: 'POST',
+      body: data,
+    }));
+    if (!result?.preset) return;
+    const saved = result.preset;
+    setPresets((current) => [saved, ...current.filter((item) => item.id !== saved.id)]);
+    setSelectedPresetId(saved.id);
+    setPresetName(saved.name);
+    setCoverImage(null);
+    setCoverPresetId(saved.cover_available ? saved.id : '');
+    setCoverPresetImageUrl(saved.cover_available ? saved.cover_source_url : '');
+    setMessage(`预设「${saved.name}」已保存`);
+  }
+
+  async function deletePreset() {
+    if (!selectedPresetId) return;
+    const preset = presets.find((item) => item.id === selectedPresetId);
+    if (!window.confirm(`删除预设「${preset?.name || ''}」？已创建的项目不受影响。`)) return;
+    const result = await run('删除预设', () => request(
+      `/api/video-library/presets/${selectedPresetId}`,
+      { method: 'DELETE' },
+    ));
+    if (!result) return;
+    setPresets((current) => current.filter((item) => item.id !== selectedPresetId));
+    setSelectedPresetId('');
+    setPresetName('');
+    setCoverPresetId('');
+    setCoverPresetImageUrl('');
+    setMessage('预设已删除');
+  }
+
+  async function previewTitleCandidates() {
+    const script = rawScriptDraft.trim();
+    if (!script) { setMessage('请先输入文案'); return; }
+    const result = await run('生成标题候选', () => request('/api/video-library/title-preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script }),
+    }));
+    if (!result) return;
+    setTitleCandidates(result.candidates || []);
+    setMessage(`已生成 ${result.candidates?.length || 0} 组标题候选，点击选择后可继续编辑`);
+  }
+
+  function resetPerVideoDraft() {
+    creationDraftRef.current = null;
+    setTitleLine1('');
+    setTitleLine2('');
+    setTitleCandidates([]);
+    setTitleConfirmed(false);
+    setCoverImage(null);
+    setCoverPresetId('');
+    setCoverPresetImageUrl('');
+    setCreationStatus({ active: false, label: '', error: '', failedIndex: 0 });
   }
 
   function updateMusicPreviewStart(value) {
@@ -1506,6 +1874,7 @@ function App() {
     }));
     if (!result) return false;
     setTitleConfirmed(true);
+    if (projectId) await refreshProject(projectId);
     if (!options.silent) setMessage('标题已确认，可以生成封面');
     return true;
   }
@@ -1522,7 +1891,9 @@ function App() {
   }
 
   async function exportPackage() {
-    if (!project?.audio_url || !project?.voice_timeline_url) {
+    if (project?.workflow_type === 'video_library') {
+      if (!project?.audio_url) { setMessage('请先在“配音”步骤生成配音'); return; }
+    } else if (!project?.audio_url || !project?.voice_timeline_url) {
       const generated = await generateVoiceAndSubtitles();
       if (!generated) return;
     }
@@ -1532,6 +1903,7 @@ function App() {
     ));
     if (!data) return;
     setExportResult(data);
+    await refreshProject(projectId);
     setMessage(`剪映草稿导出完成：${data.verification?.jianying?.draft_name || ''}`);
   }
 
@@ -1551,8 +1923,13 @@ function App() {
     if (data?.path) setMessage(`已打开剪映草稿文件夹：${data.path}`);
   }
 
-  const workflowBusy = busy || ['generating_shots', 'generating_images'].includes(project?.status);
+  const workflowBusy = busy || ['video_generating', 'video_rendering', 'generating_shots', 'generating_images'].includes(project?.status);
   const workflowMessage = (() => {
+    if (project?.status === 'video_generating') return '正在生成配音并匹配视频素材';
+    if (project?.status === 'video_rendering') {
+      const progress = project.render_progress;
+      return progress ? `正在合成竖屏视频（${progress.done}/${progress.total} 段）` : '正在合成竖屏视频';
+    }
     if (project?.status === 'shot_generation_failed') {
       return project.generation_error ? `处理失败：${project.generation_error}` : '分镜生成失败';
     }
@@ -1570,6 +1947,364 @@ function App() {
     });
   }
 
+  function renderPresetPanel() {
+    return (
+      <div className="preset-panel">
+        <label>
+          预设
+          <select
+            value={selectedPresetId}
+            onChange={(event) => {
+              const preset = presets.find((item) => item.id === event.target.value);
+              if (preset) applyPreset(preset);
+              else {
+                setSelectedPresetId('');
+                setPresetName('');
+                setCoverPresetId('');
+                setCoverPresetImageUrl('');
+              }
+            }}
+          >
+            <option value="">不使用预设</option>
+            {presets.map((preset) => (
+              <option key={preset.id} value={preset.id}>{preset.name}</option>
+            ))}
+          </select>
+        </label>
+        <label>
+          预设名称
+          <input value={presetName} onChange={(event) => setPresetName(event.target.value)} placeholder="例如：沉稳男声·墨绿" maxLength={60} />
+        </label>
+        <div className="preset-actions">
+          <button type="button" disabled={busy || !presetName.trim()} onClick={() => savePreset()}>保存为新预设</button>
+          <button type="button" disabled={busy || !selectedPresetId} onClick={() => savePreset({ overwrite: true })}>覆盖保存</button>
+          <button type="button" className="danger" disabled={busy || !selectedPresetId} onClick={deletePreset}>删除预设</button>
+        </div>
+        <small className="preset-hint">预设保存配音、模板、音乐和封面；标题文字不保存。</small>
+      </div>
+    );
+  }
+
+  function renderTitleSettings(mode) {
+    const isCreate = mode === 'create';
+    return (
+      <div className="title-section">
+        <h3>{isCreate ? '两行标题' : '标题'}</h3>
+        <div className="title-inputs">
+          <label>
+            标题第一行
+            <input
+              value={titleLine1}
+              onChange={(event) => { setTitleLine1(event.target.value); setTitleConfirmed(false); }}
+              placeholder="标题第一行，完整表达"
+            />
+          </label>
+          <label>
+            标题第二行
+            <input
+              value={titleLine2}
+              onChange={(event) => { setTitleLine2(event.target.value); setTitleConfirmed(false); }}
+              placeholder="标题第二行，完整表达"
+            />
+          </label>
+        </div>
+        {titleCandidates.length > 0 && (
+          <div className="title-candidates">
+            <div className="title-candidates-heading">
+              <strong>AI 标题候选</strong>
+              <small>系统不评分，点击选择后可继续编辑</small>
+            </div>
+            <div className="title-candidate-grid">
+              {titleCandidates.map((candidate, index) => {
+                const selected = titleLine1 === candidate.line1 && titleLine2 === candidate.line2;
+                return (
+                  <button
+                    type="button"
+                    className={selected ? 'title-candidate selected' : 'title-candidate'}
+                    key={`${candidate.line1}-${candidate.line2}-${index}`}
+                    onClick={() => {
+                      setTitleLine1(candidate.line1 || '');
+                      setTitleLine2(candidate.line2 || '');
+                      setTitleConfirmed(false);
+                      setMessage(`已选择候选 ${index + 1}，可以编辑后确认`);
+                    }}
+                  >
+                    <span className="title-candidate-index">{index + 1}</span>
+                    <span className="title-candidate-copy">
+                      <b>{candidate.line1}</b>
+                      <b>{candidate.line2}</b>
+                    </span>
+                    {candidate.style && <small>{candidate.style}</small>}
+                    {candidate.evidence_quote && (
+                      <small className="title-candidate-evidence">依据：{candidate.evidence_quote}</small>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+        <div className="actions">
+          <button className="primary" disabled={busy} onClick={isCreate ? previewTitleCandidates : generateTitle}>
+            <Wand2 size={18} /> {titleLine1 ? '重新生成标题' : 'AI 生成爆款标题'}
+          </button>
+          {isCreate ? (
+            <small>创建项目时会自动保存这两行标题。</small>
+          ) : (
+            <button disabled={busy || !titleLine1.trim() || !titleLine2.trim()} onClick={confirmTitle}>
+              <Save size={18} /> {titleConfirmed ? '标题已确认 ✓' : '确认标题'}
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  function renderVoiceSettings(mode) {
+    const isCreate = mode === 'create';
+    return (
+      <div className="voice-volume-section">
+        <h3>{isCreate ? '配音' : '配音与音量'}</h3>
+        <div className="audio-source-choice" role="group" aria-label="配音来源">
+          <button type="button" aria-pressed={audioSource === 'tts'} className={audioSource === 'tts' ? 'selected' : ''} onClick={() => setAudioSource('tts')}>AI 生成配音</button>
+          <button type="button" aria-pressed={audioSource === 'upload'} className={audioSource === 'upload' ? 'selected' : ''} onClick={() => setAudioSource('upload')}>上传音频</button>
+        </div>
+        {audioSource === 'tts' ? (
+          <div className="video-create-options">
+            <VoiceSelect value={voiceType} onChange={setVoiceType} />
+            <SpeechRateSelect value={speechRate} onChange={setSpeechRate} />
+            <button type="button" onClick={() => previewVoice({ draft: isCreate })} disabled={previewingVoice}>
+              <Mic size={18} /> {previewingVoice ? '试听生成中…' : '试听音色'}
+            </button>
+            {voicePreviewUrl && <audio ref={voicePreviewRef} className="voice-preview-player" controls src={voicePreviewUrl} />}
+          </div>
+        ) : (
+          <div className="video-create-options">
+            <label className="media-upload audio-upload">{audioFile ? audioFile.name : '选择音频文件'}<input aria-label="上传配音音频" type="file" accept=".mp3,.wav,.m4a,.aac,.ogg,.flac,.wma,audio/*" onChange={(event) => { setAudioFile(event.target.files[0] || null); event.target.value = ''; }} /></label>
+            <small>支持 MP3、WAV、M4A、AAC、OGG、FLAC、WMA；字幕按文案长度均分配音时长生成。</small>
+          </div>
+        )}
+        {!isCreate && (
+          <div className="actions">
+            <button
+              className="primary"
+              disabled={busy || (audioSource === 'upload' && !audioFile)}
+              onClick={async () => {
+                await generateVideoVoice(projectId, audioSource, audioFile);
+                setAudioFile(null);
+              }}
+            >
+              <Mic size={18} /> {project?.audio_url ? '重新生成配音与字幕' : '生成配音与字幕'}
+            </button>
+            {project?.subtitle_url && <a className="media-upload" href={`${API}${project.subtitle_url}`} download>下载字幕</a>}
+          </div>
+        )}
+        <div className="voice-volume-inline">
+          <label>
+            配音音量：{voiceVolume}%
+            <input
+              type="range"
+              min="0"
+              max={MAX_VOICE_VOLUME_PERCENT}
+              step="1"
+              value={voiceVolume}
+              onChange={(event) => updateVoiceVolume(event.target.value)}
+            />
+          </label>
+          {!isCreate && (
+            <button type="button" className="primary" disabled={busy} onClick={saveVoiceVolume}>
+              <Save size={18} /> 保存配音音量
+            </button>
+          )}
+          <small>0%–300%，导出剪映草稿时使用相同的音量增益。</small>
+        </div>
+      </div>
+    );
+  }
+
+  function renderMusicSettings(mode) {
+    const isCreate = mode === 'create';
+    const selectedMusic = musicLibrary.find((music) => music.id === backgroundMusicId);
+    const maxStart = selectedMusic ? Math.max(0, Number(selectedMusic.duration_sec || 0) - 0.1) : 0;
+    return (
+      <div className="music-section">
+        <h3>背景音乐</h3>
+        <input
+          ref={musicInputRef}
+          className="hidden-input"
+          type="file"
+          accept=".mp3,.wav,.m4a,.aac,.ogg,.flac,audio/*"
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            if (file) uploadBackgroundMusic(file, { persist: !isCreate });
+            event.target.value = '';
+          }}
+        />
+        <label>
+          音乐库
+          <div className="music-library-row">
+            <select
+              value={backgroundMusicId}
+              onChange={(event) => {
+                setBackgroundMusicId(event.target.value);
+                setBackgroundMusicStart(0);
+              }}
+            >
+              <option value="">不添加背景音乐</option>
+              {musicLibrary.map((music) => (
+                <option key={music.id} value={music.id}>
+                  {music.name} · {Math.round(Number(music.duration_sec || 0))}秒
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              className="danger icon-button"
+              title="删除当前选中的音乐"
+              aria-label="删除当前选中的音乐"
+              disabled={!backgroundMusicId || busy}
+              onClick={deleteBackgroundMusic}
+            >
+              <Trash2 size={18} />
+            </button>
+          </div>
+        </label>
+        <button type="button" onClick={() => musicInputRef.current?.click()}>
+          <Music size={18} /> 上传音乐并加入音乐库
+        </button>
+        {selectedMusic && (
+          <>
+            <audio
+              ref={musicPreviewRef}
+              controls
+              src={`${API}${selectedMusic.file_url}`}
+              onLoadedMetadata={(event) => {
+                try {
+                  event.currentTarget.currentTime = Math.min(backgroundMusicStart, event.currentTarget.duration || 0);
+                  event.currentTarget.volume = backgroundMusicVolume / 100;
+                } catch {
+                  // Browsers may reject seeking before metadata is ready.
+                }
+              }}
+              onPlay={(event) => {
+                event.currentTarget.volume = backgroundMusicVolume / 100;
+                if (event.currentTarget.currentTime < backgroundMusicStart) {
+                  event.currentTarget.currentTime = backgroundMusicStart;
+                }
+              }}
+            />
+            <button type="button" onClick={playMusicPreview}>
+              <Music size={18} /> 从设置位置试听
+            </button>
+            <label>
+              音乐起始位置：{Number(backgroundMusicStart).toFixed(1)} 秒
+              <input
+                type="range"
+                min="0"
+                max={maxStart}
+                step="0.1"
+                value={Math.min(backgroundMusicStart, maxStart)}
+                onChange={(event) => updateMusicPreviewStart(event.target.value)}
+              />
+            </label>
+            <label>
+              音乐音量：{backgroundMusicVolume}%
+              <input
+                type="range"
+                min="0"
+                max="100"
+                step="1"
+                value={backgroundMusicVolume}
+                onChange={(event) => updateMusicPreviewVolume(event.target.value)}
+              />
+            </label>
+          </>
+        )}
+        <small>音乐不足视频时长时会自动循环，相邻循环片段使用 1 秒淡入淡出衔接。</small>
+        {!isCreate && (
+          <button type="button" className="primary" disabled={busy} onClick={() => saveMusicSettings()}>
+            <Save size={18} /> 保存配乐设置
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  function renderCoverWorkspace(mode) {
+    const isCreate = mode === 'create';
+    return (
+      <div className={coverImagePreviewUrl ? 'cover-workspace' : 'cover-workspace single'}>
+        <div className="cover-section">
+          <h3>封面</h3>
+          <p className="cover-layout-note">封面保持完整 9:16 竖屏画面，标题显示在图片上层。上传后可在右侧分别拖动两行文字，拖动右下角圆点调整字号。</p>
+          <input
+            ref={coverInputRef}
+            className="hidden-input"
+            type="file"
+            accept="image/*"
+            onChange={(event) => {
+              setCoverImage(event.target.files?.[0] || null);
+              setCoverPresetId('');
+              setCoverPresetImageUrl('');
+            }}
+          />
+          <button type="button" onClick={() => {
+            if (!coverInputRef.current) return;
+            coverInputRef.current.value = '';
+            coverInputRef.current.click();
+          }}>
+            <ImagePlus size={18} /> {coverImage || coverPresetId ? '更换封面图片' : '上传封面图片'}
+          </button>
+          {coverImage && <small className="cover-file-name">{coverImage.name}</small>}
+          {!coverImage && coverPresetId && <small>当前使用预设封面</small>}
+          <label className="cover-mask-control">
+            遮罩不透明度：{coverMaskOpacity}%
+            <input
+              type="range"
+              min="0"
+              max="80"
+              step="1"
+              value={coverMaskOpacity}
+              onChange={(event) => setCoverMaskOpacity(Number(event.target.value))}
+            />
+            <small>数值越高，背景越暗，标题越醒目。</small>
+          </label>
+          {isCreate ? (
+            <small>创建项目时会自动生成并保存封面。</small>
+          ) : (
+            <div className="actions">
+              <button
+                className="primary"
+                disabled={busy || !titleLine1.trim() || !titleLine2.trim() || (!coverImage && !coverPresetId && !project?.cover_source_url)}
+                onClick={() => generateCover()}
+              >
+                <ImagePlus size={18} /> {project?.cover_url ? '重新合成封面' : '生成 9:16 封面'}
+              </button>
+            </div>
+          )}
+        </div>
+        {coverImagePreviewUrl && (
+          <div className="cover-preview">
+            <CoverTitleEditor
+              imageUrl={coverImagePreviewUrl}
+              line1={titleLine1}
+              line2={titleLine2}
+              positions={coverTitlePositions}
+              maskOpacity={coverMaskOpacity}
+              onChange={updateCoverTitlePosition}
+            />
+            <small className="cover-editor-hint">拖动标题框调整位置，拖动右下角圆点调整字号</small>
+            {!isCreate && project?.cover_url && (
+              <button type="button" className="cover-download-button" disabled={busy} onClick={downloadCover}>
+                <Download size={18} /> 应用调整并下载封面
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div className={sidebarCollapsed ? 'app sidebar-collapsed' : 'app'}>
       <aside className={sidebarCollapsed ? 'sidebar collapsed' : 'sidebar'}>
@@ -1585,12 +2320,27 @@ function App() {
         </button>
         <div className="brand"><Film size={22} /><span className="brand-label">草稿生成器</span></div>
         <nav>
-          <button title="项目" className={tab === 'create' ? 'active' : ''} onClick={() => setTab('create')}><Scissors size={18} /><span>项目</span></button>
-          <button title="文案" className={tab === 'script' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('script')}><Wand2 size={18} /><span>文案</span></button>
-          <button title="分镜" className={tab === 'storyboard' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('storyboard')}><Archive size={18} /><span>分镜</span></button>
-          <button title="配音" className={tab === 'match' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('match')}><Mic size={18} /><span>配音</span></button>
-          <button title="标题" className={tab === 'cover' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('cover')}><Music size={18} /><span>标题</span></button>
-          <button title="导出" className={tab === 'export' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('export')}><Download size={18} /><span>导出</span></button>
+          <button
+            title="项目"
+            className={tab === 'create' ? 'active' : ''}
+            onClick={() => {
+              if (tab === 'export' && project?.workflow_type === 'video_library') resetPerVideoDraft();
+              setTab('create');
+            }}
+          ><Scissors size={18} /><span>项目</span></button>
+          <button title="项目工作台" className={tab === 'projects' ? 'active' : ''} onClick={() => setTab('projects')}><Archive size={18} /><span>项目工作台</span></button>
+          <button title="素材库" className={tab === 'library' ? 'active' : ''} onClick={() => { setTab('library'); refreshMedia().catch(error => setMessage(error.message)); }}><Film size={18} /><span>素材库</span></button>
+          {project && project.workflow_type !== 'video_library' && <button title="文案" className={tab === 'script' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('script')}><Wand2 size={18} /><span>文案</span></button>}
+          {project?.workflow_type === 'video_library' ? (
+            <button title="导出" className={tab === 'export' ? 'active' : ''} onClick={() => setTab('export')}><Download size={18} /><span>导出</span></button>
+          ) : project ? (
+            <>
+              <button title="分镜" className={tab === 'storyboard' ? 'active' : ''} onClick={() => setTab('storyboard')}><Archive size={18} /><span>分镜</span></button>
+              <button title="配音" className={tab === 'match' ? 'active' : ''} onClick={() => setTab('match')}><Mic size={18} /><span>配音</span></button>
+              <button title="标题" className={tab === 'cover' ? 'active' : ''} onClick={() => setTab('cover')}><Music size={18} /><span>标题</span></button>
+              <button title="导出" className={tab === 'export' ? 'active' : ''} onClick={() => setTab('export')}><Download size={18} /><span>导出</span></button>
+            </>
+          ) : null}
           <button title="设置" className={tab === 'settings' ? 'active' : ''} onClick={() => setTab('settings')}><Settings size={18} /><span>设置</span></button>
         </nav>
         <div className="project-picker">
@@ -1603,19 +2353,20 @@ function App() {
               setProjectMenuOpen(false);
               refreshAll(id);
             }}
+            disabled={busy}
           />
-          <button className="danger icon-only" disabled={!projectId} title="删除项目" onClick={deleteProject}><Trash2 size={18} /></button>
+          <button className="danger icon-only" disabled={!projectId || busy} title="删除项目" onClick={deleteProject}><Trash2 size={18} /></button>
         </div>
       </aside>
 
       <main>
         <header className="topbar">
           <div>
-            <h1>{tab === 'settings' ? '本地设置' : (project?.name || 'AI 短视频草稿工作台')}</h1>
-            <p>{tab === 'settings' ? '项目与剪映草稿保存位置' : '使用 AI 图片提示词和 AI 出图完成分镜画面。'}</p>
+            <h1>{tab === 'settings' ? '本地设置' : tab === 'create' ? '新建视频' : tab === 'projects' ? '项目工作台' : (project?.name || 'AI 短视频草稿工作台')}</h1>
+            <p>{tab === 'settings' ? '项目与剪映草稿保存位置' : '输入文案 · 配音 · 标题 · 音乐 · 封面 · 导出剪映草稿'}</p>
           </div>
           <div className="top-actions">
-            {project && (
+            {project && tab !== 'create' && tab !== 'projects' && (
               <div className="project-name-editor">
                 <input
                   value={projectNameDraft}
@@ -1625,7 +2376,7 @@ function App() {
                     if (event.key === 'Escape') setProjectNameDraft(project.name || '');
                   }}
                   aria-label="项目名称"
-                  maxLength="80"
+                  maxLength={80}
                 />
                 <button
                   type="button"
@@ -1642,6 +2393,116 @@ function App() {
           </div>
         </header>
 
+        {tab === 'library' && <MediaLibrary media={media} reload={refreshMedia} onError={setMessage} />}
+        {tab === 'projects' && (
+          <section className="band">
+            <ProjectManager
+              projects={projects}
+              activeProjectId={projectId}
+              search={projectSearch}
+              filter={projectFilter}
+              onSearch={setProjectSearch}
+              onFilter={setProjectFilter}
+              onOpen={(id) => refreshAll(id)}
+              onArchive={setProjectArchived}
+              onDelete={deleteProjectItem}
+              onDeleteMany={deleteProjects}
+              busy={busy}
+            />
+          </section>
+        )}
+        {tab === 'export' && project?.workflow_type === 'video_library' && (
+          <section className="band result">
+            <h2>导出剪映草稿</h2>
+            <p>草稿包含背景模板、随机匹配的视频素材、配音、每行最多 9 字的字幕、两行标题、背景音乐和封面。</p>
+            {creationStatus.error && (
+              <div className="video-error" role="alert">
+                <strong>{creationStatus.error}</strong>
+                <div className="video-error-actions">
+                  {creationProjectIdRef.current && (
+                    <button type="button" disabled={busy} onClick={retryCreation}>重试未完成步骤</button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setCreationStatus({ active: false, label: '', error: '', failedIndex: 0 })}
+                  >
+                    关闭提示
+                  </button>
+                </div>
+              </div>
+            )}
+            <div className="video-summary">
+              <span>配音时长 <b>{Number(project.audio_duration_sec || 0).toFixed(1)} 秒</b></span>
+              <span>标题 <b>{project.title_line1 ? `${project.title_line1} / ${project.title_line2 || '—'}` : '未填写'}</b></span>
+              <span>背景音乐 <b>{project.background_music_name || '未选择'}</b></span>
+              <span>封面 <b>{project.cover_url ? '已生成' : '未生成'}</b></span>
+            </div>
+            {project.audio_url && (
+              <div className="export-voice-preview">
+                <audio
+                  key={`${project.audio_url}-${voiceAudioVersion}`}
+                  ref={mainVoicePreviewRef}
+                  controls
+                  crossOrigin="anonymous"
+                  preload="metadata"
+                  src={`${API}${project.audio_url}?v=${voiceAudioVersion || encodeURIComponent(project.updated_at || '')}`}
+                  onLoadedMetadata={(event) => { event.currentTarget.volume = Math.min(1, voiceVolume / 100); }}
+                  onPlay={(event) => activateMainVoicePreview(event.currentTarget)}
+                />
+                <span>配音音量 {voiceVolume}%</span>
+              </div>
+            )}
+            <section className="vlib-script-card">
+              <div className="vlib-script-heading">
+                <div>
+                  <h3>项目文案</h3>
+                  <small>{scriptCharacterCount(project.raw_script)} 字 · 创建于 {formatProjectTime(project.created_at)}</small>
+                </div>
+                <button type="button" onClick={copyProjectScript} disabled={!project.raw_script}>复制文案</button>
+              </div>
+              <pre className="vlib-script-text">{project.raw_script || '（没有保存文案）'}</pre>
+              <div className="vlib-title-preview">
+                <div><small>标题第一行</small><b>{project.title_line1 || '未填写'}</b></div>
+                <div><small>标题第二行</small><b>{project.title_line2 || '未填写'}</b></div>
+              </div>
+            </section>
+            <details
+              className="vlib-export-settings"
+              open={settingsOpen}
+              onToggle={(event) => setSettingsOpen(event.currentTarget.open)}
+            >
+              <summary>修改设置</summary>
+              <div className="vlib-settings-grid">
+                {renderVoiceSettings('project')}
+                {renderTitleSettings('project')}
+                {renderMusicSettings('project')}
+                {renderCoverWorkspace('project')}
+              </div>
+            </details>
+            <small className="vlib-settings-hint">修改配音音量、标题、音乐或封面后，请先点击对应的保存/生成按钮，再导出。</small>
+            <div className="export-actions">
+              <button type="button" onClick={openExportFolder}><FolderOpen size={18} /> 打开导出文件夹</button>
+              <button className="primary" onClick={exportPackage} disabled={busy || !project.audio_url}><Archive size={18} /> 导出剪映草稿</button>
+            </div>
+            {exportResult && (
+              <div className="export-result-card">
+                <div>
+                  <strong>剪映草稿导出完成</strong>
+                  <small>保存位置：{exportResult.export_folder}</small>
+                  {exportResult.verification?.jianying?.draft_path && (
+                    <small>剪映草稿：{exportResult.verification.jianying.draft_path}</small>
+                  )}
+                </div>
+                <div className="export-result-actions">
+                  {exportResult.verification?.jianying && (
+                    <button onClick={openDraftFolder}><FolderOpen size={18} /> 打开剪映草稿</button>
+                  )}
+                  <button className="primary" onClick={openExportFolder}><FolderOpen size={18} /> 打开导出文件夹</button>
+                </div>
+              </div>
+            )}
+          </section>
+        )}
         {tab === 'settings' && (
           <section className="band settings-workspace">
             <div className="settings-heading">
@@ -1685,53 +2546,55 @@ function App() {
 
         {tab === 'create' && (
           <section className="band project-workspace">
-            <form onSubmit={createProject} className="create-project-layout">
-              <div className="panel create-options-panel">
-                <h2>创建历史向视频</h2>
-                <label>项目名称<input name="name" placeholder="可留空，系统自动取标题" /></label>
-                <div className="history-create-guide">
-                  <strong>三步历史创作流程</strong>
-                  <div><span>1</span><p><b>策略分析</b>提炼爆款逻辑、切入视角和开场方案</p></div>
-                  <div><span>2</span><p><b>正文创作</b>按确认后的策略生成历史口播正文</p></div>
-                  <div><span>3</span><p><b>终审定稿</b>校验史实、原创度和口语流畅度</p></div>
-                  <small>每一步都可以与 AI 聊天修改，确认后才会进入下一步。</small>
-                </div>
-              </div>
-
+            <form
+              onSubmit={createProject}
+              className="video-create-form"
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && event.target.tagName !== 'TEXTAREA') event.preventDefault();
+              }}
+            >
               <div className="panel create-script-panel">
-                <div className="script-title script-panel-heading">
-                  <h2>历史参考文案</h2>
-                  <span className="script-character-count">{scriptCharacterCount(rawScriptDraft)} 字</span>
+                <div className="create-heading">
+                  <div>
+                    <h2>新建视频</h2>
+                    <p>输入文案，提前选好配音、标题、背景音乐和封面；创建后直接导出剪映草稿。</p>
+                  </div>
+                  <span className="create-badge">9:16 · 1080 × 1920</span>
                 </div>
-                <textarea
-                  className="create-script-textarea"
-                  name="raw_script"
-                  required
-                  value={rawScriptDraft}
-                  onChange={(event) => setRawScriptDraft(event.target.value)}
-                  placeholder="粘贴需要重构的历史人物、历史事件或纪实解说参考文案"
-                  aria-label="历史参考文案"
-                />
+                <div className={`create-fields ${creationStatus.active ? 'busy' : ''}`}>
+                  {renderPresetPanel()}
+                  <div className="create-flow">
+                    <section className="create-card">{renderTitleSettings('create')}</section>
+                    <section className="create-card">
+                      <div className="create-card-head">
+                        <h3>视频文案</h3>
+                        <span className="script-character-count">{scriptCharacterCount(rawScriptDraft)} 字</span>
+                      </div>
+                      <textarea className="create-script-textarea" required value={rawScriptDraft} onChange={event => setRawScriptDraft(event.target.value)} placeholder="输入或粘贴视频文案，然后在下方配置配音、音乐和封面" aria-label="视频文案" />
+                      <TemplatePicker templates={media.templates} value={backgroundTemplateId} onChange={setBackgroundTemplateId} reload={refreshMedia} onError={setMessage} />
+                    </section>
+                    <section className="create-card">{renderVoiceSettings('create')}</section>
+                    <section className="create-card">{renderMusicSettings('create')}</section>
+                    <section className="create-card">{renderCoverWorkspace('create')}</section>
+                  </div>
+                </div>
+                {creationStatus.active && <p className="video-progress" role="status">{creationStatus.label}</p>}
+                {creationStatus.error && <p className="video-error" role="alert">{creationStatus.error}</p>}
+                {!media.videos.length && <p>素材库还没有视频。<button type="button" onClick={() => setTab('library')}>上传视频素材</button></p>}
                 <div className="script-create-actions">
-                  <button className="primary" disabled={!rawScriptDraft.trim()}><Save size={18} /> 创建并进入三步创作</button>
+                  <button
+                    className="primary"
+                    disabled={busy || !rawScriptDraft.trim() || !media.videos.length || !media.templates.length || !titleLine1.trim() || !titleLine2.trim() || (audioSource === 'upload' && !audioFile)}
+                  >
+                    <Film size={18} /> {creationStatus.active ? creationStatus.label : '生成'}
+                  </button>
                 </div>
               </div>
             </form>
-            <ProjectManager
-              projects={projects}
-              activeProjectId={projectId}
-              search={projectSearch}
-              filter={projectFilter}
-              onSearch={setProjectSearch}
-              onFilter={setProjectFilter}
-              onOpen={(id) => refreshAll(id)}
-              onArchive={setProjectArchived}
-              onDelete={deleteProjectItem}
-            />
           </section>
         )}
 
-        {tab === 'script' && project && (
+        {tab === 'script' && project && project.workflow_type !== 'video_library' && (
           <section className="band history-script-grid">
             <div className="panel">
               <div className="script-title script-panel-heading">
@@ -2016,7 +2879,7 @@ function App() {
           </section>
         )}
 
-        {tab === 'storyboard' && (
+        {tab === 'storyboard' && project?.workflow_type !== 'video_library' && (
           <section className="band">
             <div className="storyboard-actions">
               <div className="storyboard-action-buttons">
@@ -2093,7 +2956,7 @@ function App() {
           </section>
         )}
 
-        {tab === 'match' && (
+        {tab === 'match' && project?.workflow_type !== 'video_library' && (
           <section className="band">
             <div className="toolbar voice-toolbar">
               <VoiceSelect value={voiceType} onChange={setVoiceType} />
@@ -2165,17 +3028,23 @@ function App() {
           </section>
         )}
 
-        {tab === 'cover' && project && (
-          <section className="band cover-workspace">
+        {project && ((project.workflow_type === 'video_library' && ['title', 'music', 'cover'].includes(tab)) || (project.workflow_type !== 'video_library' && tab === 'cover')) && (
+          <section className={`band ${project.workflow_type !== 'video_library' || tab === 'cover' ? 'cover-workspace' : ''}`}>
             <div className="panel cover-editor">
-              {/* Step 1: Title Generation */}
-              <div>
-                <h2>标题封面与配乐</h2>
-                <p>生成两行标题和视频封面，并从音乐库选择背景音乐。配乐设置会在剪映草稿导出时自动应用。</p>
-              </div>
+              {project.workflow_type === 'video_library' ? (
+                <div>
+                  <h2>{tab === 'title' ? '标题' : tab === 'music' ? '背景音乐' : '封面'}</h2>
+                  <p>{tab === 'title' ? '填写两行标题，也可以让 AI 生成候选标题。' : tab === 'music' ? '从音乐库选择背景音乐，设置起始位置和音量，导出剪映草稿时自动应用。' : '上传竖版人物图片，并调整两行封面文字的位置和字号。'}</p>
+                </div>
+              ) : (
+                <div>
+                  <h2>标题封面与配乐</h2>
+                  <p>生成两行标题和视频封面，并从音乐库选择背景音乐。配乐设置会在剪映草稿导出时自动应用。</p>
+                </div>
+              )}
 
-              <div className="title-section">
-                <h3>第一步 · 生成标题</h3>
+              {(project.workflow_type !== 'video_library' || tab === 'title') && <div className="title-section">
+                <h3>{project.workflow_type === 'video_library' ? '两行标题' : '第一步 · 生成标题'}</h3>
                 <div className="title-inputs">
                   <label>
                     标题第一行
@@ -2250,11 +3119,11 @@ function App() {
                     <Save size={18} /> {titleConfirmed ? '标题已确认 ✓' : '确认标题'}
                   </button>
                 </div>
-              </div>
+              </div>}
 
               {/* Step 2: Cover Generation (only after title is confirmed) */}
-              <div className="cover-section">
-                <h3>第二步 · 生成封面</h3>
+              {(project.workflow_type !== 'video_library' || tab === 'cover') && <div className="cover-section">
+                <h3>{project.workflow_type === 'video_library' ? '封面' : '第二步 · 生成封面'}</h3>
                 <p className="cover-layout-note">封面保持完整的 9:16 竖屏画面，不做裁剪；图片上方会叠加黑色遮罩，标题显示在遮罩上层。上传图片后，可在右侧分别拖动两行标题，拖动选框右下角可调整大小。</p>
                 <input
                   ref={coverInputRef}
@@ -2292,9 +3161,9 @@ function App() {
                     <ImagePlus size={18} /> {project.cover_url ? '重新合成封面' : '生成 9:16 封面'}
                   </button>
                 </div>
-              </div>
+              </div>}
 
-              {project.audio_url && (
+              {project.workflow_type !== 'video_library' && project.audio_url && (
                 <div className="voice-volume-section">
                   <h3>第三步 · 调整配音音量</h3>
                   <audio
@@ -2327,8 +3196,8 @@ function App() {
                 </div>
               )}
 
-              <div className="music-section">
-                <h3>{project.audio_url ? '第四步' : '第三步'} · 设置背景音乐</h3>
+              {(project.workflow_type !== 'video_library' || tab === 'music') && <div className="music-section">
+                <h3>{project.workflow_type === 'video_library' ? '背景音乐' : `${project.audio_url ? '第四步' : '第三步'} · 设置背景音乐`}</h3>
                 <input
                   ref={musicInputRef}
                   className="hidden-input"
@@ -2429,14 +3298,14 @@ function App() {
                   <Save size={18} /> 保存配乐设置
                 </button>
                 <small>音乐不足视频时长时会自动循环，相邻循环片段使用 1 秒淡入淡出衔接。</small>
-                <button type="button" disabled={!project.cover_url} onClick={() => setTab('export')}>
+                <button type="button" disabled={project.workflow_type !== 'video_library' && !project.cover_url} onClick={() => setTab('export')}>
                   <Download size={18} /> 下一步：导出
                 </button>
-              </div>
+              </div>}
 
-              {project.cover_model && <small>封面处理：{project.cover_model}</small>}
+              {(project.workflow_type !== 'video_library' || tab === 'cover') && project.cover_model && <small>封面处理：{project.cover_model}</small>}
             </div>
-            <div className="cover-preview">
+            {(project.workflow_type !== 'video_library' || tab === 'cover') && <div className="cover-preview">
               {coverImagePreviewUrl ? (
                 <>
                   <CoverTitleEditor
@@ -2461,11 +3330,11 @@ function App() {
                   <span>确认标题并上传人物图片后，在这里生成竖版封面</span>
                 </div>
               )}
-            </div>
+            </div>}
           </section>
         )}
 
-        {tab === 'export' && (
+        {tab === 'export' && project?.workflow_type !== 'video_library' && (
           <section className="band result">
             <h2>结果导出</h2>
             <p>导出内容包括按镜头编号的图片、配音、SRT 字幕、每行最多 6 个字的 TXT 字幕和剪映草稿。</p>
@@ -2565,7 +3434,9 @@ function App() {
   );
 }
 
-function ProjectManager({ projects, activeProjectId, search, filter, onSearch, onFilter, onOpen, onArchive, onDelete }) {
+function ProjectManager({ projects, activeProjectId, search, filter, onSearch, onFilter, onOpen, onArchive, onDelete, onDeleteMany, busy = false }) {
+  const [selectedIds, setSelectedIds] = useState(new Set());
+  const selectAllRef = useRef(null);
   const sorted = [...projects].sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')));
   const recent = sorted.filter((item) => !item.archived).slice(0, 6);
   const query = search.trim().toLowerCase();
@@ -2579,6 +3450,45 @@ function ProjectManager({ projects, activeProjectId, search, filter, onSearch, o
     if (filter === 'done') return stage.key === 'done';
     return true;
   });
+  const filteredIds = filtered.map((item) => item.id);
+  const allSelected = filteredIds.length > 0 && filteredIds.every((id) => selectedIds.has(id));
+  const someSelected = filteredIds.some((id) => selectedIds.has(id));
+
+  useEffect(() => {
+    if (selectAllRef.current) selectAllRef.current.indeterminate = someSelected && !allSelected;
+  }, [someSelected, allSelected]);
+
+  useEffect(() => {
+    const validIds = new Set(projects.map((item) => item.id));
+    setSelectedIds((current) => {
+      const next = new Set([...current].filter((id) => validIds.has(id)));
+      return next.size === current.size ? current : next;
+    });
+  }, [projects]);
+
+  function toggleSelection(id) {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleFiltered() {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (allSelected) filteredIds.forEach((id) => next.delete(id));
+      else filteredIds.forEach((id) => next.add(id));
+      return next;
+    });
+  }
+
+  async function deleteSelected() {
+    if (!selectedIds.size || !onDeleteMany) return;
+    const deleted = await onDeleteMany([...selectedIds]);
+    if (deleted) setSelectedIds(new Set());
+  }
 
   return (
     <div className="project-manager panel">
@@ -2591,7 +3501,7 @@ function ProjectManager({ projects, activeProjectId, search, filter, onSearch, o
           <strong>最近项目</strong>
           <div>
             {recent.map((item) => (
-              <button type="button" className={item.id === activeProjectId ? 'active' : ''} key={item.id} onClick={() => onOpen(item.id)}>
+              <button type="button" className={item.id === activeProjectId ? 'active' : ''} key={item.id} disabled={busy} onClick={() => onOpen(item.id)}>
                 <span>{item.name}</span><small>{projectStage(item).label}</small>
               </button>
             ))}
@@ -2607,28 +3517,53 @@ function ProjectManager({ projects, activeProjectId, search, filter, onSearch, o
           <option value="done">已完成</option>
           <option value="archived">已归档</option>
         </select>
+        <button type="button" className="danger" disabled={busy || !selectedIds.size} onClick={deleteSelected}>
+          批量删除（{selectedIds.size}）
+        </button>
       </div>
       <div className="project-table-wrap">
         <table className="project-table">
-          <thead><tr><th>项目名称</th><th>当前阶段</th><th>修改时间</th><th>分镜数</th><th>操作</th></tr></thead>
+          <thead><tr>
+            <th className="project-select-cell">
+              <input
+                ref={selectAllRef}
+                type="checkbox"
+                checked={allSelected}
+                onChange={toggleFiltered}
+                disabled={busy}
+                aria-label="全选当前列表"
+                title="全选当前列表"
+              />
+            </th>
+            <th>项目名称</th><th>当前阶段</th><th>修改时间</th><th>素材数</th><th>操作</th>
+          </tr></thead>
           <tbody>
             {filtered.map((item) => {
               const stage = projectStage(item);
               return (
                 <tr key={item.id} className={item.id === activeProjectId ? 'active' : ''}>
-                  <td><button type="button" className="project-name-link" onClick={() => onOpen(item.id)}>{item.name}</button></td>
+                  <td className="project-select-cell">
+                    <input
+                      type="checkbox"
+                      checked={selectedIds.has(item.id)}
+                      onChange={() => toggleSelection(item.id)}
+                      disabled={busy}
+                      aria-label={`选择项目 ${item.name}`}
+                    />
+                  </td>
+                  <td><button type="button" className="project-name-link" disabled={busy} onClick={() => onOpen(item.id)}>{item.name}</button></td>
                   <td><span className={`project-stage ${stage.key}`}>{stage.label}</span></td>
                   <td>{formatProjectTime(item.updated_at)}</td>
                   <td>{item.shot_count || 0}</td>
                   <td><div className="project-row-actions">
-                    <button type="button" onClick={() => onOpen(item.id)}>继续</button>
-                    <button type="button" onClick={() => onArchive(item, !item.archived)}>{item.archived ? '恢复' : '归档'}</button>
-                    <button type="button" className="danger" onClick={() => onDelete(item)}>删除</button>
+                    <button type="button" disabled={busy} onClick={() => onOpen(item.id)}>继续</button>
+                    <button type="button" disabled={busy} onClick={() => onArchive(item, !item.archived)}>{item.archived ? '恢复' : '归档'}</button>
+                    <button type="button" className="danger" disabled={busy} onClick={() => onDelete(item)}>删除</button>
                   </div></td>
                 </tr>
               );
             })}
-            {!filtered.length && <tr><td colSpan="5" className="empty-projects">没有符合条件的项目</td></tr>}
+            {!filtered.length && <tr><td colSpan="6" className="empty-projects">没有符合条件的项目</td></tr>}
           </tbody>
         </table>
       </div>
@@ -2636,18 +3571,18 @@ function ProjectManager({ projects, activeProjectId, search, filter, onSearch, o
   );
 }
 
-function ProjectSelect({ projects, projectId, open, onOpenChange, onSelect }) {
+function ProjectSelect({ projects, projectId, open, onOpenChange, onSelect, disabled = false }) {
   const selected = projects.find((item) => item.id === projectId);
   return (
     <div className="custom-select">
-      <button type="button" className={open ? 'custom-select-trigger open' : 'custom-select-trigger'} onClick={() => onOpenChange(!open)}>
+      <button type="button" className={open ? 'custom-select-trigger open' : 'custom-select-trigger'} disabled={disabled} onClick={() => onOpenChange(!open)}>
         <span>{selected?.name || '选择项目'}</span>
       </button>
       {open && (
         <div className="custom-select-menu">
-          <button type="button" className={!projectId ? 'selected' : ''} onClick={() => onSelect('')}>选择项目</button>
+          <button type="button" className={!projectId ? 'selected' : ''} disabled={disabled} onClick={() => onSelect('')}>选择项目</button>
           {projects.map((item) => (
-            <button type="button" key={item.id} className={item.id === projectId ? 'selected' : ''} onClick={() => onSelect(item.id)}>
+            <button type="button" key={item.id} className={item.id === projectId ? 'selected' : ''} disabled={disabled} onClick={() => onSelect(item.id)}>
               {item.name}
             </button>
           ))}
