@@ -23,6 +23,9 @@ SUBTITLE_FONT_FILE = PROJECT_ROOT / "assets" / "DouyinSansBold.otf"
 SUBTITLE_FONT_NAME = "Douyin Sans"
 TITLE_FONT_FILE = PROJECT_ROOT / "assets" / "龚帆怒放体.ttf"
 TITLE_FONT_NAME = "gongfannufangti"
+# Editable covers validated in Jianying 11.6 use schema 189. The generator's
+# main-timeline template is still 110; do not inherit that for nested covers.
+JIANYING_COVER_SCHEMA_VERSION = "189.0.0"
 
 
 def _font_result(path: str | Path, name: str) -> tuple[str, str]:
@@ -354,7 +357,7 @@ def _install_jianying_cover(draft_path: Path, cover_path: Path) -> dict[str, str
     # Match a native 11.6 cover: the composition must include its image's
     # complete time range. A zero duration survives as an empty editor cover.
     composition["id"] = cover_id
-    composition["new_version"] = content.get("new_version", composition["new_version"])
+    composition["new_version"] = JIANYING_COVER_SCHEMA_VERSION
     composition["canvas_config"] = {}
     composition["config"]["sticker_max_index"] = 14000
     composition["tracks"][0]["segments"][0]["track_render_index"] = 101

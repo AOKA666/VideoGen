@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -54,6 +55,37 @@ class LocalDirectorySettingsTests(unittest.TestCase):
             self.assertEqual(image.resolve(), Path(response.path).resolve())
             with self.assertRaises(HTTPException):
                 read_storage_file("db.json")
+
+    def test_storage_move_relocates_library_and_template_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as old_root, tempfile.TemporaryDirectory() as workspace:
+            stale_assets = Path(old_root) / "storage" / "assets"
+            assets = Path(workspace) / "assets"
+            assets.mkdir()
+            for name in ("music_probe.mp3", "template_probe.png"):
+                (assets / name).write_bytes(b"probe")
+            (Path(workspace) / "db.json").write_text(json.dumps({
+                "music_library": [{
+                    "id": "music-1",
+                    "local_path": str(stale_assets / "music_probe.mp3"),
+                    "file_url": "/storage/assets/music_probe.mp3",
+                }],
+                "video_templates": [{
+                    "id": "template-1",
+                    "local_path": str(stale_assets / "template_probe.png"),
+                    "file_url": "/storage/assets/template_probe.png",
+                }],
+            }), encoding="utf-8")
+
+            store.configure_storage(workspace)
+            store.ensure_storage()
+            data = store.load_db()
+
+            music = data["music_library"][0]
+            template = data["video_templates"][0]
+            self.assertEqual(str((assets / "music_probe.mp3").resolve()), music["local_path"])
+            self.assertEqual(str((assets / "template_probe.png").resolve()), template["local_path"])
+            self.assertEqual("/storage/assets/music_probe.mp3", music["file_url"])
+            self.assertEqual("/storage/assets/template_probe.png", template["file_url"])
 
     def test_configured_jianying_directory_has_priority(self) -> None:
         with tempfile.TemporaryDirectory() as draft_dir:

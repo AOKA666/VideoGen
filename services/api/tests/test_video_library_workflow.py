@@ -259,6 +259,7 @@ class JianyingVideoDraftTests(unittest.TestCase):
                                 content = json.loads((destination / "draft_content.json").read_text(encoding="utf-8"))
                                 composition = next(m["draft"] for m in content["materials"]["drafts"]
                                                    if m["id"] == content["cover"]["cover_draft_id"])
+                                self.assertEqual(composition["new_version"], "189.0.0")
                                 segment = composition["tracks"][0]["segments"][0]
                                 time = segment["target_timerange"]
                                 self.assertEqual(composition["duration"], time["start"] + time["duration"])
@@ -298,6 +299,7 @@ class JianyingVideoDraftTests(unittest.TestCase):
                              if m["id"] == actual["cover"]["cover_draft_id"])
                 self.assertEqual(actual["cover"]["sub_type"], "local")
                 composition = cover["draft"]
+                self.assertEqual(composition["new_version"], "189.0.0")
                 segment = composition["tracks"][0]["segments"][0]
                 material = next(m for m in composition["materials"]["videos"]
                                 if m["id"] == segment["material_id"])

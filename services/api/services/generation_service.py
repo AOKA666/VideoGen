@@ -1064,6 +1064,7 @@ def align_voice_to_script(path: Path, shots: list[dict], duration: float, senten
                     "start_time": subtitle_chars[0]["start"],
                     "end_time": subtitle_chars[-1]["end"],
                     "duration_sec": subtitle_chars[-1]["end"] - subtitle_chars[0]["start"],
+                    "character_timings": subtitle_chars,
                 })
         own_timings = [item for item in subtitle_timings if item.get("shot_id") == shot.get("id")]
         if own_timings:
@@ -1075,11 +1076,74 @@ def align_voice_to_script(path: Path, shots: list[dict], duration: float, senten
                 "duration_sec": own_timings[-1]["end_time"] - own_timings[0]["start_time"],
                 "subtitle_timings": own_timings,
             })
+    if characters:
+        correct_subtitle_onsets(path, subtitle_timings)
+        for shot in shot_timings:
+            own = shot["subtitle_timings"]
+            shot.update(start_time=own[0]["start_time"], end_time=own[-1]["end_time"],
+                        duration_sec=own[-1]["end_time"] - own[0]["start_time"])
     return {
         "shot_timings": shot_timings,
         "subtitle_timings": subtitle_timings,
         "alignment_method": alignment_method,
     }
+
+
+def correct_subtitle_onsets(path: Path, timings: list[dict]) -> int:
+    """Recover late sentence onsets only in otherwise uncaptioned audio gaps.
+
+    TTS can timestamp an initial phrase partway through its spoken audio.
+    Keep ordinary word boundaries, but use the first speech onset after the
+    preceding subtitle when a substantial silence-to-speech boundary exists.
+    """
+    if not timings or not path.is_file():
+        return 0
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostdin", "-i", str(path),
+         "-af", "silencedetect=noise=-35dB:d=0.18", "-f", "null", "-"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=120, creationflags=0x08000000 if os.name == "nt" else 0,
+    )
+    if result.returncode:
+        raise RuntimeError("无法分析配音起声位置，请检查音频文件")
+    boundaries = []
+    silence_start = None
+    for line in result.stderr.splitlines():
+        start_match = re.search(r"silence_start: ([\d.]+)", line)
+        end_match = re.search(r"silence_end: ([\d.]+)", line)
+        if start_match:
+            silence_start = float(start_match.group(1))
+        if end_match and silence_start is not None:
+            boundaries.append((silence_start, float(end_match.group(1))))
+            silence_start = None
+    return _correct_subtitle_onsets(timings, boundaries)
+
+
+SUBTITLE_ONSET_MAX_LAG_SEC = 3.0
+
+
+def _correct_subtitle_onsets(timings: list[dict], boundaries: list[tuple[float, float]]) -> int:
+    corrected = 0
+    previous_end = 0.0
+    for cue in timings:
+        start, end = float(cue["start_time"]), float(cue["end_time"])
+        candidates = [
+            onset for silence, onset in boundaries
+            if silence >= previous_end - 0.08 and onset >= previous_end
+            and 0.15 <= start - onset <= SUBTITLE_ONSET_MAX_LAG_SEC
+        ]
+        if candidates:
+            onset = round(min(candidates), 3)
+            cue.setdefault("original_start_time", start)
+            cue["start_time"] = onset
+            cue["duration_sec"] = end - onset
+            cue["onset_alignment"] = "audio_silence_boundary"
+            # Retain the corrected onset when this cue is split on export.
+            if cue.get("character_timings"):
+                cue["character_timings"][0]["start"] = onset
+            corrected += 1
+        previous_end = end
+    return corrected
 
 
 def synthesize_project_voice(path: Path, shots: list[dict], voice_type: str | None = None,
@@ -1218,6 +1282,12 @@ def _timed_export_subtitle_chunks(timing: dict, max_hanzi: int) -> list[dict]:
     weights = [max(chinese_char_count(chunk), 1) for chunk in chunks]
     total_weight = sum(weights) or 1
     elapsed_weight = 0
+    characters = timing.get("character_timings") or []
+    exact_characters = (
+        "".join(item.get("char", "") for item in characters) == alignment_text(raw_text)
+        and bool(characters)
+    )
+    character_cursor = 0
     subtitles: list[dict] = []
     for index, (chunk, weight) in enumerate(zip(chunks, weights)):
         chunk_text = subtitle_display_text(chunk)
@@ -1231,6 +1301,13 @@ def _timed_export_subtitle_chunks(timing: dict, max_hanzi: int) -> list[dict]:
             if index == len(chunks) - 1
             else start + (end - start) * elapsed_weight / total_weight
         )
+        if exact_characters:
+            count = len(alignment_text(chunk))
+            matched = characters[character_cursor:character_cursor + count]
+            character_cursor += count
+            if matched:
+                chunk_start = float(matched[0]["start"])
+                chunk_end = float(matched[-1]["end"])
         subtitles.append({
             "start_time": round(chunk_start, 3),
             "end_time": round(chunk_end, 3),
@@ -1330,15 +1407,24 @@ def narration_shot(project: dict) -> dict:
         script, _, _ = strip_product_marker(
             str(project.get("rewritten_script") or project.get("raw_script") or "")
         )
+    timings = strip_marker_from_timings(
+        project.get("narration_subtitle_timings") or []
+    )
+    audio_path = Path(str(project.get("audio_path") or ""))
+    if timings and audio_path.is_file():
+        # Projects voiced before onset correction keep stale timings on disk.
+        # Re-derive the onsets from the audio so export fixes them as well.
+        try:
+            correct_subtitle_onsets(audio_path, timings)
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            pass
     return {
         "id": "narration",
         "shot_index": 1,
         "voice_text": script,
         "start_time": 0.0,
         "end_time": float(project.get("audio_duration_sec") or 0),
-        "subtitle_timings": strip_marker_from_timings(
-            project.get("narration_subtitle_timings") or []
-        ),
+        "subtitle_timings": timings,
     }
 
 
@@ -1386,24 +1472,26 @@ def build_export_subtitles(shots: list[dict], max_hanzi: int = 6) -> list[dict]:
 
 def _normalize_export_subtitle_timings(subtitles: list[dict]) -> list[dict]:
     normalized: list[dict] = []
-    previous_end = 0.0
     for subtitle in sorted(subtitles, key=lambda item: (float(item.get("start_time") or 0), float(item.get("end_time") or 0))):
         text = str(subtitle.get("text") or "").strip()
         if not text:
             continue
         start = round(max(float(subtitle.get("start_time") or 0), 0.0), 3)
-        end = round(max(float(subtitle.get("end_time") or 0), start + 0.08), 3)
-        if normalized and start <= previous_end:
-            start = round(previous_end + 0.001, 3)
-        if end <= start:
-            end = round(start + 0.08, 3)
+        end = round(max(float(subtitle.get("end_time") or 0), start + 0.001), 3)
+        # Preserve the next spoken onset. Moving it after the previous end
+        # causes cumulative lag; shorten the previous display instead.
+        if normalized and start == normalized[-1]["start_time"]:
+            normalized[-1]["text"] += text
+            normalized[-1]["end_time"] = max(normalized[-1]["end_time"], end)
+            continue
+        if normalized and normalized[-1]["end_time"] > start:
+            normalized[-1]["end_time"] = start
         item = {
             **subtitle,
             "start_time": start,
             "end_time": end,
         }
         normalized.append(item)
-        previous_end = end
     return normalized
 
 

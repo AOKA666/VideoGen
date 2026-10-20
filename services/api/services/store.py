@@ -186,15 +186,16 @@ def ensure_storage() -> None:
             asset["local_path"] = str(current_path)
             asset["file_url"] = public_url(current_path)
             changed = True
-        for product in data.get("product_library", []):
-            product_path = str(product.get("local_path") or "")
-            if not product_path:
-                continue
-            current_product_path = _current_storage_path(product_path)
-            if current_product_path.exists() and str(current_product_path) != product_path:
-                product["local_path"] = str(current_product_path)
-                product["file_url"] = public_url(current_product_path)
-                changed = True
+        for library_key in ("product_library", "music_library", "video_library", "video_templates"):
+            for item in data.get(library_key, []):
+                local_path = str(item.get("local_path") or "")
+                if not local_path:
+                    continue
+                current_path = _current_storage_path(local_path)
+                if current_path.exists() and str(current_path) != local_path:
+                    item["local_path"] = str(current_path)
+                    item["file_url"] = public_url(current_path)
+                    changed = True
         for preset in data.get("video_library_presets", []):
             cover_path = str(preset.get("cover_source_path") or "")
             if not cover_path:
