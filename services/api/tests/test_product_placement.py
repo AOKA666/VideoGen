@@ -160,7 +160,7 @@ class ProductLibraryTests(unittest.TestCase):
         self.assertFalse(Path(product["local_path"]).exists())
 
         kept = media.upload_product(image_upload())
-        project = create_project(ProjectCreate(raw_script="测试。", workflow_type="video_library"))["project"]
+        project = create_project(ProjectCreate(raw_script="测试。【带货开始】", workflow_type="video_library"))["project"]
         with store.db_write_transaction():
             db = store.load_db()
             row = next(p for p in db["projects"] if p["id"] == project["id"])
@@ -387,7 +387,6 @@ class ProductDraftTests(unittest.TestCase):
                 report = video_export_service.create_jianying_native_draft(
                     root / "package", "pip_test", shots, [clip], audio, srt,
                     background_template_path=template,
-                    scene_media="video", copy_scenes=False, animate_scenes=False,
                     clip_window=(0, 589, 1080, 742),
                     subtitle_transform_y=video_export_service._transform_y_for_visual_y(1180),
                     product_placement={

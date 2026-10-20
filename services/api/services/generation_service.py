@@ -1,487 +1,23 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import html
 import base64
 import http.client
 import json
-import mimetypes
 import os
 import re
 import shutil
 import subprocess
 import urllib.error
 import urllib.request
-import wave
 from difflib import SequenceMatcher
-from io import BytesIO
 from json import JSONDecoder
 from pathlib import Path
 from uuid import uuid4
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from services.store import public_url
 from services.title_style import TITLE_FONT_SIZE_PX
-from services.storyboard_style import (
-    STORYBOARD_STYLE_PROMPT,
-    sanitize_storyboard_visual_prompt,
-)
-
-
-STORYBOARD_SEEDREAM_MODEL = "doubao-seedream-4-0-250828"
-STORYBOARD_OPENAI_MODEL = "gpt-image-2"
-STORYBOARD_IMAGE_SIZE = "1440x2560"
-OPENAI_FAST_IMAGE_SIZE = "720x1280"
-IMAGE_GENERATION_PROVIDERS = {"seedream", "openai"}
-
-def generate_svg_placeholder(path: Path, shot: dict) -> str:
-    prompt = build_image_prompt(shot)
-    title = html.escape(shot.get("visual_need") or "历史纪实画面")
-    text = html.escape((shot.get("voice_text") or "")[:38])
-    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="1080" viewBox="0 0 1080 1080">
-  <defs>
-    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#1f2937"/>
-      <stop offset="0.42" stop-color="#5b5347"/>
-      <stop offset="1" stop-color="#b8b2a4"/>
-    </linearGradient>
-    <filter id="grain"><feTurbulence type="fractalNoise" baseFrequency="0.8" numOctaves="3" stitchTiles="stitch"/><feColorMatrix type="saturate" values="0"/></filter>
-  </defs>
-  <rect width="1080" height="1080" fill="url(#g)"/>
-  <rect width="1080" height="1080" opacity="0.18" filter="url(#grain)"/>
-  <rect x="92" y="120" width="896" height="660" fill="#111827" opacity="0.28"/>
-  <circle cx="540" cy="420" r="160" fill="#e5e7eb" opacity="0.16"/>
-  <path d="M280 650 C400 540 680 540 800 650 L800 760 L280 760 Z" fill="#e5e7eb" opacity="0.14"/>
-  <text x="92" y="880" fill="#f8fafc" font-size="54" font-family="Arial, sans-serif">{title}</text>
-  <text x="92" y="950" fill="#e5e7eb" font-size="30" font-family="Arial, sans-serif">{text}</text>
-  <text x="92" y="1760" fill="#d1d5db" font-size="28" font-family="Arial, sans-serif">AI placeholder · archival documentary style</text>
-</svg>"""
-    path.write_text(svg, encoding="utf-8")
-    return prompt
-
-
-def build_image_prompt(shot: dict) -> str:
-    visual_need = sanitize_storyboard_visual_prompt(shot.get("visual_need"))
-    if not visual_need or visual_need == "待AI生成画面描述":
-        raise ValueError("DeepSeek did not return an image prompt for this shot")
-    return f"{STORYBOARD_STYLE_PROMPT}；具体画面：{visual_need}"
-
-
-def ark_endpoint() -> str:
-    return os.getenv("ARK_ENDPOINT", "https://ark.cn-beijing.volces.com/api/v3")
-
-
-def ark_image_model() -> str:
-    return os.getenv("ARK_IMAGE_MODEL", STORYBOARD_SEEDREAM_MODEL)
-
-
-def ark_image_edit_model() -> str:
-    return os.getenv("ARK_IMAGE_EDIT_MODEL", ark_image_model())
-
-
-def openai_image_endpoint() -> str:
-    return os.getenv("OPENAI_ENDPOINT", "https://api.openai.com/v1").rstrip("/")
-
-
-def openai_image_model() -> str:
-    return os.getenv("OPENAI_IMAGE_MODEL", STORYBOARD_OPENAI_MODEL).strip() or STORYBOARD_OPENAI_MODEL
-
-
-def openai_image_size() -> str:
-    return os.getenv("OPENAI_IMAGE_SIZE", OPENAI_FAST_IMAGE_SIZE).strip() or OPENAI_FAST_IMAGE_SIZE
-
-
-def openai_image_output_format() -> str:
-    output_format = os.getenv("OPENAI_IMAGE_FORMAT", "jpeg").strip().lower()
-    return output_format if output_format in {"png", "jpeg", "webp"} else "jpeg"
-
-
-def generated_image_extension(provider: str) -> str:
-    if normalize_image_generation_provider(provider) != "openai":
-        return ".png"
-    return {"jpeg": ".jpg", "webp": ".webp", "png": ".png"}[openai_image_output_format()]
-
-
-def normalize_image_generation_provider(value: object) -> str:
-    provider = str(value or "openai").strip().lower()
-    if provider not in IMAGE_GENERATION_PROVIDERS:
-        raise ValueError("image generation provider must be seedream or openai")
-    return provider
-
-
-def image_size_for_ratio(video_ratio: str | None) -> str:
-    if video_ratio == "16:9":
-        return "2560x1440"
-    if video_ratio == "1:1":
-        return "1920x1920"
-    return "1440x2560"
-
-
-def storyboard_image_size() -> str:
-    return STORYBOARD_IMAGE_SIZE
-
-
-def image_edit_size_for_source(path: Path) -> str:
-    with Image.open(path) as image:
-        width, height = image.size
-    if width <= 0 or height <= 0:
-        raise RuntimeError(f"Image has invalid dimensions: {width}x{height}")
-
-    aspect_ratio = width / height
-    if aspect_ratio >= 1.2:
-        return image_size_for_ratio("16:9")
-    if aspect_ratio <= (1 / 1.2):
-        return image_size_for_ratio("9:16")
-    return image_size_for_ratio("1:1")
-
-
-def _fit_without_distortion(image: Image.Image, target_size: tuple[int, int]) -> Image.Image:
-    target_width, target_height = target_size
-    source_width, source_height = image.size
-    if source_width <= 0 or source_height <= 0:
-        raise RuntimeError(f"Edited image has invalid dimensions: {source_width}x{source_height}")
-    source_ratio = source_width / source_height
-    target_ratio = target_width / target_height
-    if abs(source_ratio - target_ratio) <= 0.02:
-        return image.resize(target_size, Image.Resampling.LANCZOS)
-    return ImageOps.fit(
-        image,
-        target_size,
-        method=Image.Resampling.LANCZOS,
-        centering=(0.5, 0.5),
-    )
-
-
-def remove_watermark_with_seedream(path: Path, shot: dict | None = None) -> dict:
-    api_key = os.getenv("ARK_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("ARK_API_KEY is not configured")
-    if not path.exists():
-        raise RuntimeError(f"Image does not exist: {path}")
-
-    prompt = (
-        "仅移除原图中已有的字幕、Logo和水印，并自然修复被遮挡区域。"
-        "禁止新增任何文字、Logo、角标、水印、平台标识或“AI生成”标识。"
-        "保持原图主体、人物、构图、色彩、光影和画面比例不变。"
-    )
-
-    original_bytes = path.read_bytes()
-    with Image.open(BytesIO(original_bytes)) as source:
-        original = ImageOps.exif_transpose(source)
-        original_size = original.size
-    edit_size = image_edit_size_for_source(path)
-
-    image_b64 = base64.b64encode(original_bytes).decode("ascii")
-    mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
-    image_data_uri = f"data:{mime};base64,{image_b64}"
-
-    payload = {
-        "model": ark_image_edit_model(),
-        "prompt": prompt,
-        "image": image_data_uri,
-        "strength": 0.3,
-        "n": 1,
-        "size": edit_size,
-        "watermark": False,
-        "response_format": "url",
-    }
-    req = urllib.request.Request(
-        f"{ark_endpoint().rstrip('/')}/images/generations",
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=180) as response:
-            response_body = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Volcengine Ark image edit API {exc.code}: {error_body}") from exc
-
-    images = response_body.get("data") or response_body.get("images") or []
-    image = images[0] if images and isinstance(images[0], dict) else {}
-    image_url = image.get("url") or image.get("image_url")
-    image_b64 = image.get("b64_json") or image.get("base64")
-    if image_url:
-        with urllib.request.urlopen(image_url, timeout=180) as response:
-            edited = response.read()
-    elif image_b64:
-        edited = base64.b64decode(image_b64)
-    else:
-        raise RuntimeError(f"Volcengine Ark image edit response does not contain an image: {response_body}")
-
-    try:
-        with Image.open(BytesIO(edited)) as source:
-            edited_image = ImageOps.exif_transpose(source)
-            edited_image.load()
-            if edited_image.size != original_size:
-                edited_image = _fit_without_distortion(edited_image, original_size)
-            suffix = path.suffix.lower()
-            save_format = {
-                ".png": "PNG",
-                ".webp": "WEBP",
-            }.get(suffix, "JPEG")
-            edited_image = edited_image.convert("RGBA" if save_format == "PNG" else "RGB")
-            output = BytesIO()
-            save_options = {"quality": 95} if save_format in {"JPEG", "WEBP"} else {}
-            edited_image.save(output, format=save_format, **save_options)
-            output_bytes = output.getvalue()
-    except Exception as exc:
-        raise RuntimeError(f"Volcengine Ark returned an invalid edited image: {exc}") from exc
-
-    path.write_bytes(output_bytes)
-    return {
-        "watermark_checked_by_ai": True,
-        "watermark_removed": True,
-        "subtitles_removed": True,
-        "logos_removed": True,
-        "output_watermark_disabled": True,
-        "original_size_preserved": True,
-        "provider": "volcengine_ark",
-        "model": ark_image_edit_model(),
-        "image_size": payload["size"],
-        "original_size": f"{original_size[0]}x{original_size[1]}",
-        "aspect_preserved": True,
-        "remote_url": image_url or "",
-    }
-
-
-def generate_doubao_image(
-    path: Path,
-    shot: dict,
-    video_ratio: str | None = "9:16",
-    prompt_override: str | None = None,
-) -> dict:
-    api_key = os.getenv("ARK_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("ARK_API_KEY is not configured")
-
-    prompt = str(prompt_override or "").strip() or build_image_prompt(shot)
-    payload = {
-        "model": ark_image_model(),
-        "prompt": prompt,
-        "size": storyboard_image_size(),
-        "response_format": "url",
-        "watermark": False,
-    }
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        f"{ark_endpoint().rstrip('/')}/images/generations",
-        data=data,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=180) as response:
-            body = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Volcengine Ark API {exc.code}: {error_body}") from exc
-
-    images = body.get("data") or body.get("images") or []
-    image_url = images[0].get("url") if images and isinstance(images[0], dict) else ""
-    if not image_url:
-        raise RuntimeError(f"Volcengine Ark response does not contain an image URL: {body}")
-
-    with urllib.request.urlopen(image_url, timeout=180) as response:
-        path.write_bytes(response.read())
-
-    return {
-        "prompt": prompt,
-        "provider": "volcengine_ark",
-        "model": ark_image_model(),
-        "remote_url": image_url,
-        "image_size": payload["size"],
-        "seed": body.get("seed"),
-    }
-
-
-def generate_openai_image(
-    path: Path,
-    shot: dict,
-    video_ratio: str | None = "9:16",
-    prompt_override: str | None = None,
-) -> dict:
-    api_key = os.getenv("OPENAI_IMAGE_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("OPENAI_IMAGE_API_KEY is not configured")
-
-    prompt = str(prompt_override or "").strip() or build_image_prompt(shot)
-    output_format = openai_image_output_format()
-    payload = {
-        "model": openai_image_model(),
-        "prompt": prompt,
-        "size": openai_image_size(),
-        "quality": os.getenv("OPENAI_IMAGE_QUALITY", "low").strip() or "low",
-        "output_format": output_format,
-    }
-    if output_format in {"jpeg", "webp"}:
-        try:
-            compression = int(os.getenv("OPENAI_IMAGE_COMPRESSION", "85"))
-        except ValueError:
-            compression = 85
-        payload["output_compression"] = max(0, min(compression, 100))
-    request = urllib.request.Request(
-        f"{openai_image_endpoint()}/images/generations",
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=180) as response:
-            body = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"OpenAI image API {exc.code}: {error_body}") from exc
-
-    images = body.get("data") or body.get("images") or []
-    image = images[0] if images and isinstance(images[0], dict) else {}
-    image_b64 = image.get("b64_json") or image.get("base64")
-    image_url = image.get("url") or image.get("image_url")
-    if image_b64:
-        content = base64.b64decode(image_b64)
-    elif image_url:
-        with urllib.request.urlopen(image_url, timeout=180) as response:
-            content = response.read()
-    else:
-        raise RuntimeError(f"OpenAI image response does not contain an image: {body}")
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(content)
-    return {
-        "prompt": prompt,
-        "provider": "openai",
-        "model": openai_image_model(),
-        "output_format": output_format,
-        "remote_url": image_url or "",
-        "image_size": payload["size"],
-        "seed": body.get("seed"),
-    }
-
-
-def generate_ai_image(
-    path: Path,
-    shot: dict,
-    video_ratio: str | None = "9:16",
-    prompt_override: str | None = None,
-    provider: str = "seedream",
-) -> dict:
-    normalized_provider = normalize_image_generation_provider(provider)
-    if normalized_provider == "openai":
-        return generate_openai_image(path, shot, video_ratio, prompt_override)
-    return generate_doubao_image(path, shot, video_ratio, prompt_override)
-
-
-def generate_seedream_cover(
-    path: Path,
-    project: dict,
-    title: str,
-    subtitle: str = "",
-    skip_text: bool = False,
-) -> dict:
-    api_key = os.getenv("ARK_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("ARK_API_KEY is not configured")
-
-    title = str(title or project.get("name") or "").strip()[:18]
-    script = str(project.get("rewritten_script") or project.get("raw_script") or "").strip()
-    subtitle = str(subtitle or "").strip()
-    if not subtitle:
-        candidates = [
-            item.strip()
-            for item in re.split(r"[。！？!?，,\n]+", script)
-            if item.strip() and item.strip() != title
-        ]
-        subtitle = candidates[0] if candidates else ""
-    subtitle = subtitle[:28]
-    if skip_text:
-        prompt = (
-            "为一条中文纪实短视频设计专业竖版封面，画布比例9:16。"
-            "根据视频主题设计有冲击力的主体画面，纪实电影海报风格，真实摄影质感，"
-            "构图简洁，主体明确，高对比度，适合手机信息流展示。"
-            f"视频主题：{project.get('name') or title}。"
-            f"文案背景：{script[:260]}。"
-            "画面中央偏上区域留出较大空白，不要在画面中放置任何文字、标题或字幕。"
-            "不添加Logo、平台角标或水印。"
-        )
-    else:
-        prompt = (
-            "为一条中文纪实短视频设计专业竖版封面，画布比例9:16。"
-            "根据视频主题设计有冲击力的主体画面，纪实电影海报风格，真实摄影质感，"
-            "构图简洁，主体明确，高对比度，适合手机信息流展示。"
-            f"视频主题：{project.get('name') or title}。"
-            f"文案背景：{script[:260]}。"
-            f"封面必须清晰准确地排版主标题「{title}」，"
-            "主标题使用高饱和亮黄色中文粗体，并添加清晰醒目的黑色粗描边。"
-        )
-        if subtitle:
-            prompt += (
-                f"主标题下方排版较小的副标题「{subtitle}」，"
-                "副标题同样使用黄色粗体和黑色描边。"
-            )
-        prompt += (
-            "所有封面文字只能使用黄色字体、黑色描边，不使用白色或其他颜色；"
-            "字形端正，不能出现错别字、乱码、重复文字；"
-            "文字与背景有清晰层次和足够留白，不添加Logo、平台角标或水印。"
-        )
-    payload = {
-        "model": ark_image_model(),
-        "prompt": prompt,
-        "negative_prompt": "错别字，乱码，重复文字，英文标题，logo，水印，平台角标，低清晰度，过度卡通",
-        "size": image_size_for_ratio("9:16"),
-        "response_format": "url",
-        "watermark": False,
-    }
-    request = urllib.request.Request(
-        f"{ark_endpoint().rstrip('/')}/images/generations",
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=180) as response:
-            body = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Volcengine Ark cover API {exc.code}: {error_body}") from exc
-
-    images = body.get("data") or body.get("images") or []
-    image = images[0] if images and isinstance(images[0], dict) else {}
-    image_url = image.get("url") or image.get("image_url")
-    image_b64 = image.get("b64_json") or image.get("base64")
-    if image_url:
-        with urllib.request.urlopen(image_url, timeout=180) as response:
-            content = response.read()
-    elif image_b64:
-        content = base64.b64decode(image_b64)
-    else:
-        raise RuntimeError(f"Volcengine Ark cover response does not contain an image: {body}")
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(content)
-    return {
-        "prompt": prompt,
-        "provider": "volcengine_ark",
-        "model": ark_image_model(),
-        "remote_url": image_url or "",
-        "image_size": payload["size"],
-        "title": title,
-        "subtitle": subtitle,
-        "seed": body.get("seed"),
-    }
 
 
 def _find_chinese_font(size: int) -> ImageFont.FreeTypeFont:
@@ -509,59 +45,6 @@ def _find_chinese_font(size: int) -> ImageFont.FreeTypeFont:
             except Exception:
                 continue
     return ImageFont.load_default()
-
-
-COVER_TITLE_CENTER_Y_RATIO = 409 / 1920
-
-
-def _cover_title_start_y(canvas_height: int, total_text_height: int) -> int:
-    """Mirror the former lower title center (y=1511) across a 1920px canvas center."""
-    title_center_y = round(canvas_height * COVER_TITLE_CENTER_Y_RATIO)
-    return max(0, title_center_y - total_text_height // 2)
-
-
-def cover_title_layout(
-    line1: str,
-    line2: str,
-    canvas_width: int = 1080,
-    canvas_height: int = 1920,
-) -> dict:
-    """Return the shared title geometry used by covers and exported video."""
-    scale = canvas_width / 1080
-    font_size = max(12, round(TITLE_FONT_SIZE_PX * scale))
-    stroke_width = max(2, round(8 * scale))
-    line_gap = max(8, round(30 * scale))
-    max_text_width = canvas_width - max(24, round(80 * scale))
-    measure = ImageDraw.Draw(Image.new("L", (1, 1)))
-
-    while True:
-        font = _find_chinese_font(font_size)
-        try:
-            font.set_variation_by_name("Heavy")
-        except (AttributeError, OSError):
-            pass
-        boxes = [
-            measure.textbbox((0, 0), line, font=font, stroke_width=stroke_width)
-            for line in (line1, line2)
-        ]
-        heights = [box[3] - box[1] for box in boxes]
-        widest_line = max((box[2] - box[0] for box in boxes), default=0)
-        if widest_line <= max_text_width or font_size <= 12:
-            break
-        font_size = max(12, font_size - max(1, round(4 * scale)))
-
-    total_height = sum(heights) + (line_gap if line1 and line2 else 0)
-    return {
-        "font": font,
-        "font_size": font_size,
-        "stroke_width": stroke_width,
-        "line_gap": line_gap,
-        "boxes": boxes,
-        "heights": heights,
-        "start_y": _cover_title_start_y(canvas_height, total_height),
-        "underline_width": max(3, round(font_size / 18)),
-        "underline_gap": max(3, round(font_size / 16)),
-    }
 
 
 def normalize_cover_title_positions(value: dict | None = None) -> dict:
@@ -634,90 +117,6 @@ def _draw_editable_cover_title(
             )
 
 
-def _draw_cover_title(
-    draw: ImageDraw.ImageDraw,
-    width: int,
-    height: int,
-    line1: str,
-    line2: str,
-    title_positions: dict | None = None,
-) -> None:
-    if title_positions is not None:
-        _draw_editable_cover_title(
-            draw,
-            width,
-            height,
-            line1,
-            line2,
-            normalize_cover_title_positions(title_positions),
-        )
-        return
-    layout = cover_title_layout(line1, line2, width, height)
-    font = layout["font"]
-    stroke_width = layout["stroke_width"]
-    y = layout["start_y"]
-    lines = (line1, line2)
-    for index, (line, box, line_height) in enumerate(zip(lines, layout["boxes"], layout["heights"])):
-        if not line:
-            continue
-        line_width = box[2] - box[0]
-        x = (width - line_width) // 2 - box[0]
-        fill = (255, 255, 255) if index == 0 else (255, 220, 0)
-        draw.text(
-            (x, y),
-            line,
-            font=font,
-            fill=fill,
-            stroke_width=stroke_width,
-            stroke_fill=(0, 0, 0),
-        )
-        if index == 1:
-            underline_y = y + box[3] + layout["underline_gap"]
-            draw.line(
-                (x + box[0], underline_y, x + box[2], underline_y),
-                fill=(0, 0, 0),
-                width=layout["underline_width"] + stroke_width * 2,
-            )
-            draw.line(
-                (x + box[0], underline_y, x + box[2], underline_y),
-                fill=fill,
-                width=layout["underline_width"],
-            )
-        y += line_height + (layout["line_gap"] if index == 0 and line2 else 0)
-
-
-def render_title_overlay(
-    path: Path,
-    line1: str,
-    line2: str,
-    width: int = 1080,
-    height: int = 1920,
-) -> None:
-    """Render the shared cover/video title style to a transparent PNG."""
-    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    _draw_cover_title(ImageDraw.Draw(overlay), width, height, line1, line2)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    overlay.save(path, format="PNG", optimize=True)
-
-
-def overlay_title_on_cover(cover_path: Path, line1: str, line2: str) -> None:
-    """Overlay two-line title text centered on the cover image."""
-    with Image.open(cover_path) as img:
-        img = img.convert("RGBA")
-        width, height = img.size
-
-        # Create a transparent overlay for text
-        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(overlay)
-
-        _draw_cover_title(draw, width, height, line1, line2)
-
-        result = Image.alpha_composite(img, overlay)
-        # Convert back to RGB for PNG save (preserve format)
-        result = result.convert("RGB")
-        result.save(cover_path, format="PNG", optimize=True)
-
-
 def compose_uploaded_cover(
     source_path: Path,
     cover_path: Path,
@@ -754,20 +153,17 @@ def compose_uploaded_cover(
         )
     draw = ImageDraw.Draw(canvas)
 
-    _draw_cover_title(draw, canvas_width, canvas_height, line1, line2, title_positions)
+    _draw_editable_cover_title(
+        draw,
+        canvas_width,
+        canvas_height,
+        line1,
+        line2,
+        normalize_cover_title_positions(title_positions),
+    )
 
     cover_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(cover_path, format="PNG", optimize=True)
-
-
-def write_silent_wav(path: Path, duration_sec: float) -> None:
-    frame_rate = 22050
-    frames = int(frame_rate * max(duration_sec, 1))
-    with wave.open(str(path), "w") as wav:
-        wav.setnchannels(1)
-        wav.setsampwidth(2)
-        wav.setframerate(frame_rate)
-        wav.writeframes(b"\x00\x00" * frames)
 
 
 def volc_tts_endpoint() -> str:
@@ -842,10 +238,6 @@ def extract_tts_response(body: bytes) -> dict:
     if not audio:
         raise RuntimeError(f"Volcengine TTS response does not contain audio data: {text[:500]}")
     return {"audio": bytes(audio), "sentences": sentences}
-
-
-def extract_audio_from_tts_response(body: bytes) -> bytes:
-    return extract_tts_response(body)["audio"]
 
 
 def read_tts_response(response) -> bytes:
@@ -1405,7 +797,7 @@ def narration_shot(project: dict) -> dict:
         script = stored.replace(PRODUCT_MARKER, "")
     else:
         script, _, _ = strip_product_marker(
-            str(project.get("rewritten_script") or project.get("raw_script") or "")
+            str(project.get("raw_script") or "")
         )
     timings = strip_marker_from_timings(
         project.get("narration_subtitle_timings") or []
@@ -1502,36 +894,3 @@ def generate_export_srt(shots: list[dict], max_hanzi: int = 6) -> str:
         end = format_srt_time(subtitle["end_time"])
         blocks.append(f"{idx}\n{start} --> {end}\n{subtitle['text']}")
     return "\n\n".join(blocks) + "\n"
-
-
-def generate_export_subtitle_txt(shots: list[dict], max_hanzi: int = 6) -> str:
-    lines = [
-        str(subtitle["text"]).replace("\r", "").replace("\n", "")
-        for subtitle in build_export_subtitles(shots, max_hanzi=max_hanzi)
-    ]
-    return "\n".join(lines) + ("\n" if lines else "")
-
-
-def generate_srt(shots: list[dict]) -> str:
-    blocks = []
-    for idx, shot in enumerate(shots, 1):
-        start = format_srt_time(float(shot.get("start_time", 0)))
-        end = format_srt_time(float(shot.get("end_time", 0)))
-        text = shot.get("voice_text", "")
-        blocks.append(f"{idx}\n{start} --> {end}\n{text}")
-    return "\n\n".join(blocks) + "\n"
-
-
-def write_timeline(path: Path, shots: list[dict]) -> None:
-    timeline = [
-        {
-            "shot_index": s.get("shot_index"),
-            "start_time": s.get("start_time"),
-            "end_time": s.get("end_time"),
-            "voice_text": s.get("voice_text"),
-            "asset_source": s.get("asset_source"),
-            "selected_asset_id": s.get("selected_asset_id"),
-        }
-        for s in shots
-    ]
-    path.write_text(json.dumps(timeline, ensure_ascii=False, indent=2), encoding="utf-8")

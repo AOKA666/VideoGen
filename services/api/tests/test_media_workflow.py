@@ -1,21 +1,19 @@
 ﻿from __future__ import annotations
 import io
-import json
 import random
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fastapi import HTTPException, UploadFile
 from PIL import Image
 from services import store
 from services.generation_service import build_export_subtitles
-from services.media_service import assemble_clips, media_command, probe_video, render_video
+from services.media_service import assemble_clips, media_command
 from routers import media
-from routers.projects import ProjectCreate, create_project, get_project
+from routers.projects import ProjectCreate, create_project
 
 
 def asset(identifier, duration):
@@ -112,44 +110,8 @@ class MediaIntegrationTests(unittest.TestCase):
         result=media.upload_template(UploadFile(file=content,filename='portrait.png'))
         self.assertTrue(Path(result['local_path']).is_file())
 
-    def test_generate_and_render_end_to_end_with_stub_voice(self):
-        uploaded = self.upload()
-        project = create_project(ProjectCreate(raw_script='测试视频拼接。', workflow_type='video_library'))['project']
-        def synthesize(path, shots, voice_type, speech_rate):
-            self.assertEqual(voice_type, 'S_6Sd6jOE42')
-            media_command(['ffmpeg','-y','-v','error','-f','lavfi','-i','sine=frequency=440:sample_rate=44100','-t','1.13',str(path)])
-            return {'duration_sec':1.13,'subtitle_timings':[{'text':'测试视频拼接','start_time':0,'end_time':1.13}]}
-        with patch.object(media,'synthesize_project_voice',side_effect=synthesize):
-            media.generate_worker(project['id'])
-        state = get_project(project['id'])
-        result = state['project']
-        # One click produces the finished MP4; the storyboard never surfaces as a separate step.
-        self.assertEqual(result['status'], 'video_done', result.get('generation_error'))
-        self.assertTrue(result['render_url'])
-        self.assertEqual(state['shots'][-1]['end_time'], 1.13)
-        with self.assertRaises(HTTPException): media.delete_video(uploaded['id'])
-        output = store.storage_dir() / result['render_url'].removeprefix('/storage/')
-        probe = probe_video(output)
-        self.assertEqual((probe['width'],probe['height']), (1080,1920))
-        self.assertLessEqual(abs(probe['duration_sec']-1.13), 1/30)
-        details = json.loads(media_command(['ffprobe','-v','error','-show_streams','-of','json',str(output)]))
-        self.assertEqual(sum(s['codec_type']=='audio' for s in details['streams']), 1)
-        screenshot = self.root / 'render-check.png'
-        media_command(['ffmpeg','-y','-v','error','-ss','0.2','-i',str(output),'-frames:v','1',str(screenshot)])
-        with Image.open(screenshot) as frame:
-            r,g,b=frame.getpixel((540,960)); self.assertGreater(r,200); self.assertLess(g,30)
-            r,g,b=frame.getpixel((540,100)); self.assertLess(r,30); self.assertGreater(g,30)
-            subtitle_pixels = sum(
-                1
-                for x in range(0, 1080, 2)
-                for y in range(1200, 1330, 2)
-                if all(channel > 220 for channel in frame.getpixel((x, y)))
-            )
-            self.assertGreater(subtitle_pixels, 100)
-
-    def test_uploaded_audio_skips_tts_and_renders(self):
-        self.upload()
-        project = create_project(ProjectCreate(raw_script='上传音频测试。', workflow_type='video_library'))['project']
+    def test_uploaded_audio_is_saved(self):
+        project = create_project(ProjectCreate(raw_script='上传音频测试。【带货开始】'))['project']
         path = self.root / 'voice.mp3'
         media_command(['ffmpeg','-y','-v','error','-f','lavfi','-i','sine=frequency=440:sample_rate=44100',
                        '-t','1.4','-q:a','4',str(path)])
@@ -159,22 +121,7 @@ class MediaIntegrationTests(unittest.TestCase):
         self.assertEqual(uploaded['audio_source'], 'upload')
         with self.assertRaises(HTTPException):
             media.upload_project_audio(project['id'], UploadFile(file=io.BytesIO(b'x'), filename='bad.txt'))
-        with patch.object(media, 'synthesize_project_voice', side_effect=AssertionError('TTS must be skipped')):
-            media.generate_worker(project['id'], 'upload')
-        state = get_project(project['id'])
-        result = state['project']
-        self.assertEqual(result['status'], 'video_done', result.get('generation_error'))
-        self.assertEqual(result['audio_source'], 'upload')
-        self.assertTrue(result['subtitle_url'])
-        self.assertTrue((store.storage_dir() / result['render_url'].removeprefix('/storage/')).is_file())
-
-    def test_empty_library_and_failed_voice_are_actionable(self):
-        project=create_project(ProjectCreate(raw_script='test',workflow_type='video_library'))['project']
-        with self.assertRaises(HTTPException): media.generate_video(project['id'])
-        self.upload()
-        with patch.object(media,'synthesize_project_voice',side_effect=RuntimeError('TTS unavailable')):
-            media.generate_worker(project['id'])
-        self.assertEqual(get_project(project['id'])['project']['status'],'video_failed')
+        self.assertTrue((store.project_dir(project['id']) / 'voice').is_dir())
 
 
 if __name__ == '__main__': unittest.main()

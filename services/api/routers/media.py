@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
 import shutil
-import threading
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -12,28 +10,15 @@ from pydantic import BaseModel, Field
 from PIL import Image, ImageOps
 
 from services.store import assets_dir, db_write_transaction, load_db, project_dir, public_url, save_db
-from services.generation_service import (
-    build_export_subtitles,
-    generate_export_srt,
-    strip_product_marker,
-    synthesize_project_voice,
-)
-from services.media_service import AUDIO_SUFFIXES, assemble_clips, probe_audio, probe_video, render_video
+from services.media_service import AUDIO_SUFFIXES, probe_audio, probe_video
 from services.product_placement_service import normalize_product_placement
 
 router = APIRouter(prefix="/api", tags=["media"])
-ACTIVE: set[str] = set()
-LOCK = threading.Lock()
-
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 PRODUCT_VIDEO_MAX_BYTES = 1024 * 1024 * 1024
 PRODUCT_IMAGE_MAX_BYTES = 20 * 1024 * 1024
 PRODUCT_IMAGE_MAX_PIXELS = 40_000_000
-
-
-class AssemblePayload(BaseModel):
-    audio_source: str | None = None
 
 
 class ProductPipBox(BaseModel):
@@ -54,6 +39,14 @@ class ProductPlacementPayload(BaseModel):
     items: list[ProductPlacementItem] = Field(default_factory=list)
     transition_sec: float = 0.5
     pip_box: ProductPipBox = Field(default_factory=ProductPipBox)
+
+
+class BulkAssetDeletePayload(BaseModel):
+    asset_ids: list[str] = Field(default_factory=list)
+
+
+def _dedupe_asset_ids(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(str(item).strip() for item in values if str(item).strip()))
 
 
 def templates() -> list[dict]:
@@ -129,7 +122,11 @@ def upload_video(file: UploadFile = File(...)):
 def delete_video(asset_id: str):
     with db_write_transaction():
         db = load_db()
-        if any(p.get("status") in {"video_generating", "video_rendering"} for p in db["projects"]):
+        if any(
+            p.get("workflow_type") == "video_library"
+            and p.get("status") in {"video_generating", "video_rendering"}
+            for p in db["projects"]
+        ):
             raise HTTPException(409, "正在生成视频，请完成后再删除素材")
         if any(s.get("selected_asset_id") == asset_id for s in db["shots"]):
             raise HTTPException(409, "素材已被项目使用，暂时不能删除")
@@ -142,6 +139,55 @@ def delete_video(asset_id: str):
         if target.is_relative_to((assets_dir() / "videos").resolve()):
             target.unlink(missing_ok=True)
     return {"status": "deleted"}
+
+
+@router.post("/media/videos/bulk-delete")
+def bulk_delete_videos(payload: BulkAssetDeletePayload):
+    asset_ids = _dedupe_asset_ids(payload.asset_ids)
+    if not asset_ids:
+        raise HTTPException(400, "请选择要删除的素材")
+
+    deleted: list[dict] = []
+    skipped: list[dict[str, str]] = []
+    with db_write_transaction():
+        db = load_db()
+        if any(
+            p.get("workflow_type") == "video_library"
+            and p.get("status") in {"video_generating", "video_rendering"}
+            for p in db["projects"]
+        ):
+            raise HTTPException(409, "正在生成视频，请完成后再删除素材")
+        used_ids = {
+            str(shot.get("selected_asset_id"))
+            for shot in db.get("shots", [])
+            if shot.get("selected_asset_id")
+        }
+        by_id = {item["id"]: item for item in db.get("video_library", [])}
+        for asset_id in asset_ids:
+            asset = by_id.get(asset_id)
+            if not asset:
+                skipped.append({"asset_id": asset_id, "reason": "素材不存在"})
+            elif asset_id in used_ids:
+                skipped.append({"asset_id": asset_id, "reason": "素材已被项目使用"})
+            else:
+                deleted.append(asset)
+        if deleted:
+            deleted_ids = {item["id"] for item in deleted}
+            db["video_library"] = [
+                item for item in db.get("video_library", []) if item["id"] not in deleted_ids
+            ]
+            save_db(db)
+
+    videos_root = (assets_dir() / "videos").resolve()
+    for asset in deleted:
+        target = Path(str(asset.get("local_path") or "")).resolve()
+        if target.is_relative_to(videos_root):
+            target.unlink(missing_ok=True)
+    return {
+        "status": "deleted",
+        "deleted_ids": [item["id"] for item in deleted],
+        "skipped": skipped,
+    }
 
 
 @router.post("/media/products")
@@ -235,6 +281,58 @@ def delete_product(asset_id: str):
     return {"status": "deleted"}
 
 
+@router.post("/media/products/bulk-delete")
+def bulk_delete_products(payload: BulkAssetDeletePayload):
+    asset_ids = _dedupe_asset_ids(payload.asset_ids)
+    if not asset_ids:
+        raise HTTPException(400, "请选择要删除的素材")
+
+    deleted: list[dict] = []
+    skipped: list[dict[str, str]] = []
+    with db_write_transaction():
+        db = load_db()
+        used_by_project = {
+            str(item.get("asset_id"))
+            for project in db.get("projects", [])
+            for item in ((project.get("product_placement") or {}).get("items") or [])
+            if item.get("asset_id")
+        }
+        used_by_preset = {
+            str(item.get("asset_id"))
+            for preset in db.get("product_placement_presets", [])
+            for item in (preset.get("items") or [])
+            if item.get("asset_id")
+        }
+        by_id = {item["id"]: item for item in db.get("product_library", [])}
+        for asset_id in asset_ids:
+            asset = by_id.get(asset_id)
+            if not asset:
+                skipped.append({"asset_id": asset_id, "reason": "带货素材不存在"})
+            elif asset_id in used_by_project:
+                skipped.append({"asset_id": asset_id, "reason": "带货素材已被项目使用"})
+            elif asset_id in used_by_preset:
+                skipped.append({"asset_id": asset_id, "reason": "带货素材已被带货预设使用"})
+            else:
+                deleted.append(asset)
+        if deleted:
+            deleted_ids = {item["id"] for item in deleted}
+            db["product_library"] = [
+                item for item in db.get("product_library", []) if item["id"] not in deleted_ids
+            ]
+            save_db(db)
+
+    products_root = (assets_dir() / "product_library").resolve()
+    for asset in deleted:
+        target = Path(str(asset.get("local_path") or "")).resolve()
+        if target.is_relative_to(products_root):
+            target.unlink(missing_ok=True)
+    return {
+        "status": "deleted",
+        "deleted_ids": [item["id"] for item in deleted],
+        "skipped": skipped,
+    }
+
+
 @router.patch("/projects/{project_id}/product-placement")
 def update_product_placement(project_id: str, payload: ProductPlacementPayload):
     db = load_db()
@@ -297,77 +395,11 @@ def update_project(project_id: str, values: dict):
         save_db(db)
 
 
-def generate_worker(project_id: str, audio_source: str = "tts"):
-    try:
-        db = load_db()
-        project = get_project(db, project_id)
-        assets = [a for a in db.get("video_library", []) if Path(a["local_path"]).is_file()]
-        base = project_dir(project_id)
-        voice_dir = base / "voice"
-        voice_dir.mkdir(exist_ok=True)
-        narration_script, _, _ = strip_product_marker(project["raw_script"])
-        voice_shot = {"id": "narration", "shot_index": 1, "voice_text": narration_script}
-        if audio_source == "upload":
-            audio = Path(project.get("uploaded_audio_path") or "")
-            if not audio.is_file():
-                raise ValueError("上传的音频文件不存在，请重新上传")
-            duration = float(project.get("uploaded_audio_duration_sec") or probe_audio(audio))
-            # Uploaded voiceovers have no word timestamps, so subtitles are weighted by text length.
-            result = {"duration_sec": duration, "subtitle_timings": [], "audio_format": audio.suffix.lstrip("."),
-                      "provider": "uploaded_audio", "voice_type": project.get("voice_type"),
-                      "timestamp_provider": "duration_weighted", "long_text_error": None}
-        else:
-            audio = voice_dir / (uuid4().hex + ".mp3")
-            result = synthesize_project_voice(audio, [voice_shot], project.get("voice_type"), project.get("speech_rate", 0))
-        shots = assemble_clips(assets, result["duration_sec"], project_id)
-        voice_shot.update({"start_time": 0, "end_time": result["duration_sec"],
-                           "subtitle_timings": result["subtitle_timings"]})
-        subtitle = voice_dir / (audio.stem + ".srt")
-        subtitle.write_text(generate_export_srt([voice_shot], max_hanzi=9), encoding="utf-8")
-        timeline = voice_dir / (audio.stem + ".json")
-        timeline.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
-        with db_write_transaction():
-            db = load_db()
-            p = get_project(db, project_id)
-            db["shots"] = [s for s in db["shots"] if s["project_id"] != project_id] + shots
-            p.update({"status": "video_ready", "audio_url": public_url(audio), "audio_path": str(audio),
-                      "audio_duration_sec": result["duration_sec"], "audio_source": audio_source,
-                      "voice_timeline_url": public_url(timeline),
-                      "subtitle_url": public_url(subtitle), "render_url": None, "generation_error": "",
-                      "updated_at": datetime.now().isoformat(timespec="seconds")})
-            save_db(db)
-        # One click from the script: voice, clip matching and the final MP4 all happen in this job.
-        update_project(project_id, {"status": "video_rendering"})
-        render_project(project_id)
-    except Exception as exc:
-        update_project(project_id, {"status": "video_failed", "generation_error": str(exc)})
-    finally:
-        with LOCK:
-            ACTIVE.discard(project_id)
-
-
-def start_job(project_id: str, worker, status: str):
-    with LOCK:
-        if project_id in ACTIVE:
-            raise HTTPException(409, "项目正在处理中，请稍候")
-        ACTIVE.add(project_id)
-    try:
-        update_project(project_id, {"status": status, "generation_error": "", "render_progress": None})
-        threading.Thread(target=worker, args=(project_id,), daemon=True).start()
-    except Exception:
-        with LOCK:
-            ACTIVE.discard(project_id)
-        raise
-    return {"status": status}
-
 
 @router.post("/projects/{project_id}/audio")
 def upload_project_audio(project_id: str, file: UploadFile = File(...)):
     db = load_db()
     project = get_project(db, project_id)
-    with LOCK:
-        if project_id in ACTIVE:
-            raise HTTPException(409, "项目正在处理中，请稍候")
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in AUDIO_SUFFIXES:
         raise HTTPException(400, "支持 MP3、WAV、M4A、AAC、OGG、FLAC、WMA 音频")
@@ -391,95 +423,3 @@ def upload_project_audio(project_id: str, file: UploadFile = File(...)):
         if isinstance(exc, HTTPException):
             raise
         raise HTTPException(400, f"音频上传失败：{exc}") from exc
-
-
-@router.post("/projects/{project_id}/assemble-video")
-def generate_video(project_id: str, payload: AssemblePayload | None = None):
-    db = load_db()
-    project = get_project(db, project_id)
-    if not project.get("raw_script", "").strip():
-        raise HTTPException(400, "请先输入文案")
-    audio_source = (payload.audio_source if payload else None) or project.get("audio_source") or "tts"
-    if audio_source not in {"tts", "upload"}:
-        raise HTTPException(400, "音频来源无效")
-    if audio_source == "upload" and not Path(project.get("uploaded_audio_path") or "").is_file():
-        raise HTTPException(400, "请先上传音频")
-    if not any(Path(a["local_path"]).is_file() for a in db.get("video_library", [])):
-        raise HTTPException(400, "请先到素材库上传视频")
-    if not any(t["id"] == project.get("background_template_id") for t in templates()):
-        raise HTTPException(400, "背景模板不存在")
-    update_project(project_id, {"audio_source": audio_source})
-    return start_job(project_id, lambda pid: generate_worker(pid, audio_source), "video_generating")
-
-
-@router.post("/projects/{project_id}/reshuffle-video")
-def reshuffle_video(project_id: str):
-    with LOCK, db_write_transaction():
-        if project_id in ACTIVE:
-            raise HTTPException(409, "项目正在处理中")
-        db = load_db()
-        p = get_project(db, project_id)
-        try:
-            shots = assemble_clips([a for a in db.get("video_library", []) if Path(a["local_path"]).is_file()],
-                                   float(p.get("audio_duration_sec") or 0), project_id)
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
-        db["shots"] = [s for s in db["shots"] if s["project_id"] != project_id] + shots
-        p.update({"render_url": None, "status": "video_ready", "updated_at": datetime.now().isoformat(timespec="seconds")})
-        save_db(db)
-    return {"shots": shots}
-
-
-def render_project(project_id: str):
-    db = load_db()
-    p = get_project(db, project_id)
-    shots = sorted([s for s in db["shots"] if s["project_id"] == project_id], key=lambda s: s["shot_index"])
-    template = next(t for t in templates() if t["id"] == p["background_template_id"])
-    target = project_dir(project_id) / "exports" / (uuid4().hex + ".mp4")
-    target.parent.mkdir(exist_ok=True)
-
-    def report(done: int, total: int):
-        try:
-            update_project(project_id, {"render_progress": {"done": done, "total": total}})
-        except Exception:
-            pass  # Progress is cosmetic; never fail the render because of it.
-
-    # Prefer the TTS word timestamps saved next to the audio; uploaded audio falls back to
-    # character-count weighting inside build_export_subtitles.
-    subtitle_timings = []
-    timeline = Path(p["audio_path"]).with_suffix(".json")
-    if timeline.is_file():
-        try:
-            subtitle_timings = json.loads(timeline.read_text(encoding="utf-8")).get("subtitle_timings") or []
-        except (OSError, ValueError):
-            subtitle_timings = []
-    narration_script, _, _ = strip_product_marker(p.get("raw_script", ""))
-    narration = {
-        "id": "narration", "shot_index": 1, "voice_text": narration_script,
-        "start_time": 0, "end_time": p["audio_duration_sec"], "subtitle_timings": subtitle_timings,
-    }
-    subtitles = build_export_subtitles([narration], max_hanzi=9)
-
-    render_video(shots, Path(p["audio_path"]), Path(template["local_path"]), target,
-                 p["audio_duration_sec"], progress=report, subtitles=subtitles)
-    update_project(project_id, {"status": "video_done", "render_url": public_url(target),
-                                "render_progress": None})
-
-
-def render_worker(project_id: str):
-    try:
-        render_project(project_id)
-    except Exception as exc:
-        update_project(project_id, {"status": "video_failed", "generation_error": str(exc)})
-    finally:
-        with LOCK:
-            ACTIVE.discard(project_id)
-
-
-@router.post("/projects/{project_id}/render-video")
-def export_video(project_id: str):
-    db = load_db()
-    p = get_project(db, project_id)
-    if not p.get("audio_path") or not any(s["project_id"] == project_id for s in db["shots"]):
-        raise HTTPException(400, "请先生成视频")
-    return start_job(project_id, render_worker, "video_rendering")

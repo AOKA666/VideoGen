@@ -22,8 +22,6 @@ COPY services/api /app/services/api
 COPY assets/template-daodejing.png /app/assets/template-daodejing.png
 COPY assets/DouyinSansBold.otf /app/assets/DouyinSansBold.otf
 COPY assets/龚帆怒放体.ttf /app/assets/龚帆怒放体.ttf
-COPY 二创提示词.txt /app/services/api/二创提示词.txt
-COPY 带书提示词.txt /app/services/api/带书提示词.txt
 
 RUN useradd --create-home --uid 10001 videogen \
     && mkdir -p /app/storage /app/services/api/logs \

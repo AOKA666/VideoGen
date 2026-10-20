@@ -2,15 +2,12 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import threading
 import time
 from contextlib import contextmanager
 from copy import deepcopy
-from datetime import datetime
 from pathlib import Path
 from typing import Any
-from uuid import uuid5, NAMESPACE_URL
 
 from services.settings_service import project_storage_directory
 
@@ -21,11 +18,7 @@ PROJECTS_DIR = STORAGE / "projects"
 DEFAULT_DB: dict[str, Any] = {
     "projects": [],
     "shots": [],
-    "generated_assets": [],
     "music_library": [],
-    "promotion_books": ["女性人物传记", "历史深处的民国", "国之脊梁"],
-    "promotion_books_catalog_initialized": True,
-    "ai_script_people_history": {},
     "video_library_presets": [],
     "product_library": [],
     "product_placement_presets": [],
@@ -34,8 +27,6 @@ _DB_LOCK = threading.RLock()
 _DB_CACHE: dict[str, Any] | None = None
 _DB_CACHE_MTIME_NS: int | None = None
 _STORAGE_INITIALIZED = False
-_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
-_SHOT_FILE_PATTERN = re.compile(r"^shot_(\d+)\.(?:png|jpe?g|webp)$", re.IGNORECASE)
 
 
 @contextmanager
@@ -82,79 +73,6 @@ def _current_storage_path(value: str | Path) -> Path:
     return relocated.resolve() if relocated.exists() else path
 
 
-def _recover_orphaned_generated_assets(data: dict[str, Any]) -> bool:
-    known_projects = {item.get("id") for item in data.get("projects", [])}
-    known_paths = {
-        str(_current_storage_path(item["local_path"])).lower()
-        for item in data.get("generated_assets", [])
-        if item.get("local_path")
-    }
-    shots_by_project_index = {
-        (shot.get("project_id"), int(shot.get("shot_index", 0))): shot
-        for shot in data.get("shots", [])
-        if shot.get("project_id") and shot.get("shot_index")
-    }
-    recovered_by_shot: dict[str, list[dict[str, Any]]] = {}
-    now = datetime.now().isoformat(timespec="seconds")
-
-    for project_id in known_projects:
-        images_dir = PROJECTS_DIR / str(project_id) / "images"
-        if not images_dir.exists():
-            continue
-        for path in sorted(images_dir.rglob("*")):
-            if not path.is_file() or path.suffix.lower() not in _IMAGE_SUFFIXES:
-                continue
-            resolved = path.resolve()
-            if str(resolved).lower() in known_paths:
-                continue
-            shot_index = None
-            file_match = _SHOT_FILE_PATTERN.match(path.name)
-            if path.parent == images_dir and file_match:
-                shot_index = int(file_match.group(1))
-            if shot_index is None:
-                continue
-            shot = shots_by_project_index.get((project_id, shot_index))
-            if not shot:
-                continue
-            asset_id = str(uuid5(NAMESPACE_URL, resolved.as_posix().lower()))
-            asset = {
-                "id": asset_id,
-                "project_id": project_id,
-                "shot_id": shot["id"],
-                "type": "image",
-                "file_type": "image",
-                "file_name": path.name,
-                "asset_source": "ai_generated",
-                "provider": "recovered_local_file",
-                "file_size": path.stat().st_size,
-                "file_url": public_url(resolved),
-                "local_path": str(resolved),
-                "status": "success",
-                "created_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
-                "recovered_at": now,
-            }
-            data.setdefault("generated_assets", []).append(asset)
-            known_paths.add(str(resolved).lower())
-            recovered_by_shot.setdefault(shot["id"], []).append(asset)
-
-    if not recovered_by_shot:
-        return False
-
-    valid_asset_ids = {item.get("id") for item in data.get("generated_assets", [])}
-    for shot in data.get("shots", []):
-        recovered = recovered_by_shot.get(shot.get("id"))
-        if not recovered:
-            continue
-        if shot.get("selected_asset_id") not in valid_asset_ids:
-            preferred = recovered[0]
-            shot["selected_asset_id"] = preferred["id"]
-            shot["asset_source"] = preferred["asset_source"]
-        shot["downloaded_image_count"] = len(recovered)
-        shot["status"] = "ai_generated"
-        shot["updated_at"] = now
-    return True
-
-
 def ensure_storage() -> None:
     global _STORAGE_INITIALIZED
     with _DB_LOCK:
@@ -172,20 +90,6 @@ def ensure_storage() -> None:
             if key not in data:
                 data[key] = default
                 changed = True
-        for project in data.get("projects", []):
-            if project.get("status") in {"video_generating", "video_rendering"}:
-                project.update({"status": "video_failed", "generation_error": "服务重启中断了任务，请重新生成或合成视频"})
-                changed = True
-        for asset in data.get("generated_assets", []):
-            local_path = asset.get("local_path")
-            if not local_path:
-                continue
-            current_path = _current_storage_path(local_path)
-            if not current_path.exists() or str(current_path) == str(local_path):
-                continue
-            asset["local_path"] = str(current_path)
-            asset["file_url"] = public_url(current_path)
-            changed = True
         for library_key in ("product_library", "music_library", "video_library", "video_templates"):
             for item in data.get(library_key, []):
                 local_path = str(item.get("local_path") or "")
@@ -209,31 +113,6 @@ def ensure_storage() -> None:
                 preset["cover_source_path"] = str(current_cover)
                 preset["cover_source_url"] = public_url(current_cover)
                 changed = True
-        stale_asset_ids = {
-            item.get("id")
-            for item in data.get("generated_assets", [])
-            if item.get("local_path") and not _current_storage_path(str(item["local_path"])).exists()
-        }
-        if stale_asset_ids:
-            data["generated_assets"] = [
-                item for item in data.get("generated_assets", [])
-                if item.get("id") not in stale_asset_ids
-            ]
-            remaining_by_shot = {
-                item.get("shot_id")
-                for item in data.get("generated_assets", [])
-                if item.get("shot_id")
-            }
-            for shot in data.get("shots", []):
-                if shot.get("status") != "ai_generated" or shot.get("id") in remaining_by_shot:
-                    continue
-                shot["status"] = "no_image"
-                shot["selected_asset_id"] = None
-                shot["asset_source"] = None
-                shot["downloaded_image_count"] = 0
-            changed = True
-        if _recover_orphaned_generated_assets(data):
-            changed = True
         if changed:
             save_db(data)
         _STORAGE_INITIALIZED = True

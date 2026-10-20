@@ -73,11 +73,6 @@ def _find_title_font() -> tuple[str, str]:
     return _find_subtitle_font()
 
 
-def _find_preferred_font() -> tuple[str, str]:
-    """Backward-compatible alias for the configured subtitle font."""
-    return _find_subtitle_font()
-
-
 def _shot_duration(shot: dict[str, Any]) -> float:
     start = float(shot.get("start_time") or 0)
     end = float(shot.get("end_time") or 0)
@@ -424,9 +419,6 @@ def create_jianying_native_draft(
     music_crossfade_sec: float = 1.0,
     voice_volume: float = 1.0,
     background_template_path: Path | None = None,
-    scene_media: str = "image",
-    copy_scenes: bool = True,
-    animate_scenes: bool = True,
     clip_window: tuple[int, int, int, int] | None = None,
     subtitle_transform_y: float = -0.43,
     product_placement: dict[str, Any] | None = None,
@@ -452,14 +444,7 @@ def create_jianying_native_draft(
     audio_dir = materials_dir / "audio"
     image_dir.mkdir(parents=True, exist_ok=True)
     audio_dir.mkdir(parents=True, exist_ok=True)
-    local_scenes = []
-    for path in scene_paths:
-        if copy_scenes:
-            target = image_dir / path.name
-            shutil.copy2(path, target)
-        else:
-            target = path
-        local_scenes.append(target)
+    local_scenes = list(scene_paths)
     local_audio = audio_dir / audio_path.name
     shutil.copy2(audio_path, local_audio)
     local_music = None
@@ -491,7 +476,6 @@ def create_jianying_native_draft(
         draft.TrackType.video, clip_track,
         relative_index=clip_relative_index,
     )
-    zoom_animation = getattr(draft.GroupAnimationType, "\u7f29\u653e")
     for (start_sec, duration_sec), scene_path in zip(display_ranges, local_scenes):
         start_us = round(start_sec * 1_000_000)
         material = draft.VideoMaterial(str(scene_path))
@@ -509,8 +493,6 @@ def create_jianying_native_draft(
             volume=0,
             clip_settings=clip_settings,
         )
-        if animate_scenes:
-            segment.add_animation(zoom_animation, duration=duration_us)
         script.add_segment(segment, clip_track)
 
     product_report = _add_product_placement_track(
@@ -654,12 +636,9 @@ def create_jianying_native_draft(
         "file_count": sum(1 for item in draft_path.rglob("*") if item.is_file()),
         "cover": cover_report,
         "background_music": bool(local_music),
-        "scene_media": scene_media,
         "clip_window": clip_window,
         "clip_scale_mode": (
             "canvas_fit" if JIANYING_SCALE_RELATIVE_TO_CANVAS_FIT else "native_pixels"
         ),
-        "copied_scenes": copy_scenes,
-        "animated_scenes": animate_scenes,
         "product_placement": product_report,
     }

@@ -1,4 +1,4 @@
-﻿import React, { useState } from 'react';
+﻿import React, { useEffect, useRef, useState } from 'react';
 import { ProductLibrary } from './ProductWorkflow';
 
 const API = import.meta.env.VITE_API_URL ?? (import.meta.env.DEV ? 'http://127.0.0.1:8000' : '');
@@ -55,6 +55,24 @@ export function MediaLibrary({
 function NormalMediaLibrary({ media, reload, onError }) {
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState('');
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+  const selectAllRef = useRef(null);
+  const videos = media.videos || [];
+  const allSelected = videos.length > 0 && selectedIds.size === videos.length;
+  const partiallySelected = selectedIds.size > 0 && !allSelected;
+
+  useEffect(() => {
+    if (!media.videos) return;
+    setSelectedIds(current => new Set(
+      [...current].filter(id => media.videos.some(item => item.id === id)),
+    ));
+  }, [media.videos]);
+
+  useEffect(() => {
+    if (selectAllRef.current) selectAllRef.current.indeterminate = partiallySelected;
+  }, [partiallySelected]);
+
   async function upload(files) {
     setUploading(true);
     const failures = [];
@@ -68,20 +86,102 @@ function NormalMediaLibrary({ media, reload, onError }) {
     setUploading(false); setProgress('');
     if (failures.length) onError(failures.join('；'));
   }
+
+  function toggleSelected(id) {
+    setSelectedIds(current => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleAll() {
+    setSelectedIds(allSelected ? new Set() : new Set(videos.map(item => item.id)));
+  }
+
+  async function removeOne(item) {
+    if (!window.confirm(`删除素材「${item.file_name}」？`)) return;
+    try {
+      await api(`/api/media/videos/${item.id}`, { method: 'DELETE' });
+      setSelectedIds(current => {
+        const next = new Set(current);
+        next.delete(item.id);
+        return next;
+      });
+      await reload();
+    } catch (error) {
+      onError(error.message);
+    }
+  }
+
+  async function bulkDelete() {
+    const ids = [...selectedIds];
+    if (!ids.length || bulkDeleting) return;
+    if (!window.confirm(`删除选中的 ${ids.length} 个素材？已被项目使用的素材会跳过。`)) return;
+    setBulkDeleting(true);
+    try {
+      const result = await api('/api/media/videos/bulk-delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ asset_ids: ids }),
+      });
+      setSelectedIds(new Set());
+      await reload();
+      if (result.skipped?.length) {
+        const detail = result.skipped
+          .map(item => `${videos.find(video => video.id === item.asset_id)?.file_name || item.asset_id}：${item.reason}`)
+          .join('；');
+        onError(`已删除 ${result.deleted_ids?.length || 0} 个素材；${result.skipped.length} 个未删除（${detail}）`);
+      }
+    } catch (error) {
+      onError(error.message);
+    } finally {
+      setBulkDeleting(false);
+    }
+  }
+
   return <>
     <div className="media-heading"><div><h2>普通素材</h2><p>上传后自动读取时长，所有项目都可以随机取用这些视频作为主画面。</p></div>
       <label className="media-upload">{uploading ? '上传中…' : '上传视频'}<input aria-label="上传视频" type="file" accept=".mp4,.mov,.mkv,.webm,.avi,.m4v" multiple disabled={uploading} onChange={event => { upload(event.target.files); event.target.value = ''; }} /></label>
     </div>
-    <p>{media.videos.length} 个素材 · 总时长 {seconds(media.videos.reduce((sum, item) => sum + item.duration_sec, 0))} · 单个文件最大 1 GB</p>
+    <p>{videos.length} 个素材 · 总时长 {seconds(videos.reduce((sum, item) => sum + item.duration_sec, 0))} · 单个文件最大 1 GB</p>
     {progress && <p role="status">{progress}</p>}
-    {!media.videos.length && <div className="media-empty">还没有普通素材。上传视频后，即可按配音时长自动拼接主画面。</div>}
-    <div className="media-grid">{media.videos.map(item => <article className="media-card" key={item.id}>
+    {!!videos.length && <div className="media-batch-bar">
+      <label>
+        <input
+          ref={selectAllRef}
+          type="checkbox"
+          checked={allSelected}
+          disabled={uploading || bulkDeleting}
+          onChange={toggleAll}
+        />
+        全选
+      </label>
+      <span>已选 {selectedIds.size} / {videos.length}</span>
+      <button
+        type="button"
+        className="danger"
+        disabled={!selectedIds.size || uploading || bulkDeleting}
+        onClick={bulkDelete}
+      >
+        {bulkDeleting ? '删除中…' : `删除选中（${selectedIds.size}）`}
+      </button>
+    </div>}
+    {!videos.length && <div className="media-empty">还没有普通素材。上传视频后，即可按配音时长自动拼接主画面。</div>}
+    <div className="media-grid">{videos.map(item => <article className={selectedIds.has(item.id) ? 'media-card selected' : 'media-card'} key={item.id}>
+      <label className="media-select">
+        <input
+          type="checkbox"
+          checked={selectedIds.has(item.id)}
+          disabled={uploading || bulkDeleting}
+          onChange={() => toggleSelected(item.id)}
+          aria-label={`选择素材 ${item.file_name}`}
+        />
+        选择
+      </label>
       <video controls preload="metadata" src={`${API}${item.file_url}`} />
       <strong title={item.file_name}>{item.file_name}</strong><p>{seconds(item.duration_sec)} · {item.width} × {item.height}</p>
-      <button disabled={uploading} onClick={async () => {
-        if (!window.confirm(`删除素材「${item.file_name}」？`)) return;
-        try { await api(`/api/media/videos/${item.id}`, { method: 'DELETE' }); await reload(); } catch (error) { onError(error.message); }
-      }}>删除素材</button>
+      <button disabled={uploading || bulkDeleting} onClick={() => removeOne(item)}>删除素材</button>
     </article>)}</div>
   </>;
 }

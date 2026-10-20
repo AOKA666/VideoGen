@@ -161,7 +161,7 @@ class PresetTests(unittest.TestCase):
     def test_generate_cover_can_reuse_preset_image(self):
         preset = video_library.upsert_preset(**preset_form(file=image_upload("purple")))["preset"]
         project = create_project(
-            ProjectCreate(raw_script="测试文案。", workflow_type="video_library"),
+            ProjectCreate(raw_script="测试文案。【带货开始】", workflow_type="video_library"),
         )["project"]
         with store.db_write_transaction():
             db = store.load_db()
@@ -185,7 +185,7 @@ class PresetTests(unittest.TestCase):
 
     def test_generate_cover_rejects_unknown_preset(self):
         project = create_project(
-            ProjectCreate(raw_script="测试文案。", workflow_type="video_library"),
+            ProjectCreate(raw_script="测试文案。【带货开始】", workflow_type="video_library"),
         )["project"]
         with store.db_write_transaction():
             db = store.load_db()

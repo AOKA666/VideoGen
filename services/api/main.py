@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from routers import export, generation, music, projects, settings, shots, system, media, video_library
+from routers import export, generation, music, projects, settings, media, video_library
 from services.env import load_env_local
 from services import store
 
@@ -13,7 +13,7 @@ load_env_local()
 store.ensure_storage()
 
 # Bump when routes change so start-local.ps1 does not reuse an outdated backend process.
-API_VERSION = 16
+API_VERSION = 20
 
 app = FastAPI(title="AI Video Draft API")
 
@@ -26,11 +26,9 @@ app.add_middleware(
 )
 
 app.include_router(projects.router)
-app.include_router(shots.router)
 app.include_router(generation.router)
 app.include_router(music.router)
 app.include_router(export.router)
-app.include_router(system.router)
 app.include_router(settings.router)
 app.include_router(media.router)
 app.include_router(video_library.router)

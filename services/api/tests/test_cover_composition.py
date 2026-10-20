@@ -12,7 +12,6 @@ API_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(API_ROOT))
 
 from services.generation_service import (  # noqa: E402
-    _cover_title_start_y,
     compose_uploaded_cover,
     normalize_cover_title_positions,
 )
@@ -50,14 +49,6 @@ class CoverCompositionTests(unittest.TestCase):
                 self.assertLess(min(white_rows), min(yellow_rows))
                 self.assertGreater(max(yellow_rows.values()), 150)
 
-    def test_title_center_is_mirrored_across_the_canvas_center(self) -> None:
-        total_height = 220
-        top_start = _cover_title_start_y(1920, total_height)
-        top_center = top_start + total_height / 2
-        former_bottom_center = 1511
-        self.assertEqual(1920, top_center + former_bottom_center)
-        self.assertLess(top_center, 960)
-
     def test_each_title_line_accepts_an_independent_position_and_size(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -92,7 +83,7 @@ class CoverCompositionTests(unittest.TestCase):
             "line1": {"x": -2, "y": 4, "font_size": 900},
         })
         self.assertEqual({"x": 0.03, "y": 0.97, "font_size": 260}, positions["line1"])
-        self.assertEqual(80, positions["line2"]["font_size"])
+        self.assertEqual(100, positions["line2"]["font_size"])
 
     def test_cover_applies_black_mask_below_title(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

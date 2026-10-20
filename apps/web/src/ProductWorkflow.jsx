@@ -28,6 +28,23 @@ function normalizePipBox(value) {
 export function ProductLibrary({ media, reload, onError, project, projectId, busy, onProjectRefresh }) {
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState('');
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+  const selectAllRef = useRef(null);
+  const products = media.products || [];
+  const allSelected = products.length > 0 && selectedIds.size === products.length;
+  const partiallySelected = selectedIds.size > 0 && !allSelected;
+
+  useEffect(() => {
+    if (!media.products) return;
+    setSelectedIds(current => new Set(
+      [...current].filter(id => media.products.some(item => item.id === id)),
+    ));
+  }, [media.products]);
+
+  useEffect(() => {
+    if (selectAllRef.current) selectAllRef.current.indeterminate = partiallySelected;
+  }, [partiallySelected]);
 
   async function upload(files) {
     setUploading(true);
@@ -45,17 +62,59 @@ export function ProductLibrary({ media, reload, onError, project, projectId, bus
     if (failures.length) onError(failures.join('；'));
   }
 
+  function toggleSelected(id) {
+    setSelectedIds(current => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleAll() {
+    setSelectedIds(allSelected ? new Set() : new Set(products.map(item => item.id)));
+  }
+
   async function remove(asset) {
     if (!window.confirm(`删除带货素材「${asset.file_name}」？`)) return;
     try {
       await api(`/api/media/products/${asset.id}`, { method: 'DELETE' });
+      setSelectedIds(current => {
+        const next = new Set(current);
+        next.delete(asset.id);
+        return next;
+      });
       await reload();
     } catch (error) {
       onError(error.message);
     }
   }
 
-  const products = media.products || [];
+  async function bulkDelete() {
+    const ids = [...selectedIds];
+    if (!ids.length || bulkDeleting) return;
+    if (!window.confirm(`删除选中的 ${ids.length} 个带货素材？已被项目或预设使用的素材会跳过。`)) return;
+    setBulkDeleting(true);
+    try {
+      const result = await api('/api/media/products/bulk-delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ asset_ids: ids }),
+      });
+      setSelectedIds(new Set());
+      await reload();
+      if (result.skipped?.length) {
+        const detail = result.skipped
+          .map(item => `${products.find(asset => asset.id === item.asset_id)?.file_name || item.asset_id}：${item.reason}`)
+          .join('；');
+        onError(`已删除 ${result.deleted_ids?.length || 0} 个素材；${result.skipped.length} 个未删除（${detail}）`);
+      }
+    } catch (error) {
+      onError(error.message);
+    } finally {
+      setBulkDeleting(false);
+    }
+  }
+
   return <>
     <div className="media-heading">
       <div>
@@ -75,11 +134,42 @@ export function ProductLibrary({ media, reload, onError, project, projectId, bus
     </div>
     <p>{products.length} 个带货素材 · 支持视频和图片 · 视频最大 1 GB，图片最大 20 MB</p>
     {progress && <p role="status">{progress}</p>}
+    {!!products.length && <div className="media-batch-bar">
+      <label>
+        <input
+          ref={selectAllRef}
+          type="checkbox"
+          checked={allSelected}
+          disabled={uploading || bulkDeleting}
+          onChange={toggleAll}
+        />
+        全选
+      </label>
+      <span>已选 {selectedIds.size} / {products.length}</span>
+      <button
+        type="button"
+        className="danger"
+        disabled={!selectedIds.size || uploading || bulkDeleting}
+        onClick={bulkDelete}
+      >
+        {bulkDeleting ? '删除中…' : `删除选中（${selectedIds.size}）`}
+      </button>
+    </div>}
     {!products.length && (
       <div className="media-empty">还没有带货素材。上传短视频或图片后，在下方配置画中画。</div>
     )}
     <div className="media-grid product-grid">
-      {products.map(item => <article className="media-card product-card" key={item.id}>
+      {products.map(item => <article className={selectedIds.has(item.id) ? 'media-card product-card selected' : 'media-card product-card'} key={item.id}>
+        <label className="media-select">
+          <input
+            type="checkbox"
+            checked={selectedIds.has(item.id)}
+            disabled={uploading || bulkDeleting}
+            onChange={() => toggleSelected(item.id)}
+            aria-label={`选择带货素材 ${item.file_name}`}
+          />
+          选择
+        </label>
         {item.media_type === 'image'
           ? <img src={`${API}${item.file_url}`} alt={item.file_name} />
           : <video controls preload="metadata" muted src={`${API}${item.file_url}`} />}
@@ -87,7 +177,7 @@ export function ProductLibrary({ media, reload, onError, project, projectId, bus
         <p>{item.media_type === 'image'
           ? `图片 · ${item.width} × ${item.height}`
           : `${seconds(item.duration_sec)} · ${item.width} × ${item.height}`}</p>
-        <button type="button" disabled={uploading} onClick={() => remove(item)}>删除素材</button>
+        <button type="button" disabled={uploading || bulkDeleting} onClick={() => remove(item)}>删除素材</button>
       </article>)}
     </div>
     {project?.workflow_type === 'video_library' ? (

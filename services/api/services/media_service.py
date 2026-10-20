@@ -6,8 +6,6 @@ import os
 import random
 import shutil
 import subprocess
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4
 
@@ -21,53 +19,6 @@ def media_command(args: list[str], timeout: int = 180) -> str:
 
 AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".wma"}
 
-SUBTITLE_FONT_NAME = "Douyin Sans"
-SUBTITLE_FONT_SIZE = 72
-SUBTITLE_OUTLINE = 5
-SUBTITLE_MARGIN_V = 610  # Text bottom sits at y=1310, near the bottom of the 1080x742 window.
-SUBTITLE_FONT_DIR = Path(__file__).resolve().parents[3] / "assets"
-SUBTITLE_ASS_HEADER = f"""[Script Info]
-ScriptType: v4.00+
-PlayResX: 1080
-PlayResY: 1920
-WrapStyle: 0
-ScaledBorderAndShadow: yes
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{SUBTITLE_FONT_NAME},{SUBTITLE_FONT_SIZE},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,{SUBTITLE_OUTLINE},0,2,60,60,{SUBTITLE_MARGIN_V},1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
-
-
-def _ass_time(seconds: float) -> str:
-    centiseconds = max(0, int(round(seconds * 100)))
-    hours, centiseconds = divmod(centiseconds, 360_000)
-    minutes, centiseconds = divmod(centiseconds, 6_000)
-    secs, centiseconds = divmod(centiseconds, 100)
-    return f"{hours}:{minutes:02d}:{secs:02d}.{centiseconds:02d}"
-
-
-def _filter_path(path: Path) -> str:
-    return str(path).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
-
-
-def build_segment_ass(subtitles: list[dict], start: float, end: float) -> str | None:
-    """Render subtitles overlapping this shot with timestamps relative to the shot start."""
-    lines = []
-    for subtitle in subtitles:
-        subtitle_start = max(float(subtitle.get("start_time") or 0), start)
-        subtitle_end = min(float(subtitle.get("end_time") or 0), end)
-        text = str(subtitle.get("text") or "").strip()
-        if not text or subtitle_end - subtitle_start < 0.02:
-            continue
-        lines.append(
-            f"Dialogue: 0,{_ass_time(subtitle_start - start)},{_ass_time(subtitle_end - start)},"
-            f"Default,,0,0,0,,{text}"
-        )
-    return SUBTITLE_ASS_HEADER + "\n".join(lines) + "\n" if lines else None
 
 
 def probe_audio(path: Path) -> float:
@@ -134,67 +85,3 @@ def assemble_clips(assets: list[dict], duration: float, project_id: str) -> list
         })
         cursor += used
     return shots
-
-
-def render_video(shots: list[dict], audio: Path, background: Path, target: Path, duration: float,
-                 progress=None, subtitles: list[dict] | None = None) -> None:
-    """Center an aspect-preserving video inside the template's middle white window."""
-    work = target.parent / ("render_" + uuid4().hex)
-    work.mkdir(parents=True)
-    try:
-        # The reference window is y=626..1418 on a 1152x2048 canvas.
-        base_graph = (
-            "[0:v]scale=1080:1920,setsar=1[bg];"
-            "[1:v]setpts=PTS-STARTPTS,scale=1080:742:force_original_aspect_ratio=decrease:force_divisible_by=2,"
-            "setsar=1,tpad=stop_mode=clone:stop_duration=1[clip];[bg][clip]overlay=(W-w)/2:(H-h)/2:shortest=1,format=yuv420p"
-        )
-        jobs = []
-        for shot in shots:
-            frame_count = round(shot["end_time"] * 30) - round(shot["start_time"] * 30)
-            if frame_count > 0:
-                jobs.append((len(jobs), shot, frame_count))
-        if not jobs:
-            raise ValueError("没有可合成的视频片段")
-
-        completed = {"count": 0}
-        progress_lock = threading.Lock()
-
-        def encode(job):
-            index, shot, frame_count = job
-            segment = work / f"clip_{index:05d}.mp4"
-            # Pad the last shot by one second so the final audio-length trim always has frames to cut.
-            frames = frame_count + 30 if index == len(jobs) - 1 else frame_count
-            graph = base_graph
-            ass_file = None
-            if subtitles:
-                document = build_segment_ass(subtitles, shot["start_time"], shot["end_time"])
-                if document:
-                    ass_file = work / f"subs_{index:05d}.ass"
-                    ass_file.write_text(document, encoding="utf-8")
-                    graph += (f",ass=filename='{_filter_path(ass_file)}'"
-                              f":fontsdir='{_filter_path(SUBTITLE_FONT_DIR)}'")
-            graph += "[v]"
-            media_command(["ffmpeg", "-y", "-v", "error", "-loop", "1", "-i", str(background),
-                           "-ss", str(shot.get("source_start_sec", 0)), "-i", shot["local_path"],
-                           "-filter_complex", graph, "-map", "[v]", "-an", "-frames:v", str(frames),
-                           "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-bf", "0",
-                           str(segment)], timeout=3600)
-            if progress:
-                with progress_lock:
-                    completed["count"] += 1
-                    done = completed["count"]
-                progress(done, len(jobs))
-            return segment
-
-        # Encode shots in parallel: clips are independent, so this is the main speedup on longer scripts.
-        workers = max(1, min(4, (os.cpu_count() or 2) // 2))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            segments = list(pool.map(encode, jobs))
-        concat = work / "clips.txt"
-        concat.write_text("\n".join(f"file '{p.name}'" for p in segments), encoding="utf-8")
-        # Stream-copy the join (all segments share encoder settings) and add audio in one pass.
-        media_command(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(concat),
-                       "-i", str(audio), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
-                       "-t", str(duration), "-movflags", "+faststart", str(target)], timeout=7200)
-    finally:
-        shutil.rmtree(work, ignore_errors=True)

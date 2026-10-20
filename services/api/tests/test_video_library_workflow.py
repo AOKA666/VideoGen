@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from fastapi import UploadFile
+from fastapi import HTTPException, UploadFile
 
 from routers import export, generation, media
 from routers.projects import BulkDeletePayload, ProjectCreate, bulk_delete_projects, create_project
@@ -56,8 +56,14 @@ class VideoLibraryWorkflowTests(unittest.TestCase):
 
     def create_video_project(self):
         return create_project(
-            ProjectCreate(raw_script="真正厉害的人往往懂得沉默。", workflow_type="video_library")
+            ProjectCreate(raw_script="真正厉害的人往往懂得沉默。【带货开始】", workflow_type="video_library")
         )["project"]
+
+    def test_create_project_requires_product_marker(self):
+        with self.assertRaises(HTTPException) as error:
+            create_project(ProjectCreate(raw_script="没有带货开始标记。", workflow_type="video_library"))
+        self.assertEqual(400, error.exception.status_code)
+        self.assertIn("【带货开始】", error.exception.detail)
 
     def test_voice_generation_narrates_script_and_matches_clips(self):
         self.upload_video()
@@ -136,7 +142,7 @@ class VideoLibraryWorkflowTests(unittest.TestCase):
 
     def test_bulk_delete_removes_selected_projects_and_folders(self):
         ids = [
-            create_project(ProjectCreate(raw_script=f"批量删除测试{i}。", workflow_type="video_library"))["project"]["id"]
+            create_project(ProjectCreate(raw_script=f"批量删除测试{i}。【带货开始】", workflow_type="video_library"))["project"]["id"]
             for i in range(3)
         ]
         with store.db_write_transaction():
@@ -202,9 +208,6 @@ class VideoLibraryWorkflowTests(unittest.TestCase):
         with patch.object(export, "create_jianying_native_draft", side_effect=fake_draft):
             report = export.export_package(project["id"])
 
-        self.assertEqual(captured["kwargs"]["scene_media"], "video")
-        self.assertFalse(captured["kwargs"]["copy_scenes"])
-        self.assertFalse(captured["kwargs"]["animate_scenes"])
         self.assertEqual(captured["kwargs"]["clip_window"], (0, 589, 1080, 742))
         self.assertAlmostEqual(captured["kwargs"]["subtitle_transform_y"], -0.2292, places=3)
         self.assertTrue(captured["kwargs"]["background_template_path"].is_file())
@@ -244,13 +247,13 @@ class JianyingVideoDraftTests(unittest.TestCase):
             shots = [{"shot_index": 1, "start_time": 0, "end_time": 1.13, "duration_sec": 1.13}]
             (root / "drafts").mkdir()
             with patch.object(video_export_service, "jianying_drafts_root", return_value=root / "drafts"):
-                for mode, scene in [("image", picture), ("video", video)]:
+                for mode, scene in [("video", video)]:
                     previous_id = None
                     for attempt in range(2):
                         with self.subTest(mode=mode, attempt=attempt):
                             report = video_export_service.create_jianying_native_draft(
                                 root / "package", f"cover_{mode}", shots, [scene], audio, srt,
-                                cover_path=cover, scene_media=mode, animate_scenes=False,
+                                cover_path=cover,
                             )
                             live = Path(report["draft_path"])
                             self.assertNotEqual(previous_id, report["cover"]["cover_draft_id"])
@@ -340,7 +343,6 @@ class JianyingVideoDraftTests(unittest.TestCase):
                     root / "package", "layout_test", shots, [clip, clip], audio, srt,
                     title_line1="标题一", title_line2="标题二",
                     background_template_path=template,
-                    scene_media="video", copy_scenes=False, animate_scenes=False,
                     clip_window=(0, 589, 1080, 742),
                     subtitle_transform_y=video_export_service._transform_y_for_visual_y(1180),
                 )

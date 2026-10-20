@@ -16,7 +16,11 @@ from routers.generation import VoiceSettingsPayload, update_voice_settings  # no
 class VoiceVolumeGainTests(unittest.TestCase):
     def test_voice_settings_accept_gain_above_one_and_cap_it_at_three(self) -> None:
         state = {
-            "projects": [{"id": "project-1", "audio_url": "/audio/voice.mp3"}],
+            "projects": [{
+                "id": "project-1",
+                "workflow_type": "video_library",
+                "audio_url": "/audio/voice.mp3",
+            }],
         }
 
         def fake_load_db():

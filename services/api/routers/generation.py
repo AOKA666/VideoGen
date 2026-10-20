@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import shutil
@@ -8,47 +7,30 @@ import threading
 from io import BytesIO
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote
-from uuid import uuid4
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
-from PIL import Image, ImageOps
 from pydantic import BaseModel
 
 from services.generation_service import (
     VIDEO_LIBRARY_SUBTITLE_MAX_HANZI,
     audio_duration,
-    build_image_prompt,
     compose_uploaded_cover,
-    generate_ai_image,
-    normalize_image_generation_provider,
-    generated_image_extension,
     generate_export_srt,
     marker_start_sec,
     narration_shot,
-    remove_watermark_with_seedream,
     strip_product_marker,
     synthesize_volcengine_tts,
     synthesize_project_voice,
-    write_timeline,
     normalize_cover_title_positions,
 )
 from services.media_service import assemble_clips, normalize_audio
 from services.store import assets_dir, db_write_transaction, load_db, project_dir, public_url, save_db
-from services.text_service import generate_publish_assistant, generate_viral_title
+from services.text_service import generate_viral_title
 
 router = APIRouter(prefix="/api/projects", tags=["generation"])
-GENERATED_IMAGE_SAVE_LOCK = threading.Lock()
 VIDEO_LIBRARY_VOICE_LOCK = threading.Lock()
 VIDEO_LIBRARY_VOICE_ACTIVE: set[str] = set()
-STORYBOARD_UPLOAD_MAX_BYTES = 20 * 1024 * 1024
-STORYBOARD_UPLOAD_MAX_PIXELS = 40_000_000
-STORYBOARD_UPLOAD_FORMATS = {
-    "JPEG": (".jpg", "RGB"),
-    "PNG": (".png", "RGBA"),
-    "WEBP": (".webp", "RGBA"),
-}
 
 
 class VoicePayload(BaseModel):
@@ -69,15 +51,9 @@ def _first_script_sentence(text: str) -> str:
     return (match.group(0) if match else compact.splitlines()[0]).strip()[:160]
 
 
-class ImageGenerationPayload(BaseModel):
-    prompt: str | None = None
-    provider: str | None = None
-
-
-class SquareCropPayload(BaseModel):
-    x: float
-    y: float
-    size: float
+def require_video_library(project: dict) -> None:
+    if project.get("workflow_type") != "video_library":
+        raise HTTPException(400, "旧项目已停用，仅支持归档或删除")
 
 
 class MusicSettingsPayload(BaseModel):
@@ -85,416 +61,6 @@ class MusicSettingsPayload(BaseModel):
     start_sec: float = 0
     volume: float = 0.2
 
-
-def _generated_image(db: dict, project_id: str, asset_id: str) -> tuple[dict, Path]:
-    asset = next(
-        (
-            item for item in db.get("generated_assets", [])
-            if item.get("id") == asset_id and item.get("project_id") == project_id
-        ),
-        None,
-    )
-    if not asset:
-        raise HTTPException(404, "Generated image not found")
-    path = Path(str(asset.get("local_path") or "")).resolve()
-    project_root = project_dir(project_id).resolve()
-    if not path.exists() or project_root not in path.parents:
-        raise HTTPException(404, "Generated image file not found")
-    return asset, path
-
-
-def _refresh_image_metadata(asset: dict, path: Path, operation: str) -> None:
-    with Image.open(path) as image:
-        asset["width"], asset["height"] = image.size
-    if operation in {"crop_square", "crop_square_region"}:
-        asset.pop("crop_region", None)
-    asset["file_size"] = path.stat().st_size
-    asset["hash"] = hashlib.sha256(path.read_bytes()).hexdigest()
-    asset["updated_at"] = datetime.now().isoformat(timespec="seconds")
-    asset.setdefault("image_operations", []).append({
-        "operation": operation,
-        "created_at": asset["updated_at"],
-    })
-
-
-def _normalize_image_format(path: Path) -> None:
-    with Image.open(path) as source:
-        supports_alpha = path.suffix.lower() in {".png", ".webp"}
-        has_alpha = "A" in source.getbands() or "transparency" in source.info
-        image = source.convert("RGBA" if supports_alpha and has_alpha else "RGB")
-        image.load()
-    save_format = {".png": "PNG", ".webp": "WEBP"}.get(path.suffix.lower(), "JPEG")
-    save_options = {"quality": 95} if save_format in {"JPEG", "WEBP"} else {}
-    image.save(path, format=save_format, **save_options)
-
-
-def _store_storyboard_upload(file: UploadFile, target_stem: Path) -> tuple[Path, int, int]:
-    temporary_path = target_stem.with_suffix(".upload")
-    temporary_path.parent.mkdir(parents=True, exist_ok=True)
-    written = 0
-    try:
-        with temporary_path.open("wb") as output:
-            while chunk := file.file.read(1024 * 1024):
-                written += len(chunk)
-                if written > STORYBOARD_UPLOAD_MAX_BYTES:
-                    raise ValueError("图片不能超过 20 MB")
-                output.write(chunk)
-        if not written:
-            raise ValueError("上传的图片为空")
-
-        with Image.open(temporary_path) as source:
-            image_format = str(source.format or "").upper()
-            if image_format not in STORYBOARD_UPLOAD_FORMATS:
-                raise ValueError("仅支持 JPG、PNG、WEBP 图片")
-            source.load()
-            image = ImageOps.exif_transpose(source)
-            width, height = image.size
-            if width <= 0 or height <= 0 or width * height > STORYBOARD_UPLOAD_MAX_PIXELS:
-                raise ValueError("图片尺寸无效或像素总数超过 4000 万")
-            suffix, alpha_mode = STORYBOARD_UPLOAD_FORMATS[image_format]
-            has_alpha = "A" in image.getbands() or "transparency" in image.info
-            image = image.convert(alpha_mode if has_alpha else "RGB")
-
-        target = target_stem.with_suffix(suffix)
-        save_options = {"quality": 95} if image_format in {"JPEG", "WEBP"} else {"optimize": True}
-        image.save(target, format=image_format, **save_options)
-        return target, width, height
-    finally:
-        temporary_path.unlink(missing_ok=True)
-
-
-def _crop_square(path: Path) -> None:
-    with Image.open(path) as source:
-        suffix = path.suffix.lower()
-        image = ImageOps.exif_transpose(source).convert("RGBA" if suffix == ".png" else "RGB")
-        width, height = image.size
-        side = min(width, height)
-        left = (width - side) // 2
-        top = (height - side) // 2
-        cropped = image.crop((left, top, left + side, top + side))
-        save_format = {
-            ".png": "PNG",
-            ".webp": "WEBP",
-        }.get(suffix, "JPEG")
-        save_options = {"quality": 95} if save_format in {"JPEG", "WEBP"} else {}
-        cropped.save(path, format=save_format, **save_options)
-
-
-def _convert_grayscale(path: Path) -> None:
-    with Image.open(path) as source:
-        suffix = path.suffix.lower()
-        transposed = ImageOps.exif_transpose(source)
-        grayscale = ImageOps.grayscale(transposed)
-        if suffix == ".png" and "A" in transposed.getbands():
-            grayscale = grayscale.convert("RGBA")
-            grayscale.putalpha(transposed.getchannel("A"))
-        save_format = {".png": "PNG", ".webp": "WEBP"}.get(suffix, "JPEG")
-        save_options = {"quality": 95} if save_format in {"JPEG", "WEBP"} else {}
-        grayscale.save(path, format=save_format, **save_options)
-
-
-def _crop_square_region(path: Path, x: float, y: float, size: float) -> None:
-    with Image.open(path) as source:
-        suffix = path.suffix.lower()
-        image = ImageOps.exif_transpose(source).convert("RGBA" if suffix == ".png" else "RGB")
-        width, height = image.size
-        if width <= 0 or height <= 0:
-            raise ValueError("Image has invalid dimensions")
-        side = max(1, min(int(round(size)), width, height))
-        left = max(0, min(int(round(x)), width - side))
-        top = max(0, min(int(round(y)), height - side))
-        cropped = image.crop((left, top, left + side, top + side))
-        save_format = {
-            ".png": "PNG",
-            ".webp": "WEBP",
-        }.get(suffix, "JPEG")
-        save_options = {"quality": 95} if save_format in {"JPEG", "WEBP"} else {}
-        cropped.save(path, format=save_format, **save_options)
-
-
-def _read_crop_region(path: Path, x: float, y: float, size: float) -> dict:
-    with Image.open(path) as source:
-        image = ImageOps.exif_transpose(source)
-        width, height = image.size
-    if width <= 0 or height <= 0:
-        raise ValueError("Image has invalid dimensions")
-    side = max(1, min(float(size), float(width), float(height)))
-    left = max(0.0, min(float(x), width - side))
-    top = max(0.0, min(float(y), height - side))
-    return {
-        "x": round(left, 3),
-        "y": round(top, 3),
-        "size": round(side, 3),
-        "image_width": width,
-        "image_height": height,
-    }
-
-
-@router.get("/{project_id}/generated-assets/{asset_id}/download-png")
-def download_generated_image_png(project_id: str, asset_id: str):
-    db = load_db()
-    asset, path = _generated_image(db, project_id, asset_id)
-    try:
-        with Image.open(path) as source:
-            image = ImageOps.exif_transpose(source)
-            image.load()
-            if image.mode not in {"RGB", "RGBA"}:
-                image = image.convert("RGBA" if "transparency" in image.info else "RGB")
-            output = BytesIO()
-            image.save(output, format="PNG", optimize=True)
-            output.seek(0)
-    except Exception as exc:
-        raise HTTPException(500, f"PNG conversion failed: {exc}") from exc
-
-    filename = f"{Path(str(asset.get('file_name') or path.name)).stem}.png"
-    encoded_filename = quote(filename, safe="")
-    return StreamingResponse(
-        output,
-        media_type="image/png",
-        # HTTP response headers must remain ASCII/Latin-1 encodable. RFC 5987's
-        # filename* form preserves Chinese and other Unicode download names.
-        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"},
-    )
-
-
-@router.post("/{project_id}/generated-assets/{asset_id}/crop-square")
-def crop_generated_image_square(project_id: str, asset_id: str):
-    db = load_db()
-    asset, path = _generated_image(db, project_id, asset_id)
-    try:
-        _crop_square(path)
-    except Exception as exc:
-        raise HTTPException(500, f"Crop image failed: {exc}") from exc
-    _refresh_image_metadata(asset, path, "crop_square")
-    save_db(db)
-    return {"status": "success", "asset": asset}
-
-
-@router.post("/{project_id}/generated-assets/{asset_id}/crop-square-region")
-def crop_generated_image_square_region(project_id: str, asset_id: str, payload: SquareCropPayload):
-    db = load_db()
-    asset, path = _generated_image(db, project_id, asset_id)
-    try:
-        crop_region = _read_crop_region(path, payload.x, payload.y, payload.size)
-    except Exception as exc:
-        raise HTTPException(500, f"Save image display region failed: {exc}") from exc
-    asset["crop_region"] = crop_region
-    now = datetime.now().isoformat(timespec="seconds")
-    asset["updated_at"] = now
-    asset.setdefault("image_operations", []).append({
-        "operation": "display_region",
-        "created_at": now,
-    })
-    save_db(db)
-    return {"status": "success", "asset": asset}
-
-
-@router.post("/{project_id}/generated-assets/{asset_id}/grayscale")
-def convert_generated_image_grayscale(project_id: str, asset_id: str):
-    db = load_db()
-    _, path = _generated_image(db, project_id, asset_id)
-    try:
-        _convert_grayscale(path)
-    except Exception as exc:
-        raise HTTPException(500, f"Convert image to grayscale failed: {exc}") from exc
-    # Concurrent conversions must not save stale DB snapshots over each other.
-    with GENERATED_IMAGE_SAVE_LOCK, db_write_transaction():
-        db = load_db()
-        asset, path = _generated_image(db, project_id, asset_id)
-        asset["is_grayscale"] = True
-        _refresh_image_metadata(asset, path, "grayscale")
-        save_db(db)
-    return {"status": "success", "asset": asset}
-
-
-@router.post("/{project_id}/crop-selected-images")
-def crop_selected_images(project_id: str):
-    db = load_db()
-    if not any(item.get("id") == project_id for item in db.get("projects", [])):
-        raise HTTPException(404, "Project not found")
-    shots = sorted(
-        [item for item in db.get("shots", []) if item.get("project_id") == project_id],
-        key=lambda item: item.get("shot_index", 0),
-    )
-    cropped = 0
-    skipped = 0
-    failed: list[dict] = []
-    for shot in shots:
-        selected_id = shot.get("selected_asset_id")
-        if not selected_id:
-            skipped += 1
-            continue
-        asset = next(
-            (
-                item for item in db.get("generated_assets", [])
-                if item.get("id") == selected_id and item.get("project_id") == project_id
-            ),
-            None,
-        )
-        if not asset:
-            skipped += 1
-            continue
-        path = Path(str(asset.get("local_path") or ""))
-        try:
-            _crop_square(path)
-            _refresh_image_metadata(asset, path, "crop_square")
-            cropped += 1
-        except Exception as exc:
-            failed.append({"shot_index": shot.get("shot_index"), "error": str(exc)[:200]})
-    save_db(db)
-    return {"status": "success", "cropped": cropped, "skipped": skipped, "failed": failed}
-
-
-@router.post("/{project_id}/generated-assets/{asset_id}/remove-watermark")
-def remove_generated_image_watermark(project_id: str, asset_id: str):
-    db = load_db()
-    asset, path = _generated_image(db, project_id, asset_id)
-    shot = next(
-        (
-            item for item in db.get("shots", [])
-            if item.get("id") == asset.get("shot_id") and item.get("project_id") == project_id
-        ),
-        None,
-    )
-    try:
-        result = remove_watermark_with_seedream(path, shot)
-        _normalize_image_format(path)
-    except Exception as exc:
-        raise HTTPException(502, str(exc)) from exc
-    asset["watermark"] = result
-    asset["watermark_removed"] = True
-    asset["watermark_provider"] = result.get("provider")
-    asset["watermark_model"] = result.get("model")
-    _refresh_image_metadata(asset, path, "remove_watermark")
-    save_db(db)
-    return {"status": "success", "asset": asset, "watermark": result}
-
-
-@router.get("/{project_id}/shots/{shot_id}/image-prompt")
-def get_image_prompt(project_id: str, shot_id: str):
-    db = load_db()
-    shot = next((s for s in db["shots"] if s["project_id"] == project_id and s["id"] == shot_id), None)
-    if not shot:
-        raise HTTPException(404, "Shot not found")
-    return {"shot_id": shot_id, "prompt": shot.get("image_prompt") or build_image_prompt(shot)}
-
-
-@router.post("/{project_id}/shots/{shot_id}/generate-image")
-def generate_image(project_id: str, shot_id: str, payload: ImageGenerationPayload | None = None):
-    db = load_db()
-    shot = next((s for s in db["shots"] if s["project_id"] == project_id and s["id"] == shot_id), None)
-    if not shot:
-        raise HTTPException(404, "Shot not found")
-    project = next((p for p in db["projects"] if p["id"] == project_id), None)
-    try:
-        provider = normalize_image_generation_provider(
-            payload.provider if payload and payload.provider else (project or {}).get("image_generation_provider")
-        )
-    except ValueError as exc:
-        raise HTTPException(422, str(exc)) from exc
-    extension = generated_image_extension(provider)
-    out = project_dir(project_id) / "images" / f"shot_{shot['shot_index']:03d}{extension}"
-    try:
-        result = generate_ai_image(out, shot, "9:16", payload.prompt if payload else None, provider)
-    except Exception as exc:
-        raise HTTPException(502, str(exc)) from exc
-    prompt = result["prompt"]
-    generated_id = str(uuid4())
-    with GENERATED_IMAGE_SAVE_LOCK, db_write_transaction():
-        # Reload after the slow AI request. Other image generations or prompt
-        # recognition may have completed while this request was in flight; using
-        # the pre-request snapshot here would silently overwrite their changes.
-        db = load_db()
-        shot = next((s for s in db["shots"] if s["project_id"] == project_id and s["id"] == shot_id), None)
-        if not shot:
-            raise HTTPException(404, "Shot not found after image generation")
-        asset = {
-            "id": generated_id,
-            "project_id": project_id,
-            "shot_id": shot_id,
-            "type": "image",
-            "asset_source": "ai_generated",
-            "prompt": prompt,
-            "provider": result.get("provider"),
-            "model": result.get("model"),
-            "image_size": result.get("image_size"),
-            "remote_url": result.get("remote_url"),
-            "seed": result.get("seed"),
-            "file_url": public_url(out),
-            "local_path": str(out),
-            "status": "success",
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-        }
-        db["generated_assets"].append(asset)
-        shot["selected_asset_id"] = generated_id
-        shot["asset_source"] = "ai_generated"
-        shot["image_prompt"] = prompt
-        shot["status"] = "ai_generated"
-        project = next((p for p in db["projects"] if p["id"] == project_id), None)
-        if project:
-            project["image_generation_provider"] = provider
-        save_db(db)
-    return {
-        "shot_id": shot_id,
-        "shot_index": shot.get("shot_index"),
-        "asset": asset,
-        "image_url": public_url(out),
-        "prompt": prompt,
-        "provider": result.get("provider"),
-        "model": result.get("model"),
-        "image_size": result.get("image_size"),
-        "status": "success",
-    }
-
-
-@router.post("/{project_id}/shots/{shot_id}/upload-image")
-def upload_shot_image(project_id: str, shot_id: str, file: UploadFile = File(...)):
-    db = load_db()
-    shot = next((s for s in db["shots"] if s["project_id"] == project_id and s["id"] == shot_id), None)
-    if not shot:
-        raise HTTPException(404, "Shot not found")
-
-    asset_id = str(uuid4())
-    original_name = Path(file.filename or "storyboard-image").name
-    target_stem = project_dir(project_id) / "images" / "uploads" / f"shot_{shot['shot_index']:03d}_{asset_id}"
-    try:
-        target, width, height = _store_storyboard_upload(file, target_stem)
-    except Exception as exc:
-        for candidate in target_stem.parent.glob(f"{target_stem.name}.*"):
-            candidate.unlink(missing_ok=True)
-        raise HTTPException(400, f"分镜图片上传失败：{exc}") from exc
-
-    now = datetime.now().isoformat(timespec="seconds")
-    with GENERATED_IMAGE_SAVE_LOCK, db_write_transaction():
-        db = load_db()
-        shot = next((s for s in db["shots"] if s["project_id"] == project_id and s["id"] == shot_id), None)
-        if not shot:
-            target.unlink(missing_ok=True)
-            raise HTTPException(404, "Shot not found after image upload")
-        asset = {
-            "id": asset_id,
-            "project_id": project_id,
-            "shot_id": shot_id,
-            "type": "image",
-            "file_type": "image",
-            "file_name": original_name,
-            "asset_source": "uploaded",
-            "provider": "user_upload",
-            "width": width,
-            "height": height,
-            "file_size": target.stat().st_size,
-            "file_url": public_url(target),
-            "local_path": str(target),
-            "status": "success",
-            "created_at": now,
-        }
-        db.setdefault("generated_assets", []).append(asset)
-        shot["selected_asset_id"] = asset_id
-        shot["asset_source"] = "uploaded"
-        shot["status"] = "ai_generated"
-        shot["updated_at"] = now
-        save_db(db)
-    return {"status": "success", "shot": shot, "asset": asset}
 
 
 def _generate_video_library_voice(project: dict, payload: VoicePayload | None) -> dict:
@@ -513,7 +79,7 @@ def _generate_video_library_voice(project: dict, payload: VoicePayload | None) -
 def _generate_video_library_voice_unlocked(project: dict, payload: VoicePayload | None) -> dict:
     """Narrate the whole script in one voice track and match clips to its duration."""
     project_id = project["id"]
-    raw_script = str(project.get("rewritten_script") or project.get("raw_script") or "").strip()
+    raw_script = str(project.get("raw_script") or "").strip()
     script, marker_present, marker_offset = strip_product_marker(raw_script)
     script = script.strip()
     if not script:
@@ -639,53 +205,8 @@ def generate_voice(project_id: str, payload: VoicePayload | None = None):
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
         raise HTTPException(404, "Project not found")
-    if project.get("workflow_type") == "video_library":
-        return _generate_video_library_voice(project, payload)
-    shots = sorted([s for s in db["shots"] if s["project_id"] == project_id], key=lambda s: s["shot_index"])
-    if not shots:
-        raise HTTPException(400, "No shots")
-    out = project_dir(project_id) / "audio" / "main_voice.mp3"
-    try:
-        result = synthesize_project_voice(out, shots, payload.voice_type if payload else None, payload.speech_rate if payload else None)
-    except Exception as exc:
-        raise HTTPException(502, str(exc)) from exc
-    timing_by_shot = {
-        timing["shot_id"]: timing
-        for timing in result.get("shot_timings", [])
-        if timing.get("shot_id")
-    }
-
-    for shot in shots:
-        timing = timing_by_shot.get(shot["id"])
-        if not timing:
-            continue
-        shot["start_time"] = round(timing["start_time"], 3)
-        shot["end_time"] = round(timing["end_time"], 3)
-        shot["duration_sec"] = round(timing["duration_sec"], 3)
-        shot["subtitle_timings"] = timing.get("subtitle_timings", [])
-    voice_timeline_path = project_dir(project_id) / "audio" / "voice_timeline.json"
-    voice_timeline_path.write_text(
-        json.dumps(result.get("shot_timings", []), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    project["voice_style"] = result["voice_type"]
-    project.setdefault("voice_volume", 1.0)
-    project["audio_url"] = public_url(out)
-    project["voice_timeline_url"] = public_url(voice_timeline_path)
-    project["audio_format"] = result["audio_format"]
-    project["updated_at"] = datetime.now().isoformat(timespec="seconds")
-    save_db(db)
-    return {
-        "audio_url": public_url(out),
-        "audio_format": result["audio_format"],
-        "voice_type": result["voice_type"],
-        "provider": result["provider"],
-        "duration_sec": result["duration_sec"],
-        "voice_timeline_url": public_url(voice_timeline_path),
-        "alignment_method": result.get("alignment_method"),
-        "timestamp_provider": result.get("timestamp_provider"),
-        "long_text_error": result.get("long_text_error"),
-    }
+    require_video_library(project)
+    return _generate_video_library_voice(project, payload)
 
 
 @router.patch("/{project_id}/voice-settings")
@@ -694,6 +215,7 @@ def update_voice_settings(project_id: str, payload: VoiceSettingsPayload):
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
         raise HTTPException(404, "Project not found")
+    require_video_library(project)
     if not project.get("audio_url"):
         raise HTTPException(400, "Voice audio has not been generated")
     volume = max(0.0, min(3.0, float(payload.volume)))
@@ -709,8 +231,9 @@ def preview_voice(project_id: str, payload: VoicePayload | None = None):
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
         raise HTTPException(404, "Project not found")
+    require_video_library(project)
     preview_text, _, _ = strip_product_marker(
-        project.get("rewritten_script") or project.get("raw_script") or ""
+        project.get("raw_script") or ""
     )
     sentence = _first_script_sentence(preview_text)
     if not sentence:
@@ -736,9 +259,10 @@ def generate_title(project_id: str):
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
         raise HTTPException(404, "Project not found")
+    require_video_library(project)
 
     script, _, _ = strip_product_marker(
-        project.get("rewritten_script") or project.get("raw_script") or ""
+        project.get("raw_script") or ""
     )
     script = script.strip()
     if not script:
@@ -762,34 +286,6 @@ def generate_title(project_id: str):
     }
 
 
-@router.post("/{project_id}/generate-publish-assistant")
-def generate_publish(project_id: str):
-    db = load_db()
-    project = next((p for p in db["projects"] if p["id"] == project_id), None)
-    if not project:
-        raise HTTPException(404, "Project not found")
-
-    script = str(project.get("rewritten_script") or project.get("raw_script") or "").strip()
-    if not script:
-        raise HTTPException(400, "No script content available for publish assistant")
-
-    result = generate_publish_assistant(script)
-    if result.get("error"):
-        raise HTTPException(502, f"Publish assistant generation failed: {result['error']}")
-
-    now = datetime.now().isoformat(timespec="seconds")
-    project["publish_short_title"] = result["short_title"]
-    project["publish_description"] = result["description"]
-    project["updated_at"] = now
-    save_db(db)
-
-    return {
-        "status": "success",
-        "short_title": result["short_title"],
-        "description": result["description"],
-    }
-
-
 @router.get("/_fonts/cover-title")
 def download_cover_title_font():
     font_path = Path(__file__).resolve().parents[3] / "assets" / "龚帆怒放体.ttf"
@@ -810,6 +306,7 @@ def generate_cover(
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
         raise HTTPException(404, "Project not found")
+    require_video_library(project)
 
     title_line1 = str(project.get("title_line1") or "").strip()
     title_line2 = str(project.get("title_line2") or "").strip()
@@ -894,6 +391,7 @@ def download_cover(project_id: str):
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
         raise HTTPException(404, "Project not found")
+    require_video_library(project)
     cover_path = project_dir(project_id) / "cover" / "cover.png"
     if not project.get("cover_url") or not cover_path.exists():
         raise HTTPException(404, "Cover image not found")
@@ -910,6 +408,7 @@ def update_music_settings(project_id: str, payload: MusicSettingsPayload):
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
         raise HTTPException(404, "Project not found")
+    require_video_library(project)
     music = None
     if payload.music_id:
         music = next(
@@ -948,30 +447,23 @@ def generate_subtitles(project_id: str):
     project = next((p for p in db["projects"] if p["id"] == project_id), None)
     if not project:
         raise HTTPException(404, "Project not found")
+    require_video_library(project)
+    if float(project.get("audio_duration_sec") or 0) <= 0:
+        raise HTTPException(400, "请先生成配音")
     srt_path = project_dir(project_id) / "subtitles" / "subtitles.srt"
-    if project.get("workflow_type") == "video_library":
-        if float(project.get("audio_duration_sec") or 0) <= 0:
-            raise HTTPException(400, "请先生成配音")
-        narration = narration_shot(project)
-        srt_path.parent.mkdir(parents=True, exist_ok=True)
-        srt_path.write_text(
-            generate_export_srt([narration], max_hanzi=VIDEO_LIBRARY_SUBTITLE_MAX_HANZI),
-            encoding="utf-8",
-        )
-        timeline_path = project_dir(project_id) / "subtitles" / "timeline.json"
-        timeline_path.write_text(json.dumps(narration, ensure_ascii=False, indent=2), encoding="utf-8")
-        with db_write_transaction():
-            current_db = load_db()
-            current = next((p for p in current_db["projects"] if p["id"] == project_id), None)
-            if current:
-                current["subtitle_url"] = public_url(srt_path)
-                current["updated_at"] = datetime.now().isoformat(timespec="seconds")
-                save_db(current_db)
-        return {"subtitle_url": public_url(srt_path), "timeline_url": public_url(timeline_path)}
-    shots = sorted([s for s in db["shots"] if s["project_id"] == project_id], key=lambda s: s["shot_index"])
-    if not shots:
-        raise HTTPException(400, "No shots")
-    srt_path.write_text(generate_export_srt(shots), encoding="utf-8")
+    narration = narration_shot(project)
+    srt_path.parent.mkdir(parents=True, exist_ok=True)
+    srt_path.write_text(
+        generate_export_srt([narration], max_hanzi=VIDEO_LIBRARY_SUBTITLE_MAX_HANZI),
+        encoding="utf-8",
+    )
     timeline_path = project_dir(project_id) / "subtitles" / "timeline.json"
-    write_timeline(timeline_path, shots)
+    timeline_path.write_text(json.dumps(narration, ensure_ascii=False, indent=2), encoding="utf-8")
+    with db_write_transaction():
+        current_db = load_db()
+        current = next((p for p in current_db["projects"] if p["id"] == project_id), None)
+        if current:
+            current["subtitle_url"] = public_url(srt_path)
+            current["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            save_db(current_db)
     return {"subtitle_url": public_url(srt_path), "timeline_url": public_url(timeline_path)}

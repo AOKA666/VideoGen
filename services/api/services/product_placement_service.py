@@ -58,7 +58,7 @@ def normalize_pip_box(value: dict | None) -> dict:
 
 
 def recompute_marker(project: dict) -> dict:
-    raw = str(project.get("rewritten_script") or project.get("raw_script") or "")
+    raw = str(project.get("raw_script") or "")
     clean, marker_present, marker_offset = strip_product_marker(raw)
     try:
         duration = float(project.get("audio_duration_sec") or 0)

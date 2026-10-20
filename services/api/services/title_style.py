@@ -2,4 +2,4 @@
 
 TITLE_JIANYING_FONT_SIZE = 15.0
 # Cover size is independently configured in Pillow/CSS pixels.
-TITLE_FONT_SIZE_PX = 80
+TITLE_FONT_SIZE_PX = 100
