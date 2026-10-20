@@ -76,6 +76,8 @@ npm run dev
 - 生成封面：`storage/projects/<project_id>/cover/cover.png`
 - 剪映草稿：`JIANYING_DRAFTS_DIR/VideoGen_<项目名>`
 
+已生成的项目封面会自动写入剪映草稿缩略图和项目内的“封面”位置，图片分镜与素材视频两种导出流程均适用，无需在剪映中重复上传。封面使用独立子草稿，不占用正片时间线；重新导出时会使用当前项目封面。
+
 ## 生产部署
 
 生产环境使用 Docker Compose、Nginx、单 FastAPI worker 和持久化 `storage/`。完整步骤见 [`assets/deployment.md`](assets/deployment.md)。应用没有内置登录鉴权，公网开放前必须启用访问控制。

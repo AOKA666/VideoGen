@@ -93,6 +93,24 @@ def recompute_marker(project: dict) -> dict:
     }
 
 
+def normalize_item_timing(asset: dict, item: dict) -> dict:
+    mode = item.get("duration_mode", "custom")
+    allowed = ("custom", "original") if asset.get("media_type") == "video" else ("custom", "remaining")
+    if mode not in allowed:
+        mode = "custom"
+    try:
+        duration = float(item.get("duration_sec") or MIN_ITEM_DURATION_SEC)
+    except (TypeError, ValueError):
+        duration = MIN_ITEM_DURATION_SEC
+    if not math.isfinite(duration):
+        duration = MIN_ITEM_DURATION_SEC
+    duration = max(MIN_ITEM_DURATION_SEC, min(duration, MAX_ITEM_DURATION_SEC))
+    source_duration = float(asset.get("duration_sec") or 0)
+    if asset.get("media_type") == "video" and source_duration > 0:
+        duration = source_duration if mode == "original" else min(duration, source_duration)
+    return {"duration_mode": mode, "duration_sec": round(duration, 3), "fill_duration": False}
+
+
 def normalize_product_placement(
     db: dict,
     project: dict,
@@ -108,19 +126,9 @@ def normalize_product_placement(
         asset = assets.get(str(item.get("asset_id") or ""))
         if not asset or not Path(str(asset.get("local_path") or "")).is_file():
             raise ValueError(f"第 {index + 1} 个带货素材不存在，请重新上传")
-        try:
-            duration = float(item.get("duration_sec") or MIN_ITEM_DURATION_SEC)
-        except (TypeError, ValueError):
-            duration = MIN_ITEM_DURATION_SEC
-        duration = max(MIN_ITEM_DURATION_SEC, min(duration, MAX_ITEM_DURATION_SEC))
-        source_duration = float(asset.get("duration_sec") or 0)
-        fill_duration = bool(item.get("fill_duration", True))
-        if asset.get("media_type") == "video" and source_duration > 0 and not fill_duration:
-            duration = min(duration, source_duration)
         normalized_items.append({
             "asset_id": asset["id"],
-            "duration_sec": round(duration, 3),
-            "fill_duration": fill_duration,
+            **normalize_item_timing(asset, item),
             "pip_box": normalize_pip_box(item.get("pip_box") or pip_box),
         })
 
@@ -169,18 +177,16 @@ def resolve_product_overlays(db: dict, project: dict, duration: float) -> tuple[
     truncated = False
     for index, item in enumerate(placement.get("items") or []):
         remaining = float(duration) - cursor
-        if remaining < MIN_ITEM_DURATION_SEC:
+        if remaining <= 1e-6:
             truncated = True
             break
         asset = assets.get(str(item.get("asset_id") or ""))
         if not asset or not Path(str(asset.get("local_path") or "")).is_file():
             raise ValueError(f"第 {index + 1} 个带货素材文件不存在，请到素材库重新选择")
-        wanted = max(MIN_ITEM_DURATION_SEC, float(item.get("duration_sec") or MIN_ITEM_DURATION_SEC))
+        timing = normalize_item_timing(asset, item)
+        wanted = remaining if timing["duration_mode"] == "remaining" else timing["duration_sec"]
         requested = wanted
-        fill_duration = bool(item.get("fill_duration", True))
         source_duration = float(asset.get("duration_sec") or 0)
-        if asset.get("media_type") == "video" and source_duration > 0 and not fill_duration:
-            wanted = min(wanted, source_duration)
         effective = min(wanted, remaining)
         if effective < wanted - 1e-6:
             truncated = True
@@ -190,11 +196,15 @@ def resolve_product_overlays(db: dict, project: dict, duration: float) -> tuple[
             "media_type": asset.get("media_type") or "video",
             "duration_sec": round(effective, 3),
             "requested_duration_sec": round(requested, 3),
-            "fill_duration": fill_duration,
+            "fill_duration": False,
+            "duration_mode": timing["duration_mode"],
             "source_duration_sec": round(source_duration, 3),
             "pip_box": normalize_pip_box(item.get("pip_box") or pip_box),
         })
         cursor += effective
+        if timing["duration_mode"] == "remaining":
+            report["skipped_after_fill"] = len(placement["items"]) - index - 1
+            break
 
     report.update({
         "enabled": bool(overlays),

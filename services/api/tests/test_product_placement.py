@@ -23,7 +23,7 @@ from services.generation_service import (
     strip_product_marker,
 )
 from services.media_service import media_command
-from services.product_placement_service import normalize_pip_box, resolve_product_overlays
+from services.product_placement_service import normalize_pip_box, resolve_product_overlays, normalize_item_timing
 
 
 def make_video(path: Path, seconds: float = 1.0, size: str = "640x480") -> Path:
@@ -54,6 +54,47 @@ def video_upload(path: Path, name: str = "带货视频.mp4") -> UploadFile:
 
 
 class PlacementUnitTests(unittest.TestCase):
+    def test_original_video_is_not_limited_to_thirty_seconds(self):
+        timing = normalize_item_timing(
+            {"media_type": "video", "duration_sec": 95.25},
+            {"duration_mode": "original", "duration_sec": 3},
+        )
+        self.assertEqual(timing["duration_sec"], 95.25)
+        self.assertEqual(timing["duration_mode"], "original")
+
+    def test_fill_image_stops_sequence_and_covers_last_fraction(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "image.png"
+            Image.new("RGB", (10, 10)).save(path)
+            db = {"product_library": [{"id": "image", "local_path": str(path), "media_type": "image"}]}
+            project = {
+                "raw_script": "【带货开始】后",
+                "audio_duration_sec": 3.2,
+                "product_placement": {"items": [
+                    {"asset_id": "image", "duration_sec": 3},
+                    {"asset_id": "image", "duration_mode": "remaining"},
+                    {"asset_id": "image", "duration_sec": 3},
+                ]},
+            }
+            overlays, report = resolve_product_overlays(db, project, 3.2)
+            self.assertEqual([item["duration_sec"] for item in overlays], [3, 0.2])
+            self.assertEqual(report["skipped_after_fill"], 1)
+            self.assertEqual(report["end_sec"], 3.2)
+            self.assertFalse(report["truncated"])
+
+    def test_original_video_truncates_at_voice_end(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "video.mp4"
+            path.touch()
+            db = {"product_library": [{"id": "video", "local_path": str(path),
+                                       "media_type": "video", "duration_sec": 60}]}
+            project = {"raw_script": "【带货开始】后", "audio_duration_sec": 10,
+                       "product_placement": {"items": [{"asset_id": "video", "duration_mode": "original"}]}}
+            overlays, report = resolve_product_overlays(db, project, 10)
+            self.assertEqual(overlays[0]["requested_duration_sec"], 60)
+            self.assertEqual(overlays[0]["duration_sec"], 10)
+            self.assertTrue(report["truncated"])
+
     def test_marker_strip_and_time_mapping(self):
         clean, present, offset = strip_product_marker("前半段【带货开始】后半段")
         self.assertEqual(clean, "前半段后半段")
@@ -129,7 +170,7 @@ class ProductLibraryTests(unittest.TestCase):
             media.delete_product(kept["id"])
         self.assertTrue(Path(kept["local_path"]).exists())
 
-    def test_fill_duration_can_stretch_or_cap_a_short_video(self):
+    def test_legacy_video_fill_does_not_slow_down_source(self):
         product = media.upload_product(video_upload(self.video))
         project = create_project(ProjectCreate(
             raw_script=f"前{PRODUCT_MARKER}后", workflow_type="video_library",
@@ -152,8 +193,8 @@ class ProductLibraryTests(unittest.TestCase):
 
         project["product_placement"]["items"][0]["fill_duration"] = True
         overlays, _ = resolve_product_overlays(db, project, 10.0)
-        self.assertEqual(overlays[0]["duration_sec"], 3.0)
-        self.assertTrue(overlays[0]["fill_duration"])
+        self.assertEqual(overlays[0]["duration_sec"], 1.0)
+        self.assertFalse(overlays[0]["fill_duration"])
 
     def test_placement_presets_round_trip_and_block_product_delete(self):
         product = media.upload_product(image_upload())
@@ -187,6 +228,27 @@ class ProductLibraryTests(unittest.TestCase):
 
         video_library.delete_placement_preset(created["id"])
         media.delete_product(product["id"])
+
+    def test_duration_modes_survive_project_and_preset_saves(self):
+        image = media.upload_product(image_upload())
+        video = media.upload_product(video_upload(self.video))
+        project = create_project(ProjectCreate(
+            raw_script=f"{PRODUCT_MARKER}测试", workflow_type="video_library",
+        ))["project"]
+        item_data = [
+            {"asset_id": video["id"], "duration_mode": "original", "duration_sec": 0.5},
+            {"asset_id": image["id"], "duration_mode": "remaining", "duration_sec": 3},
+        ]
+        result = media.update_product_placement(project["id"], media.ProductPlacementPayload(
+            items=[media.ProductPlacementItem(**item) for item in item_data],
+        ))["product_placement"]
+        self.assertEqual([item["duration_mode"] for item in result["items"]], ["original", "remaining"])
+        self.assertAlmostEqual(result["items"][0]["duration_sec"], 1.0)
+        preset = video_library.upsert_placement_preset(video_library.PlacementPresetPayload(
+            name="timing modes",
+            items=[video_library.PlacementPresetItem(**item) for item in item_data],
+        ))["preset"]
+        self.assertEqual([item["duration_mode"] for item in preset["items"]], ["original", "remaining"])
 
     def test_voice_generation_strips_marker_and_resolves_start(self):
         self.upload_normal()
@@ -308,7 +370,7 @@ class ProductLibraryTests(unittest.TestCase):
     "pyJianYingDraft unavailable",
 )
 class ProductDraftTests(unittest.TestCase):
-    def test_products_track_stretches_and_fades(self):
+    def test_products_track_plays_original_speed_and_fades(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "drafts").mkdir()
@@ -350,14 +412,14 @@ class ProductDraftTests(unittest.TestCase):
             product_segments = tracks["products"]["segments"]
             clip_segment = tracks["clips"]["segments"][0]
             self.assertGreater(product_segments[0]["render_index"], clip_segment["render_index"])
-            self.assertEqual(len(product_segments), 2)  # stretched video + image, no looping
+            self.assertEqual(len(product_segments), 2)  # original-speed video + image, no looping
             self.assertEqual(
                 [segment["target_timerange"]["start"] for segment in product_segments],
-                [1_000_000, 4_000_000],
+                [1_000_000, 2_000_000],
             )
-            self.assertEqual(product_segments[0]["target_timerange"]["duration"], 3_000_000)
+            self.assertEqual(product_segments[0]["target_timerange"]["duration"], 1_000_000)
             self.assertEqual(product_segments[0]["source_timerange"]["duration"], 1_000_000)
-            self.assertAlmostEqual(product_segments[0]["speed"], 1 / 3, places=3)
+            self.assertAlmostEqual(product_segments[0]["speed"], 1.0, places=3)
             self.assertTrue(all(segment["volume"] == 0 for segment in product_segments))
             first = product_segments[0]
             self.assertAlmostEqual(first["clip"]["scale"]["x"], 0.4, places=3)

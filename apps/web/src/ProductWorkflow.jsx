@@ -1,4 +1,5 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { productTimeline, fittedProductBox, subtitleAtTime } from './productTiming.js';
+import React, { useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
 
 const API = import.meta.env.VITE_API_URL ?? (import.meta.env.DEV ? 'http://127.0.0.1:8000' : '');
 const PRODUCT_MARKER = '【带货开始】';
@@ -107,10 +108,14 @@ export function ProductLibrary({ media, reload, onError, project, projectId, bus
   </>;
 }
 
-export function ProductPlacementPanel({ project, projectId, media, busy, onProjectRefresh, onError }) {
+export function ProductPlacementPanel({ project, projectId, media, busy, onProjectRefresh, onError, saveRef }) {
   const placement = project.product_placement || {};
   const placementKey = JSON.stringify(placement);
-  const [items, setItems] = useState([]);
+  const [items, setItems] = useState(() => (placement.items || []).map(item => ({
+    ...item,
+    duration_mode: item.duration_mode || 'custom',
+    pip_box: normalizePipBox(item.pip_box || placement.pip_box),
+  })));
   const [transitionSec, setTransitionSec] = useState(0.5);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
@@ -130,7 +135,7 @@ export function ProductPlacementPanel({ project, projectId, media, busy, onProje
     const fallback = normalizePipBox(current.pip_box);
     setItems((current.items || []).map(item => ({
       ...item,
-      fill_duration: item.fill_duration !== false,
+      duration_mode: item.duration_mode || 'custom',
       pip_box: normalizePipBox(item.pip_box || fallback),
     })));
     setTransitionSec(Number(current.transition_sec ?? 0.5));
@@ -162,30 +167,39 @@ export function ProductPlacementPanel({ project, projectId, media, busy, onProje
   const selectedPipBox = selectedItem?.pip_box
     ? normalizePipBox(selectedItem.pip_box)
     : fallbackPipBox;
+  const visiblePipBox = fittedProductBox(selectedPipBox, selectedAsset);
   const template = (media.templates || []).find(item => item.id === project.background_template_id);
   const markerPresent = String(project.raw_script || '').includes(PRODUCT_MARKER);
   const hasPreviewAudio = Boolean(project.audio_url);
   const previewStartSec = Number(placement.start_sec ?? 0) || 0;
+  const timingKnown = markerPresent && placement.start_sec != null && Number(project.audio_duration_sec) > 0 && !placement.start_sec_stale;
+  const available = timingKnown ? Math.max(0, Number(project.audio_duration_sec) - previewStartSec) : null;
+  const timeline = productTimeline(items, assetMap, available);
+  const subtitleTimings = useMemo(() => (project.narration_subtitle_timings || [])
+    .filter(cue => cue.text?.trim() && Number.isFinite(Number(cue.start_time))
+      && Number(cue.end_time) > Number(cue.start_time))
+    .map(cue => ({ ...cue, start_time: Number(cue.start_time), end_time: Number(cue.end_time) }))
+    .sort((a, b) => a.start_time - b.start_time), [project.narration_subtitle_timings]);
+  const playbackItems = items.map((item, index) => ({ ...item, index, duration_sec: timeline.rows[index].effective }))
+    .filter(item => item.duration_sec > 0);
+
 
   useEffect(() => {
-    if (!playing || hasPreviewAudio || !items.length) {
+    if (!playing) {
+      previewAudioRef.current?.pause();
       setFade(1);
       return undefined;
     }
-    let fadeTimer;
-    const interval = window.setInterval(() => {
-      setFade(0);
-      fadeTimer = window.setTimeout(() => {
-        setSelectedIndex(current => (current + 1) % items.length);
-        setFade(1);
-      }, 300);
-    }, 2200);
-    return () => {
-      window.clearInterval(interval);
-      window.clearTimeout(fadeTimer);
-      setFade(1);
-    };
-  }, [playing, hasPreviewAudio, items.length]);
+    if (hasPreviewAudio) return undefined;
+    const started = performance.now();
+    const interval = window.setInterval(() => updatePreviewElapsed((performance.now() - started) / 1000), 50);
+    return () => window.clearInterval(interval);
+  }, [playing, hasPreviewAudio]);
+
+  useEffect(() => {
+    setPlaying(false);
+    previewAudioRef.current?.pause();
+  }, [items, project.audio_duration_sec, placement.start_sec]);
 
   let statusText = '';
   let statusWarning = false;
@@ -208,7 +222,7 @@ export function ProductPlacementPanel({ project, projectId, media, busy, onProje
     const box = selectedItem?.pip_box ? { ...selectedItem.pip_box } : { ...fallbackPipBox };
     setItems(current => [
       ...current,
-      { asset_id: asset.id, duration_sec: duration, fill_duration: true, pip_box: box },
+      { asset_id: asset.id, duration_sec: duration, duration_mode: 'custom', pip_box: box },
     ]);
     setSelectedIndex(nextIndex);
   }
@@ -217,27 +231,16 @@ export function ProductPlacementPanel({ project, projectId, media, busy, onProje
     setItems(current => current.map((item, itemIndex) => {
       if (itemIndex !== index) return item;
       const asset = assetMap.get(item.asset_id);
-      const maxDuration = asset?.media_type === 'video' && item.fill_duration === false
-        ? Math.min(20, Number(asset.duration_sec) || 20)
-        : 20;
+      const maxDuration = asset?.media_type === 'video'
+        ? Math.min(30, Number(asset.duration_sec) || 30)
+        : 30;
       return { ...item, duration_sec: clamp(value, 0.5, maxDuration) };
     }));
   }
 
-  function toggleFillDuration(index) {
-    setItems(current => current.map((item, itemIndex) => {
-      if (itemIndex !== index) return item;
-      const asset = assetMap.get(item.asset_id);
-      const fill = item.fill_duration === false;
-      const maxDuration = asset?.media_type === 'video' && !fill
-        ? Math.min(20, Number(asset.duration_sec) || 20)
-        : 20;
-      return {
-        ...item,
-        fill_duration: fill,
-        duration_sec: Math.min(Number(item.duration_sec), maxDuration),
-      };
-    }));
+  function toggleDurationMode(index, mode) {
+    setItems(current => current.map((item, itemIndex) => itemIndex === index
+      ? { ...item, duration_mode: item.duration_mode === mode ? 'custom' : mode } : item));
   }
 
   function moveItem(index, offset) {
@@ -279,14 +282,26 @@ export function ProductPlacementPanel({ project, projectId, media, busy, onProje
           y: clamp(start.y + dy, 0, 1 - start.h),
         });
       } else {
+        const fitted = fittedProductBox(start, selectedAsset);
+        const desired = 1 + (Math.abs(dx / fitted.w) > Math.abs(dy / fitted.h) ? dx / fitted.w : dy / fitted.h);
+        const minimum = Math.max(MIN_PIP / start.w, MIN_PIP / start.h);
+        const offsetX = fitted.x - start.x;
+        const offsetY = fitted.y - start.y;
+        const maximum = Math.min(
+          (1 - fitted.x) / (start.w - offsetX),
+          (1 - fitted.y) / (start.h - offsetY),
+          offsetX > 0 ? fitted.x / offsetX : Infinity,
+          offsetY > 0 ? fitted.y / offsetY : Infinity,
+        );
+        const scale = clamp(desired, minimum, maximum);
         updateBox({
-          ...start,
-          w: clamp(start.w + dx, MIN_PIP, 1 - start.x),
-          h: clamp(start.h + dy, MIN_PIP, 1 - start.y),
+          x: fitted.x - offsetX * scale, y: fitted.y - offsetY * scale,
+          w: start.w * scale, h: start.h * scale,
         });
       }
     };
-    const end = () => {
+    const end = (upEvent) => {
+      if (upEvent.type === 'pointerup') move(upEvent);
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', end);
       window.removeEventListener('pointercancel', end);
@@ -303,8 +318,8 @@ export function ProductPlacementPanel({ project, projectId, media, busy, onProje
       setFade(1);
       return;
     }
-    if (!items.length) return;
-    setSelectedIndex(0);
+    if (!playbackItems.length) return;
+    setSelectedIndex(playbackItems[0].index);
     setFade(1);
     setPreviewError('');
     setPlaying(true);
@@ -328,32 +343,35 @@ export function ProductPlacementPanel({ project, projectId, media, busy, onProje
   }
 
   function handlePreviewTimeUpdate(event) {
-    const elapsed = event.currentTarget.currentTime - previewStartSec;
-    const total = items.reduce((sum, item) => sum + Number(item.duration_sec || 0), 0);
+    updatePreviewElapsed(event.currentTarget.currentTime - previewStartSec);
+  }
+
+  function updatePreviewElapsed(elapsed) {
+    const total = timeline.used;
     if (elapsed < 0) {
       setFade(0.3);
       return;
     }
     if (elapsed >= total) {
-      event.currentTarget.pause();
+      previewAudioRef.current?.pause();
       setPlaying(false);
       setFade(1);
       return;
     }
     let cursor = 0;
     let active = 0;
-    for (let index = 0; index < items.length; index += 1) {
-      const duration = Number(items[index].duration_sec || 0);
-      if (elapsed <= cursor + duration) {
+    for (let index = 0; index < playbackItems.length; index += 1) {
+      const duration = Number(playbackItems[index].duration_sec || 0);
+      if (elapsed < cursor + duration) {
         active = index;
         break;
       }
       cursor += duration;
     }
-    const activeDuration = Number(items[active]?.duration_sec || 0);
+    const activeDuration = Number(playbackItems[active]?.duration_sec || 0);
     const fadeWindow = Math.min(0.3, activeDuration / 2);
     const within = elapsed - cursor;
-    setSelectedIndex(active);
+    setSelectedIndex(playbackItems[active]?.index ?? 0);
     setFade(
       within < fadeWindow || elapsed > cursor + activeDuration - fadeWindow ? 0.3 : 1,
     );
@@ -366,7 +384,7 @@ export function ProductPlacementPanel({ project, projectId, media, busy, onProje
       .map(item => ({
         asset_id: item.asset_id,
         duration_sec: Number(item.duration_sec || 3),
-        fill_duration: item.fill_duration !== false,
+        duration_mode: item.duration_mode || 'custom',
         pip_box: normalizePipBox(item.pip_box || fallback),
       }));
     setItems(nextItems);
@@ -396,7 +414,7 @@ export function ProductPlacementPanel({ project, projectId, media, busy, onProje
         items: items.map(item => ({
           asset_id: item.asset_id,
           duration_sec: Number(item.duration_sec),
-          fill_duration: item.fill_duration !== false,
+          duration_mode: item.duration_mode || 'custom',
           pip_box: normalizePipBox(item.pip_box || selectedPipBox),
         })),
         transition_sec: Number(transitionSec),
@@ -437,8 +455,10 @@ export function ProductPlacementPanel({ project, projectId, media, busy, onProje
     }
   }
 
+  useImperativeHandle(saveRef, () => ({ projectId, save }));
+
   async function save() {
-    if (!projectId) return;
+    if (!projectId) return false;
     setSaving(true);
     setNotice('');
     try {
@@ -449,7 +469,7 @@ export function ProductPlacementPanel({ project, projectId, media, busy, onProje
           items: items.map(item => ({
             asset_id: item.asset_id,
             duration_sec: Number(item.duration_sec),
-            fill_duration: item.fill_duration !== false,
+            duration_mode: item.duration_mode || 'custom',
             pip_box: normalizePipBox(item.pip_box || selectedPipBox),
           })),
           transition_sec: Number(transitionSec),
@@ -465,8 +485,10 @@ export function ProductPlacementPanel({ project, projectId, media, busy, onProje
       setTransitionSec(Number(saved.transition_sec ?? 0.5));
       setNotice('带货设置已保存');
       await onProjectRefresh?.();
+      return true;
     } catch (error) {
       onError?.(error.message);
+      return false;
     } finally {
       setSaving(false);
     }
@@ -522,6 +544,12 @@ export function ProductPlacementPanel({ project, projectId, media, busy, onProje
       />
     )}
     <div className={statusWarning ? 'placement-status warning' : 'placement-status'}>{statusText}</div>
+    <div className={timeline.truncated ? 'placement-status warning' : 'placement-status'} role="status" aria-live="polite">
+      {timingKnown ? <>可用 {seconds(available)} · 已安排 {seconds(timeline.used)} · 剩余 {seconds(timeline.remaining)}
+        {timeline.truncated && '；素材超出配音结尾，导出时将截断。'}
+        {timeline.skipped > 0 && `；撑满图片之后的 ${timeline.skipped} 个素材不再播放。`}
+      </> : '生成有效配音后显示剩余时长；当前无法准确判断是否超出。'}
+    </div>
     <div className="product-placement-content">
       <div className="product-placement-left">
         <h4>已选带货素材</h4>
@@ -529,38 +557,60 @@ export function ProductPlacementPanel({ project, projectId, media, busy, onProje
         <div className="product-item-list">
           {items.map((item, index) => {
             const asset = assetMap.get(item.asset_id);
-            const fill = item.fill_duration !== false;
-            const sourceDuration = asset?.media_type === 'video' ? Number(asset.duration_sec || 0) : 0;
-            const sliderMax = asset?.media_type === 'video' && !fill
-              ? Math.min(20, sourceDuration || 20)
-              : 20;
-            const stretched = asset?.media_type === 'video'
-              && fill && Number(item.duration_sec) > sourceDuration;
+            const video = asset?.media_type === 'video';
+            const mode = item.duration_mode || 'custom';
+            const rowTiming = timeline.rows[index];
+            const endTime = timingKnown && rowTiming.end != null ? previewStartSec + rowTiming.end : null;
+            const subtitle = endTime == null ? null : subtitleAtTime(subtitleTimings, endTime);
+            const sliderMax = video ? Math.min(30, Number(asset.duration_sec) || 30) : 30;
             return <div className={index === selectedIndex ? 'product-item-row selected' : 'product-item-row'} key={`${item.asset_id}-${index}`}>
               <button type="button" className="product-item-name" onClick={() => setSelectedIndex(index)}>
                 {asset?.file_name || '素材已删除'}
               </button>
               <input
                 type="range"
-                min="0.5"
+                aria-label={`素材 ${index + 1} 展示时长`}
+                aria-describedby={`product-subtitle-${projectId}-${index}`}
+                min={Math.min(0.5, sliderMax)}
                 max={sliderMax}
-                step="0.5"
-                value={Math.min(Number(item.duration_sec), sliderMax)}
+                step="0.1"
+                disabled={mode !== 'custom' || rowTiming.skipped}
+                value={Math.min(Number(item.duration_sec) || 3, sliderMax)}
                 onChange={event => updateDuration(index, event.target.value)}
               />
               <span className="product-item-duration">
-                {Number(item.duration_sec).toFixed(1)} 秒{stretched ? ' · 撑满' : ''}
+                {rowTiming.skipped ? '不再播放' : rowTiming.effective == null ? '至配音结尾' : seconds(rowTiming.effective)}
+                {rowTiming.truncated && <strong className="product-truncated">超出 {seconds(rowTiming.wanted - rowTiming.effective)}，将截断</strong>}
               </span>
-              {asset?.media_type === 'video' ? (
-                <label className="product-fill-toggle" title="素材不够长时放慢视频，铺满所选时长">
-                  <input type="checkbox" checked={fill} onChange={() => toggleFillDuration(index)} />
-                  撑满时长
-                </label>
-              ) : <span />}
+              <label className="product-fill-toggle" title={video ? '按素材原时长正常播放，超出配音结尾时截断' : '一直展示到配音结尾，后续素材不再播放'}>
+                <input type="checkbox" checked={mode === (video ? 'original' : 'remaining')}
+                  onChange={() => toggleDurationMode(index, video ? 'original' : 'remaining')} />
+                {video ? '原时长' : '撑满时长'}
+              </label>
               <div className="product-item-actions">
                 <button type="button" disabled={index === 0} onClick={() => moveItem(index, -1)}>↑</button>
                 <button type="button" disabled={index === items.length - 1} onClick={() => moveItem(index, 1)}>↓</button>
                 <button type="button" className="danger" onClick={() => removeItem(index)}>删除</button>
+              </div>
+              <div className="product-item-subtitles" id={`product-subtitle-${projectId}-${index}`}>
+                {rowTiming.skipped || rowTiming.effective === 0
+                  ? <small>该素材不再播放，没有对应字幕。</small>
+                  : !timingKnown
+                    ? <small>{placement.start_sec_stale ? '文案已修改，请重新生成配音后对齐字幕。' : '生成配音并设置带货开始标记后，可查看切换位置的字幕。'}</small>
+                    : !subtitleTimings.length
+                      ? <small>当前配音暂无字幕时间信息。</small>
+                      : <>
+                        <small>
+                          展示区间 {seconds(previewStartSec + rowTiming.start)} — {seconds(endTime)}
+                          {endTime >= Number(project.audio_duration_sec) ? ' · 配音结尾' : ' · 拖动滑块查看切换处文案'}
+                        </small>
+                        {subtitle.previous && <p className="product-subtitle-context"><span>上一句</span>{subtitle.previous.text}</p>}
+                        <p className="product-subtitle-current"><span>切换处</span>{
+                          endTime >= Number(project.audio_duration_sec) ? '配音已结束'
+                            : subtitle.current?.text || '此处为字幕间隙'
+                        }</p>
+                        {subtitle.next && <p className="product-subtitle-context"><span>下一句</span>{subtitle.next.text}</p>}
+                      </>}
               </div>
             </div>;
           })}
@@ -575,7 +625,7 @@ export function ProductPlacementPanel({ project, projectId, media, busy, onProje
             value={transitionSec}
             onChange={event => setTransitionSec(Number(event.target.value))}
           />
-          <small>首个素材淡入、最后一个淡出各 0.3 秒；中间使用剪映「叠化」。视频超过原长时不再循环：勾选「撑满时长」会放慢铺满所选时长，未勾选则最多使用素材原长。</small>
+          <small>首个素材淡入、最后一个淡出各 0.3 秒；中间使用剪映「叠化」。图片可撑满至配音结尾，后续素材不再播放；视频选择「原时长」后正常速度完整播放，超出配音结尾的部分将截断。</small>
         </label>
         <h4>添加带货素材</h4>
         <div className="product-picker">
@@ -602,25 +652,24 @@ export function ProductPlacementPanel({ project, projectId, media, busy, onProje
             <div
               className="pip-box"
               style={{
-                left: `${selectedPipBox.x * 100}%`,
-                top: `${selectedPipBox.y * 100}%`,
-                width: `${selectedPipBox.w * 100}%`,
-                height: `${selectedPipBox.h * 100}%`,
+                left: `${visiblePipBox.x * 100}%`,
+                top: `${visiblePipBox.y * 100}%`,
+                width: `${visiblePipBox.w * 100}%`,
+                height: `${visiblePipBox.h * 100}%`,
               }}
               onPointerDown={event => beginPipInteraction(event, 'move')}
             >
               {selectedAsset.media_type === 'image'
                 ? <img
-                    key={selectedAsset.id}
+                    key={`${selectedAsset.id}-${selectedIndex}-${playing}`}
                     src={`${API}${selectedAsset.file_url}`}
                     alt={selectedAsset.file_name}
                     style={{ opacity: fade, transition: 'opacity .3s' }}
                   />
                 : <video
-                    key={selectedAsset.id}
+                    key={`${selectedAsset.id}-${selectedIndex}-${playing}`}
                     src={`${API}${selectedAsset.file_url}`}
                     muted
-                    loop
                     autoPlay
                     playsInline
                     style={{ opacity: fade, transition: 'opacity .3s' }}

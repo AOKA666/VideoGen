@@ -22,6 +22,7 @@ from uuid import uuid4
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from services.store import public_url
+from services.title_style import TITLE_FONT_SIZE_PX
 from services.storyboard_style import (
     STORYBOARD_STYLE_PROMPT,
     sanitize_storyboard_visual_prompt,
@@ -527,7 +528,7 @@ def cover_title_layout(
 ) -> dict:
     """Return the shared title geometry used by covers and exported video."""
     scale = canvas_width / 1080
-    font_size = max(12, round(124 * scale))
+    font_size = max(12, round(TITLE_FONT_SIZE_PX * scale))
     stroke_width = max(2, round(8 * scale))
     line_gap = max(8, round(30 * scale))
     max_text_width = canvas_width - max(24, round(80 * scale))
@@ -567,8 +568,8 @@ def normalize_cover_title_positions(value: dict | None = None) -> dict:
     """Return safe, normalized positions and sizes for both editable title lines."""
     source = value if isinstance(value, dict) else {}
     defaults = {
-        "line1": {"x": 0.5, "y": 0.18, "font_size": 124},
-        "line2": {"x": 0.5, "y": 0.25, "font_size": 124},
+        "line1": {"x": 0.5, "y": 0.18, "font_size": TITLE_FONT_SIZE_PX},
+        "line2": {"x": 0.5, "y": 0.25, "font_size": TITLE_FONT_SIZE_PX},
     }
     normalized: dict[str, dict[str, float | int]] = {}
     for key, fallback in defaults.items():
@@ -744,7 +745,7 @@ def compose_uploaded_cover(
             (canvas_height - fitted_cover.height) // 2,
         ),
     )
-    normalized_mask_opacity = max(0.0, min(0.8, float(mask_opacity)))
+    normalized_mask_opacity = max(0.0, min(1.0, float(mask_opacity)))
     if normalized_mask_opacity:
         canvas = Image.blend(
             canvas,

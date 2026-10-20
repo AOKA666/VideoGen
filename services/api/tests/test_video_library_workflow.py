@@ -228,6 +228,96 @@ def _can_create_jianying_draft() -> bool:
 
 @unittest.skipUnless(_can_create_jianying_draft(), "pyJianYingDraft/pymediainfo unavailable")
 class JianyingVideoDraftTests(unittest.TestCase):
+    def test_both_export_modes_keep_editable_cover_on_first_export_and_reexport(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            audio = make_audio(root / "voice.mp3", 1.13)
+            video = make_video(root / "clip.mp4", 1.2, "640x480")
+            picture = root / "scene.png"
+            cover = root / "cover.png"
+            Image.new("RGB", (108, 192), (20, 50, 90)).save(picture)
+            Image.new("RGB", (108, 192), (190, 40, 60)).save(cover)
+            srt = root / "subtitles.srt"
+            srt.write_text("1\n00:00:00,000 --> 00:00:01,130\n封面测试\n\n", encoding="utf-8")
+            shots = [{"shot_index": 1, "start_time": 0, "end_time": 1.13, "duration_sec": 1.13}]
+            (root / "drafts").mkdir()
+            with patch.object(video_export_service, "jianying_drafts_root", return_value=root / "drafts"):
+                for mode, scene in [("image", picture), ("video", video)]:
+                    previous_id = None
+                    for attempt in range(2):
+                        with self.subTest(mode=mode, attempt=attempt):
+                            report = video_export_service.create_jianying_native_draft(
+                                root / "package", f"cover_{mode}", shots, [scene], audio, srt,
+                                cover_path=cover, scene_media=mode, animate_scenes=False,
+                            )
+                            live = Path(report["draft_path"])
+                            self.assertNotEqual(previous_id, report["cover"]["cover_draft_id"])
+                            previous_id = report["cover"]["cover_draft_id"]
+                            for destination in [live, root / "package"]:
+                                content = json.loads((destination / "draft_content.json").read_text(encoding="utf-8"))
+                                composition = next(m["draft"] for m in content["materials"]["drafts"]
+                                                   if m["id"] == content["cover"]["cover_draft_id"])
+                                segment = composition["tracks"][0]["segments"][0]
+                                time = segment["target_timerange"]
+                                self.assertEqual(composition["duration"], time["start"] + time["duration"])
+                                self.assertGreater(composition["duration"], content["duration"])
+                                self.assertEqual(segment["track_render_index"], 101)
+                                material = composition["materials"]["videos"][0]
+                                resource = destination / "Resources/cover" / material["path"].rsplit("/", 1)[1]
+                                self.assertTrue(resource.is_file())
+                                self.assertTrue((destination / "draft_local_cover.jpg").is_file())
+                                with Image.open(resource) as image:
+                                    self.assertEqual(image.size, (108, 192))
+                                    self.assertGreater(image.getpixel((50, 100))[0], 180)
+
+    def test_uploaded_cover_is_an_independent_composition(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "uploaded.png"
+            Image.new("RGB", (108, 192), (30, 120, 60)).save(source)
+            content = {
+                "duration": 10_000_000,
+                "tracks": [{"name": "main", "segments": []}],
+                "materials": {"drafts": [{"id": "unrelated", "type": "composition"}]},
+            }
+            content_path = root / "draft_content.json"
+            content_path.write_text(json.dumps(content), encoding="utf-8")
+            meta_path = root / "draft_meta_info.json"
+            meta_path.write_text('{"draft_id":"keep","draft_cover":""}', encoding="utf-8")
+            for _ in range(2):
+                report = video_export_service._install_jianying_cover(root, source)
+                actual = json.loads(content_path.read_text(encoding="utf-8"))
+                self.assertEqual(actual["duration"], content["duration"])
+                self.assertEqual(actual["tracks"], content["tracks"])
+                self.assertEqual(len(actual["materials"]["drafts"]), 2)
+                cover = next(m for m in actual["materials"]["drafts"]
+                             if m["id"] == actual["cover"]["cover_draft_id"])
+                self.assertEqual(actual["cover"]["sub_type"], "local")
+                composition = cover["draft"]
+                segment = composition["tracks"][0]["segments"][0]
+                material = next(m for m in composition["materials"]["videos"]
+                                if m["id"] == segment["material_id"])
+                self.assertTrue(material["path"].startswith("##_draftpath_placeholder_"))
+                self.assertEqual(material["path"].split("/Resources/cover/")[1],
+                                 Path(report["cover_path"]).name)
+                self.assertTrue(Path(report["cover_path"]).is_file())
+                self.assertEqual(cover["id"], composition["id"] + "_material")
+                timerange = segment["target_timerange"]
+                self.assertGreater(timerange["start"], content["duration"])
+                self.assertEqual(composition["duration"],
+                                 timerange["start"] + timerange["duration"])
+                self.assertEqual(segment["render_index"], 101)
+                self.assertEqual(segment["track_render_index"], 101)
+                self.assertEqual((material["width"], material["height"]), (108, 192))
+                self.assertTrue(Path(report["local_cover_path"]).is_file())
+                metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+                self.assertEqual(metadata["draft_id"], "keep")
+                self.assertEqual(metadata["draft_cover"], report["draft_cover_path"])
+
     def test_background_template_and_clips_are_layered_into_the_window(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

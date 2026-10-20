@@ -13,6 +13,7 @@ from uuid import uuid4
 from PIL import Image, ImageOps
 
 from services.settings_service import configured_jianying_directory
+from services.title_style import TITLE_JIANYING_FONT_SIZE
 
 SUBTITLE_RGB_COLOR = (1.0, 1.0, 1.0)
 SUBTITLE_JIANYING_BORDER_WIDTH = 40.0
@@ -159,7 +160,7 @@ def _add_product_placement_track(
     script, draft, placement: dict | None, clip_relative_index: int,
     materials_dir: Path, audio_duration_us: int,
 ) -> dict | None:
-    """Add a PIP track above the base clips, with looping and dissolve transitions."""
+    """Add a PIP track above the base clips, at original speed with dissolve transitions."""
     items = (placement or {}).get("items") or []
     if not items:
         return None
@@ -168,7 +169,7 @@ def _add_product_placement_track(
     except (TypeError, ValueError):
         start_us = 0
     start_us = min(max(start_us, 0), audio_duration_us)
-    if audio_duration_us - start_us < 500_000:
+    if audio_duration_us - start_us <= 0:
         return None
 
     track_name = "products"
@@ -214,18 +215,11 @@ def _add_product_placement_track(
             transform_y=transform_y,
         )
 
-        fill_duration = bool(item.get("fill_duration", True))
         if material.material_type == "video":
             if material.duration <= 0:
                 raise ValueError(f"无法读取带货视频时长：{source.name}")
-            if not fill_duration:
-                # Without "撑满时长", never stretch beyond the source video.
-                remaining = min(remaining, material.duration)
-            source_duration_us = (
-                material.duration
-                if fill_duration and remaining > material.duration
-                else min(remaining, material.duration)
-            )
+            remaining = min(remaining, material.duration)
+            source_duration_us = remaining
         else:
             source_duration_us = remaining
         if remaining <= 0:
@@ -297,7 +291,7 @@ def _add_product_placement_track(
 def _jianying_title_geometry(line1: str, line2: str) -> dict[str, float]:
     """Keep calibrated Jianying title geometry independent of cover font changes."""
     return {
-        "font_size": 15.0,
+        "font_size": TITLE_JIANYING_FONT_SIZE,
         "line1_transform_y": 0.645,
         "line2_transform_y": 0.485,
     }
@@ -323,34 +317,90 @@ def jianying_drafts_root() -> Path:
 
 
 def _install_jianying_cover(draft_path: Path, cover_path: Path) -> dict[str, str]:
+    import pyJianYingDraft as draft
+
+    content_path = draft_path / "draft_content.json"
+    content = json.loads(content_path.read_text(encoding="utf-8-sig"))
     cover_id = str(uuid4()).upper()
     resource_dir = draft_path / "Resources" / "cover"
     resource_dir.mkdir(parents=True, exist_ok=True)
     resource_cover = resource_dir / f"{cover_id}.jpg"
     root_cover = draft_path / "draft_cover.jpg"
+    local_cover = draft_path / "draft_local_cover.jpg"
 
     with Image.open(cover_path) as source:
         cover = ImageOps.exif_transpose(source).convert("RGB")
         cover.save(resource_cover, format="JPEG", quality=95, optimize=True)
         cover.save(root_cover, format="JPEG", quality=95, optimize=True)
+        thumbnail = cover.copy()
+        thumbnail.thumbnail((320, 320), Image.Resampling.LANCZOS)
+        thumbnail.save(local_cover, format="JPEG", quality=95)
+        width, height = cover.size
 
-    content_path = draft_path / "draft_content.json"
-    content = json.loads(content_path.read_text(encoding="utf-8"))
+    # Jianying's editable cover is a separate composition referenced by
+    # cover_draft_id, not an image path on the main timeline.
+    # Verified against a native Jianying 11.6 draft and the editor's cover slot:
+    # preserve the nested duration, use a draft-relative resource path and
+    # render layer 101. The same installer serves both image and video exports.
+    cover_script = draft.ScriptFile(width, height, 30, False)
+    cover_script.add_track(draft.TrackType.video, "cover", relative_index=101)
+    cover_script.add_segment(draft.VideoSegment(
+        str(resource_cover.resolve()),
+        draft.Timerange(int(content.get("duration") or 0) + 1_000_000, 3_000_000),
+        source_timerange=draft.Timerange(0, 3_000_000),
+        volume=0.0,
+    ), "cover")
+    composition = json.loads(cover_script.dumps())
+    # Match a native 11.6 cover: the composition must include its image's
+    # complete time range. A zero duration survives as an empty editor cover.
+    composition["id"] = cover_id
+    composition["new_version"] = content.get("new_version", composition["new_version"])
+    composition["canvas_config"] = {}
+    composition["config"]["sticker_max_index"] = 14000
+    composition["tracks"][0]["segments"][0]["track_render_index"] = 101
+    composition["materials"]["videos"][0]["path"] = (
+        "##_draftpath_placeholder_0E685133-18CE-45ED-8CB8-2904A212EC80_##"
+        f"/Resources/cover/{resource_cover.name}"
+    )
+    composition_id = f"{cover_id}_material"
+    old_cover_id = (content.get("cover") or {}).get("cover_draft_id")
+    materials = content.setdefault("materials", {})
+    materials["drafts"] = [
+        item for item in materials.get("drafts", [])
+        if not old_cover_id or item.get("id") != old_cover_id
+    ] + [{
+        "id": composition_id,
+        "type": "composition",
+        "draft": composition,
+        "category_id": "",
+        "category_name": "",
+        "combination_id": "",
+        "formula_id": "",
+        "name": "",
+        "precompile_combination": False,
+    }]
     content["cover"] = {
-        "path": str(resource_cover.resolve()),
+        "cover_draft_id": composition_id,
+        "cover_template": None,
+        "sub_type": "local",
         "type": "image",
-        "time": 0,
-        "time_ms": 0,
-        "custom_cover_id": cover_id,
+        "web_cover_info": None,
     }
-    content["static_cover_image_path"] = str(resource_cover.resolve())
+    content["static_cover_image_path"] = ""
     content_path.write_text(
         json.dumps(content, ensure_ascii=False, separators=(",", ":")),
         encoding="utf-8",
     )
+    meta_path = draft_path / "draft_meta_info.json"
+    if meta_path.is_file():
+        metadata = json.loads(meta_path.read_text(encoding="utf-8-sig"))
+        metadata["draft_cover"] = str(root_cover.resolve())
+        meta_path.write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
     return {
         "cover_path": str(resource_cover.resolve()),
         "draft_cover_path": str(root_cover.resolve()),
+        "local_cover_path": str(local_cover.resolve()),
+        "cover_draft_id": composition_id,
         "custom_cover_id": cover_id,
     }
 

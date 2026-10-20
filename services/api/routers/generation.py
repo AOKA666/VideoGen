@@ -803,7 +803,7 @@ def generate_cover(
     project_id: str,
     file: UploadFile | None = File(None),
     title_positions: str = Form(""),
-    mask_opacity: float = Form(0.35),
+    mask_opacity: float = Form(0.0),
     preset_id: str = Form(""),
 ):
     db = load_db()
@@ -848,7 +848,7 @@ def generate_cover(
         except json.JSONDecodeError as exc:
             raise ValueError("Invalid cover title positions") from exc
         positions = normalize_cover_title_positions(raw_positions)
-        normalized_mask_opacity = max(0.0, min(0.8, float(mask_opacity)))
+        normalized_mask_opacity = max(0.0, min(1.0, float(mask_opacity)))
         compose_uploaded_cover(
             source_path,
             cover_path,

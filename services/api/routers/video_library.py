@@ -24,6 +24,7 @@ from services.product_placement_service import (
     MAX_ITEMS,
     MIN_ITEM_DURATION_SEC,
     normalize_pip_box,
+    normalize_item_timing,
 )
 from services.store import assets_dir, db_write_transaction, load_db, public_url, save_db
 from services.text_service import generate_viral_title
@@ -49,7 +50,7 @@ class VoicePreviewPayload(BaseModel):
 class PlacementPresetItem(BaseModel):
     asset_id: str
     duration_sec: float = 3.0
-    fill_duration: bool = True
+    duration_mode: str = "custom"
     pip_box: dict | None = None
 
 
@@ -148,7 +149,7 @@ def upsert_preset(
     background_music_start_sec: float = Form(0),
     background_music_volume: float = Form(0.2),
     cover_title_positions: str = Form(""),
-    cover_mask_opacity: float = Form(0.35),
+    cover_mask_opacity: float = Form(0.0),
     cover_source_preset_id: str = Form(""),
     file: UploadFile | None = File(None),
 ):
@@ -231,7 +232,7 @@ def upsert_preset(
         "cover_source_path": str(new_cover_path) if new_cover_path else "",
         "cover_source_url": public_url(new_cover_path) if new_cover_path else "",
         "cover_title_positions": positions,
-        "cover_mask_opacity": round(max(0.0, min(float(cover_mask_opacity), 0.8)), 3),
+        "cover_mask_opacity": round(max(0.0, min(float(cover_mask_opacity), 1.0)), 3),
         "created_at": (existing or {}).get("created_at") or now,
         "updated_at": now,
     }
@@ -301,14 +302,9 @@ def upsert_placement_preset(payload: PlacementPresetPayload):
         asset = assets.get(str(item.asset_id or ""))
         if not asset:
             raise HTTPException(400, f"第 {index + 1} 个带货素材不存在")
-        duration = max(MIN_ITEM_DURATION_SEC, min(float(item.duration_sec or 0), MAX_ITEM_DURATION_SEC))
-        source_duration = float(asset.get("duration_sec") or 0)
-        if asset.get("media_type") == "video" and source_duration > 0 and not item.fill_duration:
-            duration = min(duration, source_duration)
         items.append({
             "asset_id": asset["id"],
-            "duration_sec": round(duration, 3),
-            "fill_duration": bool(item.fill_duration),
+            **normalize_item_timing(asset, item.model_dump()),
             "pip_box": normalize_pip_box(item.pip_box or default_box),
         })
 

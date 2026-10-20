@@ -220,7 +220,8 @@ def _export_video_library_draft(db: dict, project: dict) -> dict:
                     "requested_duration_sec": item["requested_duration_sec"],
                     "effective_duration_sec": item["duration_sec"],
                     "source_path": item["path"],
-                    "fill_duration": item.get("fill_duration", True),
+                    "fill_duration": False,
+                    "duration_mode": item.get("duration_mode", "custom"),
                     "source_duration_sec": item.get("source_duration_sec"),
                     "pip_box": item.get("pip_box"),
                 }

@@ -46,6 +46,7 @@ class ProductPipBox(BaseModel):
 class ProductPlacementItem(BaseModel):
     asset_id: str
     duration_sec: float = 3.0
+    duration_mode: str = "custom"
     pip_box: ProductPipBox | None = None
 
 

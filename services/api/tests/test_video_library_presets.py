@@ -66,7 +66,7 @@ class PresetTests(unittest.TestCase):
         self.assertEqual(preset["name"], "沉稳男声")
         self.assertEqual(preset["speech_rate"], -50)
         self.assertEqual(preset["voice_volume"], 3.0)
-        self.assertEqual(preset["cover_mask_opacity"], 0.8)
+        self.assertEqual(preset["cover_mask_opacity"], 0.9)
         self.assertTrue(preset["cover_available"])
         self.assertNotIn("title_line1", preset)
         self.assertNotIn("title_line2", preset)

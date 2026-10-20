@@ -4,6 +4,7 @@ import { Archive, Check, ChevronLeft, ChevronRight, Copy, Download, Eraser, Film
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import './styles.css';
+import './studio.css';
 import { MediaLibrary, TemplatePicker } from './MediaWorkflow';
 import { ProductPlacementPanel } from './ProductWorkflow';
 
@@ -23,8 +24,8 @@ const IMAGE_GENERATION_PROVIDER_LABELS = {
 const MAX_VOICE_VOLUME_PERCENT = 300;
 const PRODUCT_MARKER = '【带货开始】';
 const DEFAULT_COVER_TITLE_POSITIONS = {
-  line1: { x: 0.5, y: 0.18, font_size: 124 },
-  line2: { x: 0.5, y: 0.25, font_size: 124 },
+  line1: { x: 0.5, y: 0.18, font_size: 80 },
+  line2: { x: 0.5, y: 0.25, font_size: 80 },
 };
 const VOICE_OPTIONS = [
   { value: 'zh_male_m191_uranus_bigtts', label: '男声 · 沉稳叙事' },
@@ -191,14 +192,14 @@ function assetImageUrl(asset) {
   return `${API}${asset.file_url}${version ? `?v=${encodeURIComponent(version)}` : ''}`;
 }
 
-function normalizeCoverTitlePositions(value) {
+function normalizeCoverTitlePositions(value, upgradeLegacyDefault = false) {
   const source = value && typeof value === 'object' ? value : {};
   return Object.fromEntries(Object.entries(DEFAULT_COVER_TITLE_POSITIONS).map(([key, fallback]) => {
     const line = source[key] && typeof source[key] === 'object' ? source[key] : {};
     return [key, {
       x: Math.max(0.03, Math.min(0.97, Number(line.x ?? fallback.x) || fallback.x)),
       y: Math.max(0.03, Math.min(0.97, Number(line.y ?? fallback.y) || fallback.y)),
-      font_size: Math.max(32, Math.min(260, Number(line.font_size ?? fallback.font_size) || fallback.font_size)),
+      font_size: Math.max(32, Math.min(260, Number(upgradeLegacyDefault && [124, 162].includes(Number(line.font_size)) ? fallback.font_size : (line.font_size ?? fallback.font_size)) || fallback.font_size)),
     }];
   }));
 }
@@ -357,7 +358,7 @@ function App() {
   const [coverImage, setCoverImage] = useState(null);
   const [coverImagePreviewUrl, setCoverImagePreviewUrl] = useState('');
   const [coverTitlePositions, setCoverTitlePositions] = useState(DEFAULT_COVER_TITLE_POSITIONS);
-  const [coverMaskOpacity, setCoverMaskOpacity] = useState(35);
+  const [coverMaskOpacity, setCoverMaskOpacity] = useState(0);
   const projectCoverTitlePositionsKey = JSON.stringify(project?.cover_title_positions ?? null);
   const [backgroundMusicId, setBackgroundMusicId] = useState('');
   const [backgroundMusicStart, setBackgroundMusicStart] = useState(0);
@@ -383,6 +384,7 @@ function App() {
     () => window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === 'true',
   );
   const scriptTextareaRef = useRef(null);
+  const productPlacementSaveRef = useRef(null);
   const coverInputRef = useRef(null);
   const musicInputRef = useRef(null);
   const musicPreviewRef = useRef(null);
@@ -591,8 +593,8 @@ function App() {
     setPublishShortTitle(project.publish_short_title || '');
     setPublishDescription(project.publish_description || '');
     setCoverImage(null);
-    setCoverTitlePositions(normalizeCoverTitlePositions(project.cover_title_positions));
-    setCoverMaskOpacity(Math.round(Number(project.cover_mask_opacity ?? 0.35) * 100));
+    setCoverTitlePositions(normalizeCoverTitlePositions(project.cover_title_positions, true));
+    setCoverMaskOpacity(Math.round(Number(project.cover_mask_opacity ?? 0) * 100));
     setBackgroundMusicId(project.background_music_id || '');
     setBackgroundMusicStart(Number(project.background_music_start_sec || 0));
     setBackgroundMusicVolume(Math.round(Number(project.background_music_volume ?? 0.2) * 100));
@@ -1757,8 +1759,8 @@ function App() {
     setBackgroundMusicId(music ? music.id : '');
     setBackgroundMusicStart(Number(preset.background_music_start_sec || 0));
     setBackgroundMusicVolume(Math.round(Number(preset.background_music_volume ?? 0.2) * 100));
-    setCoverTitlePositions(normalizeCoverTitlePositions(preset.cover_title_positions));
-    setCoverMaskOpacity(Math.round(Number(preset.cover_mask_opacity ?? 0.35) * 100));
+    setCoverTitlePositions(normalizeCoverTitlePositions(preset.cover_title_positions, true));
+    setCoverMaskOpacity(Math.round(Number(preset.cover_mask_opacity ?? 0) * 100));
     setCoverImage(null);
     setCoverPresetId(preset.cover_available ? preset.id : '');
     setCoverPresetImageUrl(preset.cover_available ? preset.cover_source_url : '');
@@ -1920,10 +1922,14 @@ function App() {
       const generated = await generateVoiceAndSubtitles();
       if (!generated) return;
     }
-    const data = await run('导出剪映草稿', () => request(
-      `/api/projects/${projectId}/export/package`,
-      { method: 'POST' },
-    ));
+    const data = await run('导出剪映草稿', async () => {
+      const panel = productPlacementSaveRef.current;
+      if (panel?.projectId === projectId && !await panel.save()) return null;
+      return request(
+        `/api/projects/${projectId}/export/package`,
+        { method: 'POST' },
+      );
+    });
     if (!data) return;
     setExportResult(data);
     await refreshProject(projectId);
@@ -2164,23 +2170,37 @@ function App() {
             event.target.value = '';
           }}
         />
-        <label>
-          音乐库
+        <div className="music-library-field">
+          <span>音乐库</span>
           <div className="music-library-row">
-            <select
-              value={backgroundMusicId}
-              onChange={(event) => {
-                setBackgroundMusicId(event.target.value);
-                setBackgroundMusicStart(0);
-              }}
-            >
-              <option value="">不添加背景音乐</option>
+            <div className="music-chips" role="radiogroup" aria-label="背景音乐">
+              <button
+                type="button"
+                role="radio"
+                aria-checked={!backgroundMusicId}
+                className={!backgroundMusicId ? 'music-chip selected' : 'music-chip'}
+                onClick={() => setBackgroundMusicId('')}
+              >
+                <span>无音乐</span>
+              </button>
               {musicLibrary.map((music) => (
-                <option key={music.id} value={music.id}>
-                  {music.name} · {Math.round(Number(music.duration_sec || 0))}秒
-                </option>
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={backgroundMusicId === music.id}
+                  className={backgroundMusicId === music.id ? 'music-chip selected' : 'music-chip'}
+                  key={music.id}
+                  title={`${music.name} · ${Math.round(Number(music.duration_sec || 0))}秒`}
+                  onClick={() => {
+                    setBackgroundMusicId(music.id);
+                    setBackgroundMusicStart(0);
+                  }}
+                >
+                  <span>{music.name}</span>
+                  <small>{Math.round(Number(music.duration_sec || 0))}秒</small>
+                </button>
               ))}
-            </select>
+            </div>
             <button
               type="button"
               className="danger icon-button"
@@ -2189,10 +2209,10 @@ function App() {
               disabled={!backgroundMusicId || busy}
               onClick={deleteBackgroundMusic}
             >
-              <Trash2 size={18} />
+              <Trash2 size={16} />
             </button>
           </div>
-        </label>
+        </div>
         <button type="button" onClick={() => musicInputRef.current?.click()}>
           <Music size={18} /> 上传音乐并加入音乐库
         </button>
@@ -2286,7 +2306,7 @@ function App() {
             <input
               type="range"
               min="0"
-              max="80"
+              max="100"
               step="1"
               value={coverMaskOpacity}
               onChange={(event) => setCoverMaskOpacity(Number(event.target.value))}
@@ -2342,8 +2362,9 @@ function App() {
         >
           {sidebarCollapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
         </button>
-        <div className="brand"><Film size={22} /><span className="brand-label">草稿生成器</span></div>
-        <nav>
+        <div className="brand"><span className="brand-symbol"><Film size={22} /></span><span className="brand-label">VideoGen<small>短视频创作工作台</small></span></div>
+        <div className="nav-caption">工作空间</div>
+        <nav aria-label="主导航">
           <button
             title="项目"
             className={tab === 'create' ? 'active' : ''}
@@ -2351,7 +2372,7 @@ function App() {
               if (tab === 'export' && project?.workflow_type === 'video_library') resetPerVideoDraft();
               setTab('create');
             }}
-          ><Scissors size={18} /><span>项目</span></button>
+          ><Scissors size={18} /><span>新建视频</span></button>
           <button title="项目工作台" className={tab === 'projects' ? 'active' : ''} onClick={() => setTab('projects')}><Archive size={18} /><span>项目工作台</span></button>
           <button title="素材库" className={tab === 'library' ? 'active' : ''} onClick={() => { setTab('library'); refreshMedia().catch(error => setMessage(error.message)); }}><Film size={18} /><span>素材库</span></button>
           {project && project.workflow_type !== 'video_library' && <button title="文案" className={tab === 'script' ? 'active' : ''} disabled={!projectId} onClick={() => setTab('script')}><Wand2 size={18} /><span>文案</span></button>}
@@ -2384,11 +2405,14 @@ function App() {
       </aside>
 
       <main>
-        <header className="topbar">
-          <div>
-            <h1>{tab === 'settings' ? '本地设置' : tab === 'create' ? '新建视频' : tab === 'projects' ? '项目工作台' : (project?.name || 'AI 短视频草稿工作台')}</h1>
-            <p>{tab === 'settings' ? '项目与剪映草稿保存位置' : '输入文案 · 配音 · 标题 · 音乐 · 封面 · 导出剪映草稿'}</p>
-          </div>
+        <header className={tab === 'create' ? 'topbar compact-topbar' : 'topbar'}>
+          {tab === 'create' && <div className="workspace-breadcrumb"><span>工作空间</span><ChevronRight size={14} /><strong>新建视频</strong></div>}
+          {tab !== 'create' && (
+            <div>
+              <h1>{tab === 'settings' ? '本地设置' : tab === 'projects' ? '项目工作台' : (project?.name || 'AI 短视频草稿工作台')}</h1>
+              <p>{tab === 'settings' ? '项目与剪映草稿保存位置' : '输入文案 · 配音 · 标题 · 音乐 · 封面 · 导出剪映草稿'}</p>
+            </div>
+          )}
           <div className="top-actions">
             {project && tab !== 'create' && tab !== 'projects' && (
               <div className="project-name-editor">
@@ -2511,6 +2535,7 @@ function App() {
             </section>
             <ProductPlacementPanel
               key={project.id}
+              saveRef={productPlacementSaveRef}
               project={project}
               projectId={projectId}
               media={media}
@@ -2613,16 +2638,17 @@ function App() {
               <div className="panel create-script-panel">
                 <div className="create-heading">
                   <div>
+                    <span className="studio-eyebrow">VIDEO STUDIO</span>
                     <h2>新建视频</h2>
-                    <p>输入文案，提前选好配音、标题、背景音乐和封面；创建后直接导出剪映草稿。</p>
+                    <p>让好文案，成为好视频。配置画面与声音，一键生成剪映草稿。</p>
                   </div>
                   <span className="create-badge">9:16 · 1080 × 1920</span>
                 </div>
                 <div className={`create-fields ${creationStatus.active ? 'busy' : ''}`}>
                   {renderPresetPanel()}
                   <div className="create-flow">
-                    <section className="create-card">{renderTitleSettings('create')}</section>
-                    <section className="create-card">
+                    <section className="create-card create-card-title">{renderTitleSettings('create')}</section>
+                    <section className="create-card create-card-script">
                       <div className="create-card-head">
                         <h3>视频文案</h3>
                         <span className="script-character-count">{scriptCharacterCount(rawScriptDraft)} 字</span>
@@ -2638,22 +2664,24 @@ function App() {
                             : '把光标放到需要开始展示带货画面的位置，再点击插入。'}
                         </small>
                       </div>
+                    </section>
+                    <section className="create-card create-card-template">
                       <TemplatePicker templates={media.templates} value={backgroundTemplateId} onChange={setBackgroundTemplateId} reload={refreshMedia} onError={setMessage} />
                     </section>
-                    <section className="create-card">{renderVoiceSettings('create')}</section>
-                    <section className="create-card">{renderMusicSettings('create')}</section>
-                    <section className="create-card">{renderCoverWorkspace('create')}</section>
+                    <section className="create-card create-card-voice">{renderVoiceSettings('create')}</section>
+                    <section className="create-card create-card-music">{renderMusicSettings('create')}</section>
+                    <section className="create-card create-card-cover">{renderCoverWorkspace('create')}</section>
                   </div>
                 </div>
                 {creationStatus.active && <p className="video-progress" role="status">{creationStatus.label}</p>}
                 {creationStatus.error && <p className="video-error" role="alert">{creationStatus.error}</p>}
-                {!media.videos.length && <p>素材库还没有视频。<button type="button" onClick={() => setTab('library')}>上传视频素材</button></p>}
+                {!media.videos.length && <p className="studio-empty-hint"><Film size={18} /><span>先添加视频素材，开启你的第一条创作。</span><button type="button" onClick={() => setTab('library')}>上传视频素材 <ChevronRight size={14} /></button></p>}
                 <div className="script-create-actions">
                   <button
                     className="primary"
                     disabled={busy || !rawScriptDraft.trim() || !media.videos.length || !media.templates.length || !titleLine1.trim() || !titleLine2.trim() || (audioSource === 'upload' && !audioFile)}
                   >
-                    <Film size={18} /> {creationStatus.active ? creationStatus.label : '生成'}
+                    <Film size={18} /> {creationStatus.active ? creationStatus.label : '生成视频草稿'}
                   </button>
                 </div>
               </div>
@@ -3212,7 +3240,7 @@ function App() {
                   <input
                     type="range"
                     min="0"
-                    max="80"
+                    max="100"
                     step="1"
                     value={coverMaskOpacity}
                     onChange={(event) => setCoverMaskOpacity(Number(event.target.value))}
