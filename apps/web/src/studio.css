@@ -85,6 +85,31 @@ small { line-height: 1.65; }
 .create-card > .cover-workspace > .cover-section > h3::before,
 .create-card-template .template-picker .media-heading h3::before { content: counter(create-step, decimal-leading-zero); width: 26px; height: 26px; border-radius: 7px; background: #edf4ef; color: #4c8261; font-size: 11px; margin-right: 10px; }
 .video-create-form .create-script-textarea { min-height: 230px; padding: 18px; line-height: 1.95; background: #fbfcfb; }
+.script-editor { position: relative; }
+.script-editor-highlight {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  overflow: hidden;
+  padding: 18px;
+  padding-right: calc(18px + var(--script-scrollbar, 0px));
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: transparent;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.95;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  pointer-events: none;
+}
+.script-editor .create-script-textarea { position: relative; z-index: 1; }
+.script-editor-highlight .product-marker-highlight {
+  color: transparent;
+  background: rgba(251, 146, 60, .34);
+  border-radius: 3px;
+  box-shadow: 0 0 0 1px rgba(234, 88, 12, .62), inset 0 -2px 0 #ea580c;
+}
 .script-character-count { background: #f4f7f4; border-color: #e8eee8; color: #89968d; font-size: 11px; }
 .script-marker-row small { font-size: 11px; }
 .script-marker-row button { min-height: 32px; font-size: 11px; color: #62816a; }
