@@ -1,3 +1,6 @@
+import asyncio
+import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -13,9 +16,38 @@ load_env_local()
 store.ensure_storage()
 
 # Bump when routes change so start-local.ps1 does not reuse an outdated backend process.
-API_VERSION = 20
+API_VERSION = 21
 
-app = FastAPI(title="AI Video Draft API")
+
+def silence_windows_connection_resets() -> None:
+    """Windows' Proactor loop logs WinError 10054 when a browser aborts a media request.
+
+    Browsers routinely cancel range requests for videos (seeking, closing a preview),
+    which is expected and harmless, so keep the default handler from logging it.
+    """
+    if sys.platform != "win32":
+        return
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+
+    def handle(loop, context):
+        if isinstance(context.get("exception"), ConnectionResetError):
+            return
+        if previous is None:
+            loop.default_exception_handler(context)
+        else:
+            previous(loop, context)
+
+    loop.set_exception_handler(handle)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    silence_windows_connection_resets()
+    yield
+
+
+app = FastAPI(title="AI Video Draft API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
