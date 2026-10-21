@@ -11,25 +11,6 @@ const SIDEBAR_COLLAPSED_STORAGE_KEY = 'videogen.sidebarCollapsed';
 const MAX_VOICE_VOLUME_PERCENT = 300;
 const PRODUCT_MARKER = '【带货开始】';
 
-function renderScriptHighlight(text) {
-  const value = String(text || '');
-  const nodes = [];
-  let cursor = 0;
-  let key = 0;
-  while (cursor < value.length) {
-    const index = value.indexOf(PRODUCT_MARKER, cursor);
-    if (index < 0) {
-      nodes.push(value.slice(cursor));
-      break;
-    }
-    if (index > cursor) nodes.push(value.slice(cursor, index));
-    nodes.push(<mark key={key} className="product-marker-highlight">{PRODUCT_MARKER}</mark>);
-    key += 1;
-    cursor = index + PRODUCT_MARKER.length;
-  }
-  nodes.push('\uFEFF');
-  return nodes;
-}
 const DEFAULT_COVER_TITLE_POSITIONS = {
   line1: { x: 0.5, y: 0.18, font_size: 100 },
   line2: { x: 0.5, y: 0.25, font_size: 100 },
@@ -256,7 +237,6 @@ function App() {
     () => window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === 'true',
   );
   const scriptTextareaRef = useRef(null);
-  const scriptHighlightRef = useRef(null);
   const productPlacementSaveRef = useRef(null);
   const coverInputRef = useRef(null);
   const musicInputRef = useRef(null);
@@ -269,18 +249,6 @@ function App() {
   const creationInFlightRef = useRef(false);
   const creationProjectIdRef = useRef('');
   const creationDraftRef = useRef(null);
-
-  function syncScriptHighlight() {
-    const mirror = scriptHighlightRef.current;
-    const editor = scriptTextareaRef.current;
-    if (!mirror || !editor) return;
-    const styles = window.getComputedStyle(editor);
-    const border = (parseFloat(styles.borderLeftWidth) || 0)
-      + (parseFloat(styles.borderRightWidth) || 0);
-    const scrollbar = Math.max(0, editor.offsetWidth - editor.clientWidth - border);
-    mirror.parentElement?.style.setProperty('--script-scrollbar', `${scrollbar}px`);
-    mirror.scrollTop = editor.scrollTop;
-  }
 
   async function run(label, fn) {
     setBusy(true);
@@ -394,15 +362,6 @@ function App() {
     setCoverImagePreviewUrl(fallback ? `${API}${fallback}` : '');
     return undefined;
   }, [coverImage, coverPresetImageUrl, project?.cover_source_url, tab]);
-
-  useEffect(() => {
-    syncScriptHighlight();
-  }, [rawScriptDraft, sidebarCollapsed, tab]);
-
-  useEffect(() => {
-    window.addEventListener('resize', syncScriptHighlight);
-    return () => window.removeEventListener('resize', syncScriptHighlight);
-  }, []);
 
   useEffect(() => {
     if (!project) return;
@@ -1882,25 +1841,15 @@ function App() {
                         <h3>视频文案</h3>
                         <span className="script-character-count">{scriptCharacterCount(rawScriptDraft)} 字</span>
                       </div>
-                      <div className="script-editor">
-                        <div ref={scriptHighlightRef} className="script-editor-highlight" aria-hidden="true">
-                          {renderScriptHighlight(rawScriptDraft)}
-                        </div>
-                        <textarea
-                          ref={scriptTextareaRef}
-                          className="create-script-textarea"
-                          required
-                          value={rawScriptDraft}
-                          onChange={event => setRawScriptDraft(event.target.value)}
-                          onScroll={event => {
-                            if (scriptHighlightRef.current) {
-                              scriptHighlightRef.current.scrollTop = event.currentTarget.scrollTop;
-                            }
-                          }}
-                          placeholder="输入或粘贴视频文案，然后在下方配置配音、音乐和封面"
-                          aria-label="视频文案"
-                        />
-                      </div>
+                      <textarea
+                        ref={scriptTextareaRef}
+                        className="create-script-textarea"
+                        required
+                        value={rawScriptDraft}
+                        onChange={event => setRawScriptDraft(event.target.value)}
+                        placeholder="输入或粘贴视频文案，然后在下方配置配音、音乐和封面"
+                        aria-label="视频文案"
+                      />
                       <div className="script-marker-row">
                         <button type="button" onClick={insertProductMarker} disabled={rawScriptDraft.includes(PRODUCT_MARKER)}>
                           插入{PRODUCT_MARKER}
