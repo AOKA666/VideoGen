@@ -8,6 +8,8 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
+import math
 import urllib.error
 import urllib.request
 from difflib import SequenceMatcher
@@ -210,7 +212,9 @@ def extract_tts_response(body: bytes) -> dict:
     text = body.decode("utf-8", errors="replace").strip()
     audio = bytearray()
     sentences = []
+    completed = False
     for item in parse_chunked_json_objects(text):
+        completed = completed or item.get("code") == 20000000
         if item.get("code") not in (None, 0, 200, 20000000):
             raise RuntimeError(f"Volcengine TTS error: {item}")
         sentence = item.get("sentence")
@@ -235,6 +239,8 @@ def extract_tts_response(body: bytes) -> dict:
             data = data or payload_obj.get("data") or payload_obj.get("audio") or payload_obj.get("audio_data")
         if data:
             audio.extend(base64.b64decode(data))
+    if not completed:
+        raise RuntimeError("配音响应未完整结束，请重试；未保存不完整音频")
     if not audio:
         raise RuntimeError(f"Volcengine TTS response does not contain audio data: {text[:500]}")
     return {"audio": bytes(audio), "sentences": sentences}
@@ -246,9 +252,7 @@ def read_tts_response(response) -> bytes:
         try:
             chunk = response.read(8192)
         except http.client.IncompleteRead as exc:
-            if exc.partial:
-                chunks.append(exc.partial)
-            break
+            raise RuntimeError("配音传输中断，请重试；未保存不完整音频") from exc
         if not chunk:
             break
         chunks.append(chunk)
@@ -357,6 +361,23 @@ def _character_timeline_from_words(words: list[dict], source_text: str, duration
     recognized_text = "".join(item["char"] for item in recognized_chars)
     source_compact = "".join(source_chars)
     matcher = SequenceMatcher(None, source_compact, recognized_text, autojunk=False)
+    for tag, a, b, c, d in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        # TTS normalizes written numbers into spoken Chinese numbers.
+        numeric = "零〇一二三四五六七八九十百千万亿点两年月日号百分之"
+        if (tag == "replace" and any(ch.isdigit() for ch in source_compact[a:b])
+                and all(ch.isdigit() or ch in numeric for ch in source_compact[a:b])
+                and all(ch.isdigit() or ch in numeric for ch in recognized_text[c:d])):
+            continue
+        raise RuntimeError(f"配音与文案不一致（第 {a + 1} 字附近：{source_compact[a:b][:24] or recognized_text[c:d][:24]}），请重新生成")
+    previous_end = 0.0
+    for char in recognized_chars:
+        start, end = char["start"], char["end"]
+        if (not math.isfinite(start) or not math.isfinite(end)
+                or start < previous_end - 0.05 or end <= start or end > duration + 0.1):
+            raise RuntimeError("配音时间戳无效，请重新生成")
+        previous_end = end
     mapped: list[dict | None] = [None] * len(source_chars)
     for block in matcher.get_matching_blocks():
         for offset in range(block.size):
@@ -372,7 +393,7 @@ def _character_timeline_from_words(words: list[dict], source_text: str, duration
         right_time = mapped[following]["start"] if following is not None else duration
         left_index = previous if previous is not None else -1
         right_index = following if following is not None else len(mapped)
-        span = max(right_index - left_index, 1)
+        span = max(right_index - left_index - 1, 1)
         start = left_time + (right_time - left_time) * (index - left_index - 1) / span
         end = left_time + (right_time - left_time) * (index - left_index) / span
         mapped[index] = {"char": source_chars[index], "start": start, "end": end}
@@ -423,6 +444,8 @@ def _weighted_subtitle_timeline(shots: list[dict], duration: float, max_hanzi: i
 def align_voice_to_script(path: Path, shots: list[dict], duration: float, sentences: list[dict],
                           max_hanzi: int = 6) -> dict:
     words = _official_timestamp_words(sentences)
+    if not words:
+        raise RuntimeError("配音未返回逐字时间戳，无法生成准确字幕，请重新生成")
 
     full_text = "".join(str(shot.get("voice_text") or "") for shot in shots)
     characters = _character_timeline_from_words(words, full_text, duration) if words else []
@@ -538,11 +561,23 @@ def _correct_subtitle_onsets(timings: list[dict], boundaries: list[tuple[float, 
     return corrected
 
 
+def split_voice_text(text: str, limit: int = 240) -> list[str]:
+    """Keep sentence boundaries and preserve every character in request order."""
+    chunks = []
+    while len(text) > limit:
+        boundaries = list(re.finditer(r"[。！？!?；;\n]", text[:limit]))
+        if not boundaries:
+            boundaries = list(re.finditer(r"[，,、]", text[:limit]))
+        cut = boundaries[-1].end() if boundaries else limit
+        chunks.append(text[:cut])
+        text = text[cut:]
+    if text:
+        chunks.append(text)
+    return chunks
+
+
 def synthesize_project_voice(path: Path, shots: list[dict], voice_type: str | None = None,
                              speech_rate: int | None = None, max_hanzi: int = 6) -> dict:
-    legacy_chunk_dir = path.parent / "voice_chunks"
-    if legacy_chunk_dir.exists():
-        shutil.rmtree(legacy_chunk_dir)
     full_text = "".join(
         str(shot.get("voice_text") or "").strip()
         for shot in shots
@@ -550,12 +585,53 @@ def synthesize_project_voice(path: Path, shots: list[dict], voice_type: str | No
     )
     if not full_text:
         raise RuntimeError("No voice text to synthesize")
-    response = synthesize_volcengine_tts(full_text, voice_type, speech_rate)
-    path.write_bytes(response["audio"])
-    final_duration = audio_duration(path)
-    alignment = align_voice_to_script(
-        path, shots, final_duration, response.get("sentences") or [], max_hanzi=max_hanzi,
-    )
+    # Decode each MP3 before joining: concatenated MP3 headers/padding can
+    # otherwise cause duration drift. Offsets follow actual decoded samples.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="voice-", dir=path.parent) as tmp:
+        work = Path(tmp)
+        sentences = []
+        samples = 0
+        with (work / "joined.pcm").open("wb") as joined:
+            for index, chunk in enumerate(split_voice_text(full_text), 1):
+                response = synthesize_volcengine_tts(chunk, voice_type, speech_rate)
+                part = work / "part.mp3"
+                part.write_bytes(response["audio"])
+                decoded = subprocess.run(
+                    ["ffmpeg", "-v", "error", "-nostdin", "-i", str(part),
+                     "-f", "s16le", "-ac", "1", "-ar", "24000", "pipe:1"],
+                    capture_output=True, check=True, timeout=120,
+                    creationflags=0x08000000 if os.name == "nt" else 0,
+                ).stdout
+                duration = len(decoded) / 48000
+                words = _official_timestamp_words(response.get("sentences") or [])
+                if not words or not decoded:
+                    raise RuntimeError(f"第 {index} 段配音缺少音频或时间戳，请重新生成")
+                try:
+                    _character_timeline_from_words(words, chunk, duration)
+                except RuntimeError as exc:
+                    raise RuntimeError(f"第 {index} 段：{exc}") from exc
+                offset = samples / 24000
+                sentences.append({"words": [
+                    {"word": word["text"], "startTime": word["start"] + offset,
+                     "endTime": word["end"] + offset} for word in words
+                ]})
+                joined.write(decoded)
+                samples += len(decoded) // 2
+        candidate = work / "complete.mp3"
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-nostdin", "-f", "s16le", "-ar", "24000",
+             "-ac", "1", "-i", str(work / "joined.pcm"), "-c:a", "libmp3lame",
+             "-b:a", "128k", str(candidate)],
+            capture_output=True, check=True, timeout=120,
+            creationflags=0x08000000 if os.name == "nt" else 0,
+        )
+        final_duration = audio_duration(candidate)
+        alignment = align_voice_to_script(
+            candidate, shots, final_duration, sentences, max_hanzi=max_hanzi,
+        )
+        # Leave the previous working audio untouched if any stage fails.
+        os.replace(candidate, path)
     return {
         "audio_format": "mp3",
         "voice_type": voice_type or volc_tts_voice(),
